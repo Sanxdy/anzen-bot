@@ -1,0 +1,148 @@
+name: build
+
+# Neither PyInstaller nor electron-builder cross-compiles: a Windows .exe has to be built on Windows
+# and a Linux build on Linux. So the same script runs on all three runners and each produces its own
+# artefact. The APK is built here too, because the Android SDK is already on the runner.
+#
+# Push a tag like `v1.0.0` and the artefacts are attached to a GitHub release; otherwise they are
+# uploaded as workflow artefacts you can download from the run page.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "server.py"
+      - "app.js"
+      - "index.html"
+      - "desktop/**"
+      - "android/**"
+      - "tests/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write          # only needed by the release job, and only on a tag
+
+jobs:
+  desktop:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false     # one OS failing must not hide whether the other two built
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS (.app + .dmg)
+            artefact: anzen-bot-macos
+            path: desktop/dist/*.dmg
+          - os: windows-latest
+            label: Windows (.exe)
+            artefact: anzen-bot-windows
+            path: desktop/dist/*.exe
+          - os: ubuntu-22.04
+            label: Linux (binary)
+            artefact: anzen-bot-linux
+            path: desktop/dist/*.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The app is Electron: the Python side is only the frozen backend, and Node is what packages
+      # the shell around it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Electron needs a display and a few system libraries to start, and a Linux runner has neither
+      # by default. xvfb supplies the display; the rest are the libraries Electron links against.
+      - name: Electron's runtime (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgtk-3-0 libnss3 libasound2 libgbm1
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller playwright
+
+      # The Computer panel needs its own Chromium inside the bundle; without it the panel reports
+      # "browser unavailable" and nothing else changes. A build failure here is not worth failing the
+      # whole job over, so the script falls back to a browser-less app on its own.
+      - name: Build
+        run: python desktop/build.py
+
+      # Test the artefact, not the source: the same suite a person runs locally. A runner has no
+      # display, so the windowed launch is skipped there — everything else (the API over the app's
+      # own socket, the secret store it hides, the LAN token, a real turn, and that no TCP port is
+      # opened) runs. Electron still wants a display to start, so Linux gets a virtual one.
+      - name: Test the built app (macOS, Windows)
+        if: runner.os != 'Linux'
+        env:
+          ANZEN_SKIP_WINDOW: "1"
+        run: python tests/test_desktop_app.py
+
+      - name: Test the built app (Linux)
+        if: runner.os == 'Linux'
+        env:
+          ANZEN_SKIP_WINDOW: "1"
+        run: xvfb-run -a python tests/test_desktop_app.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artefact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+  android:
+    name: Android (.apk)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner images already carry the SDK and a JDK; the build script finds them by itself.
+      - name: Show the toolchain it will use
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" "$ANDROID_HOME/platforms"
+          java -version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # `sips` is macOS-only, so on the runner the icons are made with ImageMagick instead. The
+      # script prefers sips when it is there and falls back otherwise.
+      - name: Icon tooling
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Check the address parsing on a plain JVM
+        run: python tests/test_android.py
+
+      - name: Build the APK
+        run: python android/build_apk.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anzen-bot-android
+          path: android/dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: Attach to the release
+    needs: [desktop, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

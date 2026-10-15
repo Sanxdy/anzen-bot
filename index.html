@@ -1,0 +1,1272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A0A0F">
+<meta name="description" content="Your own team of AI bots, in a chat app. Each with its own model, memory, tools and voice.">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Anzen-bot">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>Anzen-bot</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='%237C5CFF'/><circle cx='20' cy='32' r='5' fill='white'/><circle cx='32' cy='32' r='5' fill='white'/><circle cx='44' cy='32' r='5' fill='white'/></svg>">
+<style>
+  /* The token block below is the default theme, and it is also theme `dark`. Every theme package
+     is one more block of the same eighteen tokens further down, selected by `data-theme` on the
+     body — so a theme is data, never a branch in the code. A theme that reads on a light surface
+     also gets the `light` class, which is what the hand-tuned legibility rules (`body.light …`)
+     hang off; those rules stay class-based because a *rule* is not a token. */
+  :root,body[data-theme="dark"]{
+    /* Surfaces are flat and graded by a 1px line, not by glow or blur. `--accent` is the one
+       colour: it marks the primary action, the chat you are in, and the live dot. Text on it
+       is `--accent-ink` (dark), because white on a mid-tone accent fails WCAG AA. `--accent` as
+       text on a surface is a third job with a third answer: a mid-tone tuned to fill a button is
+       under 4.5:1 as 14px prose, so `--accent-txt` is that same hue walked to a legible lightness
+       per theme. Links, quote labels and the reply label read in it; the accent itself keeps the
+       borders and the fills. */
+    --bg:#08080C; --bg2:#0E0E14; --card:#14141C; --card2:#1B1B25; --line:#26262F;
+    --line2:#33333F; --txt:#F2F2F7; --dim:#9C9CAD; --dim2:#84848F;
+    --accent:#7C5CFF; --accent-ink:#0B0B10; --accent-txt:#A48BFF; --ok:#38D39F; --warn:#F5B23D; --err:#FF5D6C;
+    --hov:#1C1C26; --track:#33333F; --dot:#5E5E6B;
+    /* The shell is a two-column grid — navigation, then content. Because the sidebar is a grid
+       column and not a flex sibling, folding it to a rail is one `grid-template-columns` change
+       and the transcript takes the space back on its own. */
+    --sb:288px; --rail:68px;
+    /* Every gap below is a step on a 4px scale, so the rhythm is one decision, not a hundred. */
+    --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:20px; --space-6:24px;
+  }
+  /* Every font size in this file is its designed px value times --fs, so one knob moves all of the
+     text together. The size control sets --fs; the font picker swaps --font. These three live on
+     `:root` alone and never inside a theme block: the default theme's block also matches
+     `body[data-theme="dark"]`, and a custom property declared on an element beats the one inherited
+     from `<html>` — which is exactly where `applyAppearance` writes them. Left in the block they
+     are pinned to 1 and to the default face, so the size and font controls silently do nothing on
+     the default theme. */
+  :root{--fs:1;
+    --font:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  body.light,body[data-theme="light"]{--bg:#F6F6F9;--bg2:#FFFFFF;--card:#FFFFFF;--card2:#F1F1F5;--line:#E4E4EA;--line2:#D5D5DE;
+    --txt:#14141C;--dim:#5A5A6A;--dim2:#6B6B78;--accent:#7C5CFF;--accent-ink:#0B0B10;--accent-txt:#5B3AE0;
+    --hov:#ECECF2;--track:#C9C9D4;--dot:#7A7A88;
+    /* The dark-theme semantics are tuned for dark surfaces; on white they fail AA, so each
+       gets a darker partner here. The Allow button keeps a pale ink of its own on that green. */
+    --ok:#0E7C52;--warn:#8A5A00;--err:#C0263A}
+  /* `--ok` and not a fixed green: a light theme is not always a green one — Monochrome Light's
+     status colours are a grey ramp and E-Ink's is a deep ink — and the hardcoded green painted over
+     both. The ink stays pale because every light theme's `--ok` is dark. */
+  body.light .btn.allow{background:var(--ok);color:#F2FFF9}
+
+  /* ---------- theme packages ----------
+     Each block below is one theme, in the same eighteen tokens as :root, so nothing in the app
+     has to know a theme exists. They come after `body.light` on purpose: a light-based theme gets
+     the `light` class *and* its own block, and the block must win (same specificity, later rule).
+     A theme may add a few lines of its own character after the block — a blur, a texture, a face
+     — but it may never leave a token undefined, or the theme would inherit a surface from the one
+     the user just left. `--accent-ink` is written out for the same reason; the running app
+     recomputes it from whatever accent is actually set. `--accent-txt` is not recomputed — it is
+     a tuned colour per theme, like `--dim2`, and it stands in for the accent only where the accent
+     is read as prose. */
+
+  /* Liquid Glass — the chrome is a translucent pane over a slow iridescent wash; the transcript
+     stays opaque, because a word you read through a blur is a word you re-read. The tokens are
+     solid, like every other theme's, and the glass is a handful of rules that make the *chrome*
+     see-through — a bubble mixed from a transparent card would simply vanish. */
+  body[data-theme="glass"]{--bg:#0A0F1E;--bg2:#111830;--card:#141B31;--card2:#1B2340;
+    --line:#26304F;--line2:#3A4670;--txt:#F3F6FF;--dim:#B4BEDB;--dim2:#94A0C2;
+    --accent:#8AB4FF;--accent-ink:#0B0B10;--accent-txt:#A9C9FF;--ok:#4FE0B0;--warn:#FFC857;--err:#FF7A88;
+    --hov:#1A2340;--track:#3A4670;--dot:#7E8AB0}
+  body[data-theme="glass-light"]{--bg:#EDF1F9;--bg2:#F7F9FD;--card:#FFFFFF;--card2:#EFF3FB;
+    --line:#DCE3F0;--line2:#C2CCE2;--txt:#0F1830;--dim:#4A5674;--dim2:#616E8C;
+    --accent:#2A62F0;--accent-ink:#FFFFFF;--accent-txt:#1D4FD8;--ok:#0E7C52;--warn:#8A5A00;--err:#C0263A;
+    --hov:#E7EDF8;--track:#C2CCE2;--dot:#7C87A3}
+  /* The wash is one fixed layer under the whole app: a solid base with three slow blooms over it,
+     so the chrome has something to be translucent over. It sits at z-index 0 with the two grid
+     columns lifted above it, which is the one arrangement that works in every browser — a
+     `z-index:-1` pseudo-element paints behind the canvas background and simply disappears. */
+  body[data-theme="glass"],body[data-theme="glass-light"]{background:transparent}
+  body[data-theme="glass"]::before,body[data-theme="glass-light"]::before{content:"";position:fixed;
+    inset:0;z-index:0;pointer-events:none;
+    background:
+      radial-gradient(46% 54% at 12% 16%,color-mix(in srgb,var(--accent) 85%,transparent),transparent 66%),
+      radial-gradient(42% 50% at 90% 10%,rgba(56,214,190,.55),transparent 68%),
+      radial-gradient(56% 62% at 56% 100%,rgba(255,120,180,.45),transparent 70%),
+      var(--bg);
+    animation:wash 34s ease-in-out infinite alternate}
+  @keyframes wash{from{transform:translate3d(-1.5%,-1%,0) scale(1.04)}to{transform:translate3d(2%,1.5%,0) scale(1.10)}}
+  body[data-theme="glass"] :is(#side,main),body[data-theme="glass-light"] :is(#side,main){position:relative;z-index:1}
+  /* The chrome is a pane: translucent, blurred, with a bright hairline rim. The reading surface is
+     only faintly translucent so the wash glows behind it — the bubbles themselves stay solid. */
+  body[data-theme="glass"] :is(#side,.topbar,.composer,.modal,.mpop,#ctx,#ctxpop,.mentionpop,.chip),
+  body[data-theme="glass-light"] :is(#side,.topbar,.composer,.modal,.mpop,#ctx,#ctxpop,.mentionpop,.chip){
+    background:color-mix(in srgb,var(--bg2) 42%,transparent);
+    backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%)}
+  body[data-theme="glass"] #msgs,body[data-theme="glass-light"] #msgs{background:color-mix(in srgb,var(--bg) 46%,transparent)}
+  /* A notice and a thinking row are the two rows with no surface of their own, so on these two themes
+     their words sat straight on the moving wash and the wash moved under them — a name in a notice at
+     2.6:1 and 2.3:1, a thinking row at 3.7:1 and 3.4:1. A plate of the theme's own base holds them
+     still; it is 88% opaque rather than solid so the wash still glows faintly behind the words. */
+  body[data-theme="glass"] :is(.m.sys,.m.think),body[data-theme="glass-light"] :is(.m.sys,.m.think){background:color-mix(in srgb,var(--bg) 88%,transparent)}
+  body[data-theme="glass"] :is(#side,.topbar,.composer),
+  body[data-theme="glass-light"] :is(#side,.topbar,.composer){border-color:rgba(255,255,255,.18)}
+  body[data-theme="glass"] :is(.modal,.mpop,#ctx,#ctxpop,.mentionpop),
+  body[data-theme="glass-light"] :is(.modal,.mpop,#ctx,#ctxpop,.mentionpop){border-color:rgba(255,255,255,.28)}
+
+  /* AI-Native — a neutral base and one accent, with every context surface carrying the same left
+     rule the approval and plan cards already use, so "this is context" reads structurally. */
+  body[data-theme="ainative"]{--bg:#0B0D12;--bg2:#12151C;--card:#161A23;--card2:#1E2330;
+    --line:#272C38;--line2:#39404F;--txt:#EDEFF4;--dim:#A0A7B8;--dim2:#8A91A3;
+    --accent:#5457E5;--accent-ink:#FFFFFF;--accent-txt:#9BA0F5;--ok:#34D399;--warn:#FBBF24;--err:#F87171;
+    --hov:#1B202A;--track:#39404F;--dot:#6B7280}
+  body[data-theme="ainative-light"]{--bg:#F7F8FA;--bg2:#FFFFFF;--card:#FFFFFF;--card2:#F1F2F6;
+    --line:#E3E5EB;--line2:#CFD3DD;--txt:#111827;--dim:#5A6273;--dim2:#686F7D;
+    --accent:#4F46E5;--accent-ink:#FFFFFF;--accent-txt:#4338CA;--ok:#047857;--warn:#8A5A00;--err:#C0263A;
+    --hov:#EDEFF4;--track:#CBD0DA;--dot:#7A8194}
+  body[data-theme="ainative"] :is(.m.tool,.m.shot,.card,.rt,.switch,.sk),
+  body[data-theme="ainative-light"] :is(.m.tool,.m.shot,.card,.rt,.switch,.sk){border-left:3px solid var(--accent)}
+
+  /* Dark Luxe — a deep graded indigo, a metallic gold accent, and panels that float on a long
+     shadow instead of on a hairline. Dark only: gold on paper is not luxe, it is a highlighter. */
+  body[data-theme="luxe"]{--bg:#0F0F23;--bg2:#15152E;--card:#1A1A3E;--card2:#22224A;
+    --line:#2E2E55;--line2:#3D3D6B;--txt:#F0EDE4;--dim:#A9A3C4;--dim2:#8F89AD;
+    --accent:#D4AF37;--accent-ink:#0B0B10;--accent-txt:#E8CE7A;--ok:#5FD3A6;--warn:#E8C766;--err:#FF6B7A;
+    --hov:#232349;--track:#3D3D6B;--dot:#8E88AC}
+  body[data-theme="luxe"] :is(.modal,.mpop,#ctx,#ctxpop,.mentionpop,.card,.approval){
+    box-shadow:0 25px 50px rgba(0,0,0,.55);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+  body[data-theme="luxe"] :is(.modal,.mpop,#ctx,#ctxpop){background:color-mix(in srgb,var(--card) 88%,transparent)}
+
+  /* E-Ink / Paper — paper and ink, a serif reading face, and no motion at all, because a page
+     does not animate. The grain is one tiled dot, faint enough to feel like stock, not noise. */
+  body[data-theme="eink"]{--bg:#FDFBF7;--bg2:#F7F4ED;--card:#FFFFFF;--card2:#F1EDE4;
+    --line:#E0DDD5;--line2:#C9C4B8;--txt:#1A1A1A;--dim:#4A4A4A;--dim2:#6A665E;
+    --accent:#1A1A1A;--accent-ink:#FFFFFF;--accent-txt:#1A1A1A;--ok:#1F5C3A;--warn:#7A5A10;--err:#8C2A2A;
+    --hov:#EFEBE1;--track:#C9C4B8;--dot:#6A665E}
+  body[data-theme="eink"] :is(#msgs,#input,.md){font-family:ui-serif,Georgia,"Iowan Old Style","Times New Roman",serif}
+  body[data-theme="eink"] :is(#msgs .m,#side .bot,.topbar){transition:none;animation:none}
+  body[data-theme="eink"]::after{content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:.4;
+    background-image:radial-gradient(rgba(0,0,0,.055) 1px,transparent 1px);background-size:3px 3px}
+
+  /* Terminal Hacker — phosphor on black, one monospace face everywhere, a faint scanline, and a
+     phosphor caret. The body text is a softened green so a long reply is not a glare. */
+  body[data-theme="terminal"]{--bg:#050806;--bg2:#0A120C;--card:#0C1610;--card2:#102016;
+    --line:#1C3A24;--line2:#2C5A38;--txt:#C8FFD0;--dim:#6FBF83;--dim2:#57996A;
+    --accent:#00FF41;--accent-ink:#0B0B10;--accent-txt:#4DFF7A;--ok:#00FF41;--warn:#FFD24A;--err:#FF5D6C;
+    --hov:#122418;--track:#2C5A38;--dot:#3E7A50}
+  body[data-theme="terminal"] :is(#side,main,.scrim),body[data-theme="terminal"] :is(#side,main,.scrim) *{font-family:var(--mono)}
+  body[data-theme="terminal"] #input{caret-color:#00FF41}
+  body[data-theme="terminal"]::after{content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:.5;
+    background:repeating-linear-gradient(0deg,rgba(0,255,65,.05) 0 1px,transparent 1px 3px)}
+
+  /* The one control the app never styles is the native slider, which a browser paints in its own
+     blue. `accent-color` is the single property that reaches it, so the volume slider belongs to
+     whichever theme is on instead of to the browser. */
+  :root{accent-color:var(--accent)}
+
+  /* Monochrome — one grey ramp and one bright accent, used only where the app means "here" or
+     "do this": the live dot, the chat you are in, the primary button. Avatars and faces go grey
+     with it. The status colours stay a lightness ramp, so they are told apart by weight. */
+  body[data-theme="mono"]{--bg:#0C0C0D;--bg2:#131315;--card:#18181B;--card2:#202024;
+    --line:#2A2A2F;--line2:#3A3A41;--txt:#F4F4F5;--dim:#A1A1AA;--dim2:#8A8A93;
+    --accent:#E4E4E7;--accent-ink:#0B0B10;--accent-txt:#F4F4F5;--ok:#D4D4D8;--warn:#B4B4BB;--err:#F4F4F5;
+    --hov:#1F1F23;--track:#3A3A41;--dot:#71717A}
+  body[data-theme="mono-light"]{--bg:#F7F7F8;--bg2:#FFFFFF;--card:#FFFFFF;--card2:#F0F0F2;
+    --line:#E4E4E7;--line2:#D4D4D8;--txt:#18181B;--dim:#52525B;--dim2:#63636B;
+    --accent:#18181B;--accent-ink:#FFFFFF;--accent-txt:#18181B;--ok:#3F3F46;--warn:#52525B;--err:#18181B;
+    --hov:#EBEBED;--track:#D4D4D8;--dot:#71717A}
+  /* A bright accent would tint the user's own bubble almost white on a dark base, so Monochrome
+     fills it with the neutral instead of with the accent. */
+  body[data-theme="mono"] .m.user{background:#26262B;border-color:#3A3A41;color:var(--txt)}
+  body[data-theme="mono"] :is(.m.tool .who,.m.shot .who,.m.plan .who,.m.final .who),
+  body[data-theme="mono-light"] :is(.m.tool .who,.m.shot .who,.m.plan .who,.m.final .who){color:var(--dim)}
+  body[data-theme="mono"] :is(.mc:not(.img),canvas){filter:grayscale(1)}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--txt);font-size:calc(14.5px * var(--fs));line-height:1.6;font-family:var(--font);
+    display:grid;grid-template-columns:var(--sb) minmax(0,1fr);grid-template-rows:minmax(0,1fr);
+    overflow:hidden;overscroll-behavior:none;
+    transition:grid-template-columns .22s cubic-bezier(.2,.8,.3,1)}
+  body.rail{grid-template-columns:var(--rail) minmax(0,1fr)}
+  /* Visible to a screen reader, invisible on screen. A label that exists only as a placeholder
+     is not a label, so fields that need one keep a real one here. */
+  .sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--line2);border-radius:20px;border:3px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:#43434f;background-clip:content-box}
+
+  /* ---------- sidebar ---------- */
+  #side{background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;
+    z-index:40;min-width:0;overflow:hidden}
+  .brand{display:flex;align-items:center;gap:11px;padding:18px 16px 14px}
+  .brand .bm{width:34px;height:34px;flex:0 0 34px}
+  .brandtx{min-width:0;flex:1}
+  .brand b{font-size:calc(15.5px * var(--fs));letter-spacing:-.2px;font-weight:700;display:block;line-height:1.2}
+  .brand span{font-size:calc(11px * var(--fs));color:var(--dim2);letter-spacing:.3px;text-transform:uppercase;font-weight:600}
+  /* The fold control is a real button with a real name, so the sidebar can be collapsed from the
+     keyboard as well as the mouse, and it reports whether it is open. */
+  .railbtn{background:transparent;border:1px solid var(--line);color:var(--dim);width:28px;height:28px;flex:0 0 28px;
+    border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}
+  .railbtn svg{width:15px;height:15px;display:block;transition:transform .22s}
+  .railbtn:hover{color:var(--txt);border-color:var(--line2)}
+  .navwrap{flex:1;overflow-y:auto;padding:4px 10px 10px}
+  .navgroup{margin:0}
+  .navlabel{font-size:calc(10.5px * var(--fs));letter-spacing:.9px;text-transform:uppercase;color:var(--dim2);
+    font-weight:700;padding:10px 8px 6px;display:flex;align-items:center;gap:6px}
+  /* A hit target is at least 24x24 (WCAG 2.5.8), and a 15px icon with 2px of padding is not: the
+     padding is what carries the target, so it is set to clear the floor. */
+  .navlabel .add{margin-left:auto;cursor:pointer;color:var(--dim);display:inline-flex;align-items:center;padding:5px 8px;border-radius:6px}
+  .navlabel .add svg{width:15px;height:15px;display:block}
+  .navlabel .add:hover{background:var(--card2);color:var(--txt)}
+  /* Folded: the faces stay, because a face is how you find a bot. Everything made of words goes.
+     Scoped to the desktop width on purpose — below 900px the sidebar is a drawer over the
+     content, and a drawer is opened to be read, so it always shows its labels. */
+  @media (min-width:901px){
+    body.rail .brandtx,body.rail .navlabel .lbl,body.rail .bot .min,body.rail .bot .kebab,
+    body.rail .sfoot .lbl{display:none}
+    body.rail .brand{justify-content:center;padding:16px 8px 12px;gap:8px;flex-wrap:wrap}
+    body.rail .navwrap{padding:4px 6px 10px}
+    body.rail .navlabel{justify-content:center;padding:8px 0 4px}
+    body.rail .navlabel .add{margin-left:0}
+    body.rail :is(#bots, #chans) .bot{justify-content:center;padding:6px;gap:0}
+    body.rail :is(#bots, #chans) .bot.sel::before{display:none}
+    body.rail ul.sub{padding-left:0}
+    body.rail .sfoot{flex-direction:column;align-items:center;padding:10px 8px;gap:8px}
+    body.rail .sfoot .btn{width:42px;height:42px;padding:0;flex:0 0 42px}
+    body.rail .sfoot .btn svg{width:17px;height:17px}
+  }
+  :is(#bots, #chans) .bot{display:flex;align-items:center;gap:12px;padding:10px 11px;border-radius:13px;cursor:pointer;
+    border:1px solid transparent;transition:background .16s,border-color .16s,transform .16s;position:relative}
+  :is(#bots, #chans) .bot:hover{background:var(--hov)}
+  body.light :is(#bots, #chans) .bot:hover{background:var(--hov)}
+  :is(#bots, #chans) .bot.sel{background:var(--card2);border-color:var(--line2)}
+  :is(#bots, #chans) .bot.sel::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:3px;background:var(--accent)}
+  .mc{flex:0 0 46px;width:46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;
+    font-size:calc(15px * var(--fs));font-weight:700;letter-spacing:.4px;background:var(--card2);border:1px solid var(--line)}
+  .mc.sm{flex:0 0 32px;width:32px;height:32px;border-radius:9px;font-size:calc(12px * var(--fs));letter-spacing:.3px}
+  /* Coucou's palette is built for fills, not for a monogram read as text, so it fails in both
+     directions: every entry is too light on a light theme's near-white card, and the deep ones
+     (purple, pink) are too dark on a dark theme's `--card2` — purple at 3.46:1 on luxe. Keep the
+     hue and walk it, the same colour just legible as text. It reads `--mc` (the avatar's own
+     colour), not `currentColor`, which on the `color` property means the inherited colour and would
+     grey every monogram alike. The 78% is the lift the transcript name already takes, and
+     tests/test_name_colour.mjs measures this rule too. The `!important` is because the avatar
+     carries `color:var(--mc)` as an inline style, which no rule without it can outrank. */
+  body.light .mc:not(.img){color:color-mix(in srgb,var(--mc) 55%,#000) !important}
+  body:not(.light) .mc:not(.img){color:color-mix(in srgb,var(--mc) 78%,#fff) !important}
+  /* A bot's name in the transcript is written in the same colour its avatar and its face are, and it
+     rides in `--mc` the same way, so there is one place a hue is written and one set of rules that
+     keep it legible. The two directions are the two ways the palette fails as text: on a light
+     surface every entry is too light to read, so it is darkened; on a dark one the deep entries
+     (purple, pink) fall under AA, so they are lifted toward white. The percentages are measured, not
+     guessed — tests/test_name_colour.mjs holds the ratios for all eleven themes. */
+  .m .hue{color:var(--mc)}
+  body.light .m .hue{color:color-mix(in srgb,var(--mc) 55%,#000) !important}
+  body:not(.light) .m .hue{color:color-mix(in srgb,var(--mc) 78%,#fff)}
+  /* Monochrome has no hue by design — its avatars and faces go grey with it — so a name keeps the dim
+     it has always had, exactly as the plan and report card headers already do. */
+  body[data-theme="mono"] .m .hue,body[data-theme="mono-light"] .m .hue{color:var(--dim) !important}
+  /* A notice is centred prose and not a bubble: on the glass themes it reads over the theme's own
+     base rather than over a solid card, so a name in it keeps the dim it has always had instead of
+     taking a colour measured against a surface it does not sit on. A name in a bubble sits on the
+     solid card and is coloured. */
+  body[data-theme="glass"] .m.sys .hue,body[data-theme="glass-light"] .m.sys .hue{color:var(--dim2) !important}
+  /* A name in the live strip is the same name, so it takes the same `--mc` and the same two measured
+     percentages — the same mix, not a second colour of its own. The four rules are written out
+     because the strip is not a `.m`, and because the one exemption the transcript needs does not
+     apply to it: a strip row has a solid `--card` behind it on every theme, glass included, so every
+     name in it is measured rather than excused — where the transcript's notices read over the glass
+     themes' own base and have to be. tests/test_name_colour.mjs reads these percentages
+     back and fails if they ever drift from the transcript's. */
+  .working .hue{color:var(--mc)}
+  body.light .working .hue{color:color-mix(in srgb,var(--mc) 55%,#000) !important}
+  body:not(.light) .working .hue{color:color-mix(in srgb,var(--mc) 78%,#fff)}
+  body[data-theme="mono"] .working .hue,body[data-theme="mono-light"] .working .hue{color:var(--dim) !important}
+  /* A company logo fills the same box the monogram used. `contain`, so a wide or tall logo is
+     letterboxed rather than cropped — a logo is not a photo. */
+  .mc.img{padding:4px;overflow:hidden}
+  .mc.img img{width:100%;height:100%;object-fit:contain;display:block}
+  .logofld{display:flex;gap:12px;align-items:flex-start}
+  .lgprev .mc{flex:0 0 46px}
+  .lgsaid{min-width:0}
+  .lgsaid .row{margin-bottom:6px}
+  :is(#bots, #chans) .bot .min{min-width:0;flex:1}
+  :is(#bots, #chans) .bot .nm{font-weight:650;font-size:calc(13.5px * var(--fs));letter-spacing:-.1px;display:flex;align-items:center;gap:7px}
+  :is(#bots, #chans) .bot .nm .pin{display:inline-flex;color:var(--dim2)}
+  :is(#bots, #chans) .bot .nm .pin svg{width:12px;height:12px}
+  :is(#bots, #chans) .bot .nm .dot{margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--dot);flex:0 0 7px;transition:background .2s}
+  :is(#bots, #chans) .bot .rl{font-size:calc(11.5px * var(--fs));color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+  /* Hidden affordances are hidden from the pointer too: `opacity:0` still takes a click, so a kebab
+     nobody can see was swallowing taps meant for the row under it. Reveal is where it comes back. */
+  :is(#bots, #chans) .bot .kebab{margin-left:4px;color:var(--dim2);opacity:0;pointer-events:none;cursor:pointer;padding:2px 5px;border-radius:6px;font-size:calc(15px * var(--fs));line-height:1}
+  :is(#bots, #chans) .bot:hover .kebab{opacity:1;pointer-events:auto}
+  /* The kebab is in the tab order, so it has to be visible when it is focused — otherwise a keyboard
+     user tabs onto a control that renders as nothing. `:focus-within` on the row covers the kebab. */
+  :is(#bots, #chans) .bot:focus-within .kebab{opacity:1;pointer-events:auto}
+  :is(#bots, #chans) .bot .kebab:hover{background:var(--hov);color:var(--txt)}
+  :is(#bots, #chans) .bot.team{background:var(--card2);border-color:var(--line2)}
+  .sfoot{padding:12px;border-top:1px solid var(--line);display:flex;gap:9px}
+  .sfoot .btn{flex:1}
+
+  /* ---------- buttons ---------- */
+  .btn{border:0;border-radius:11px;padding:10px 15px;font-weight:600;font-size:calc(13.5px * var(--fs));font-family:var(--font);cursor:pointer;
+    transition:filter .15s,background .15s,transform .06s;display:inline-flex;align-items:center;justify-content:center;gap:7px}
+  /* A button's `display` beats the browser's own `[hidden]{display:none}`, so the attribute alone
+     does nothing and a button meant to be hidden stays on screen. Every other element here that
+     sets `display` restates the rule for the same reason; this is the one `.btn` needed. */
+  .btn[hidden]{display:none}
+  .btn:active{transform:translateY(1px)}
+  .btn.pri{background:var(--accent);color:var(--accent-ink)}
+  .btn.pri:hover{filter:brightness(1.08)}
+  .btn.allow{background:var(--ok);color:#04261a}
+  .btn.deny{background:var(--hov);color:var(--txt)}
+  .btn.deny:hover{background:var(--line2)}
+  .btn.ghost{background:transparent;border:1px solid var(--line2);color:var(--dim)}
+  .btn.ghost:hover{color:var(--txt);border-color:#3a3a4a;background:var(--hov)}
+  .btn.sm{padding:6px 11px;font-size:calc(12.5px * var(--fs));border-radius:9px}
+  .btn:disabled{opacity:.45;cursor:default;transform:none}
+  /* icons never stand alone: every one sits next to its text label */
+  .ico{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;color:currentColor}
+  .ico svg{width:17px;height:17px;display:block}
+  .btn .ico svg,.btn svg{width:15px;height:15px;display:block}
+
+  /* ---------- main ---------- */
+  /* Scoped by class, not by tag: the settings dialog has a header of its own and must not
+     inherit the topbar's border, height or background. */
+  main{display:flex;flex-direction:column;min-width:0;position:relative}
+  /* The chip popovers hang off this bar, and the glass themes give it a backdrop-filter — which
+     makes it a stacking context, trapping `.mpop`/`#ctxpop` inside it. Its own z-index is therefore
+     what decides whether an open popover sits above the transcript or under it: at 0 the message
+     bubbles, which are positioned and come later in the tree, paint straight over the popover. */
+  .topbar{display:flex;align-items:center;gap:12px;padding:13px 22px;border-bottom:1px solid var(--line);
+    background:var(--bg);min-height:70px;z-index:2}
+  .hdot{width:9px;height:9px;border-radius:50%;background:var(--dot);flex:0 0 9px;transition:background .25s}
+  .hdot.live{background:var(--accent)}
+  .topbar .ht{min-width:0}
+  .topbar .h1{font-weight:700;font-size:calc(16px * var(--fs));letter-spacing:-.2px;display:flex;align-items:center;gap:8px}
+  /* No text-transform here: the line can carry a repo path ("working · repo: ~/code/my-app") and
+     `capitalize` would rewrite the path to "~/Code/My-App". The state words are already cased. */
+  .topbar .h2{font-size:calc(12px * var(--fs));color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* The one state that is asking something of you is the one worth a colour. */
+  .topbar .h2.attn{color:var(--warn)}
+  .chips{margin-left:auto;display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end;position:relative}
+  .chip{font-size:calc(11.5px * var(--fs));color:var(--dim);background:var(--card);border:1px solid var(--line);
+    padding:4px 9px;border-radius:999px;white-space:nowrap;cursor:pointer;font-family:var(--font)}
+  .chip:hover{color:var(--txt);border-color:var(--line2)}
+  #chipModel{max-width:230px;overflow:hidden;text-overflow:ellipsis}
+  /* The model chip is a switch, not a door to Settings: it names the model that will answer and
+     swaps to any model in your list on the spot. */
+  .mpop{position:absolute;top:calc(100% + 8px);right:0;z-index:60;width:310px;max-width:calc(100vw - 24px);
+    background:var(--card);border:1px solid var(--line2);border-radius:13px;padding:8px;display:flex;
+    flex-direction:column;gap:6px;box-shadow:0 18px 44px rgba(0,0,0,.44)}
+  .mlist{max-height:300px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+  .mrow{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;color:var(--txt);
+    font:inherit;font-size:calc(12.5px * var(--fs));padding:7px 9px;border-radius:8px;cursor:pointer;
+    overflow-wrap:anywhere;line-height:1.4}
+  .mrow:hover{background:var(--card2)}
+  .mrow.on{background:color-mix(in srgb,var(--accent) 18%,var(--card));border-color:var(--accent)}
+  .mrow span{display:block;color:var(--dim);font-size:calc(11px * var(--fs));margin-top:2px;font-weight:400}
+  .mempty{color:var(--dim);font-size:calc(12px * var(--fs));padding:8px 9px;line-height:1.5}
+  /* The approval popover: a heading, then the level rows. In a channel the heading names the room,
+     because the level picked there is the room's — there are no per-member pickers. */
+  .aphead{font-size:calc(10.5px * var(--fs));letter-spacing:.6px;text-transform:uppercase;color:var(--dim2);
+    font-weight:700;padding:7px 9px 2px}
+  /* The context chip: how full this chat's window is, and on hover what filled it. The popover
+     hangs off the chip's own wrapper, with a transparent strip bridging the 9px gap, so the pointer
+     never leaves the wrapper on its way down and the panel cannot close under it. A click toggles it
+     as well, so it opens from the keyboard and on touch, where there is no hover. */
+  .ctxwrap{position:relative;display:inline-flex}
+  #chipCtx{font-variant-numeric:tabular-nums}
+  #chipCtx.warm{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,var(--line))}
+  #chipCtx.hot{color:var(--err);border-color:color-mix(in srgb,var(--err) 60%,var(--line))}
+  #ctxpop{display:none;position:absolute;top:calc(100% + 9px);right:0;z-index:60;width:306px;
+    max-width:calc(100vw - 24px);background:var(--card);border:1px solid var(--line2);border-radius:13px;
+    padding:12px 13px 11px;box-shadow:0 18px 44px rgba(0,0,0,.44)}
+  #ctxpop::before{content:"";position:absolute;left:0;right:0;top:-9px;height:9px}
+  /* Hover and the click toggle reveal it. Not `:focus-within`: that showed it on a plain Tab
+     without setting `aria-expanded`, so the attribute lied and Escape (which only knows the
+     `.open` class) could not close it. Tab to the chip and press Enter — it is announced. */
+  .ctxwrap:hover #ctxpop,.ctxwrap.open #ctxpop{display:block}
+  .ctxhead{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:9px;
+    font-size:calc(11.5px * var(--fs));color:var(--dim)}
+  .ctxhead span{font-weight:700;color:var(--txt)}
+  .ctxhead b{font-weight:600;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .ctxbar{height:8px;border-radius:999px;background:var(--track);overflow:hidden;margin-bottom:11px}
+  .ctxfill{height:100%;display:flex;border-radius:999px;overflow:hidden;transition:width .3s ease}
+  .ctxfill i{display:block;min-width:2px}
+  .ctxrows{display:flex;flex-direction:column;gap:5px}
+  .ctxrow{display:flex;align-items:center;gap:8px;font-size:calc(11.5px * var(--fs))}
+  .ctxrow .dot{width:8px;height:8px;border-radius:3px;flex:0 0 auto}
+  .ctxrow .lbl{flex:1;min-width:0;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ctxrow .pct{color:var(--txt);font-variant-numeric:tabular-nums}
+  .ctxfoot{margin-top:10px;padding-top:9px;border-top:1px solid var(--line);color:var(--dim2);
+    font-size:calc(11px * var(--fs));font-variant-numeric:tabular-nums}
+  .iconbtn{background:var(--card);border:1px solid var(--line);color:var(--dim);width:34px;height:34px;border-radius:10px;
+    display:none;align-items:center;justify-content:center;cursor:pointer;font-size:calc(16px * var(--fs))}
+  .iconbtn:hover{color:var(--txt)}
+  #msgs{flex:1;overflow-y:auto;padding:26px 22px 128px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth}
+  /* A row keeps its own height and the column scrolls instead. These are flex items, so a row that
+     is allowed to shrink will shrink — and `.m.tool` carries `overflow:hidden` (it clips its
+     header's hover to the rounded corner), which gives it an automatic minimum size of zero. So the
+     moment a transcript grew taller than its box, every tool row was squeezed down to its 2px
+     border: a turn full of tool calls collapsed into a wall of empty lines. */
+  #msgs>*{flex:0 0 auto}
+  /* Density (Appearance) is one body attribute, set from `applyAppearance`. Comfortable is the
+     styles above and needs no rule; compact tightens the two things that set a transcript's rhythm —
+     the gap between rows and each bubble's own padding. */
+  body[data-density="compact"] #msgs{gap:9px;padding:16px 18px 120px}
+  body[data-density="compact"] .m:not(.tool){padding:7px 12px}
+  /* A live turn follows only when you are already at the bottom. When you have scrolled back to read
+     an earlier step, new output stops yanking you down and this pill appears instead. */
+  .jump{position:absolute;left:50%;transform:translateX(-50%);bottom:112px;z-index:6;
+    padding:6px 13px;border-radius:999px;border:1px solid var(--line2);background:var(--card2);
+    color:var(--txt);font-size:calc(12px * var(--fs));font-weight:600;cursor:pointer;
+    box-shadow:0 6px 20px rgba(0,0,0,.32)}
+  .jump:hover{background:var(--hov)}
+  /* Long transcripts are the main thing anyone reads here, so a message is a flat surface
+     graded by a hairline border: no fill, no glow, and a line length short enough to track. */
+  .m{position:relative;max-width:min(680px,86%);padding:11px 15px;border-radius:14px;white-space:pre-wrap;word-break:break-word;
+    line-height:1.62;animation:pop .24s cubic-bezier(.2,.8,.3,1)}
+  @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .m.user{align-self:flex-end;background:color-mix(in srgb,var(--accent) 15%,var(--card));
+    border:1px solid color-mix(in srgb,var(--accent) 34%,var(--line));color:var(--txt);border-bottom-right-radius:6px}
+  .m.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-bottom-left-radius:6px}
+  .m.tool{align-self:flex-start;background:var(--bg2);border:1px solid var(--line);font-size:calc(12.5px * var(--fs));line-height:1.5;font-family:var(--mono);
+    border-radius:13px;border-bottom-left-radius:6px;max-width:min(720px,92%)}
+  .m.tool .who{color:#8FBEFF}
+  .m.tool .h{color:#D3D7E2;font-weight:600;white-space:pre-wrap;overflow-wrap:anywhere}
+  body.light .m.tool .who{color:#2C6FB5}
+  body.light .m.tool .h{color:#333}
+  .m.tool pre.out{margin:7px 0 0;padding:8px 10px;background:var(--bg);border:1px solid var(--line);
+    border-radius:9px;overflow:auto;max-height:280px;font-size:calc(12px * var(--fs));line-height:1.5;font-family:var(--mono);color:#C3D0DE}
+  body.light .m.tool pre.out{background:#EFEFF5;color:#333}
+  .m.shot{align-self:flex-start;background:var(--bg2);border:1px solid var(--line);max-width:min(720px,92%);border-radius:13px;border-bottom-left-radius:6px}
+  .m.shot .who{color:#FFB4D1}
+  body.light .m.shot .who{color:#A8386A}
+  .m.shot img{display:block;width:100%;border-radius:9px;border:1px solid var(--line);margin-top:2px}
+  .m.shot .note{margin-top:7px;font-size:calc(12.5px * var(--fs));color:var(--dim);line-height:1.5}
+  .m.sys{align-self:center;font-size:calc(12px * var(--fs));color:var(--dim2);text-align:center}
+  /* The header is one row: the name on the left, the time on the right, a gap between them. Laid out
+     as a row rather than pinning the time to the bubble's corner — a short message makes a narrow
+     bubble, and a corner-pinned time then lands right on top of the name. A row keeps them apart at
+     any width, and the name still ellipsises rather than shoving the time aside. */
+  .m .who{display:flex;align-items:baseline;gap:10px;font-size:calc(10.5px * var(--fs));font-weight:700;
+    letter-spacing:.5px;text-transform:uppercase;color:var(--dim);margin-bottom:4px;max-width:100%}
+  .m .who .wn{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    word-break:keep-all;overflow-wrap:normal}
+  /* When the message landed, at the end of its own header line. Dim and unemphatic — a reference,
+     not the content. `margin-left:auto` holds it at the right whether or not a name precedes it.
+     A 72% opacity is the same weight as an 82% mix with the surface it sits on, but a mix is a
+     colour the contrast check can measure, and an opacity is not: the mix is what the pixel gets. */
+  .mts{margin-left:auto;flex:0 0 auto;white-space:nowrap;font-weight:500;letter-spacing:0;text-transform:none;
+    color:color-mix(in srgb,var(--dim) 82%,var(--card));font-variant-numeric:tabular-nums}
+  /* A bot's reply arrives as markdown, so it is rendered. The wrapper drops the bubble's
+     pre-wrap — block spacing now comes from the elements, not from the source's newlines. */
+  .md{white-space:normal}
+  .md>*:first-child{margin-top:0}
+  .md>*:last-child{margin-bottom:0}
+  /* Prose is capped at 68 characters to the line, so a wide window does not stretch a paragraph into
+     a line the eye loses its place in. Code and tables are exempt: a wrapped command or a squeezed
+     table is worse than a long line, and both scroll inside the bubble instead. */
+  .md p{margin:0 0 9px;max-width:68ch}
+  .md h1,.md h2,.md h3,.md h4,.md h5,.md h6{margin:13px 0 7px;line-height:1.3;font-weight:700}
+  .md h1{font-size:calc(17px * var(--fs))}
+  .md h2{font-size:calc(15.5px * var(--fs))}
+  .md h3{font-size:calc(14px * var(--fs))}
+  .md h4,.md h5,.md h6{font-size:calc(13px * var(--fs))}
+  .md ul,.md ol{margin:0 0 9px;padding-left:22px}
+  .md ul{list-style:disc}
+  .md ol{list-style:decimal}
+  .md li{margin:3px 0;max-width:68ch}
+  .md code{font-family:var(--mono);font-size:calc(12.5px * var(--fs));background:var(--bg);
+    border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+  .md pre{margin:9px 0;padding:9px 11px;background:var(--bg);border:1px solid var(--line);border-radius:9px;
+    overflow:auto;max-height:340px}
+  .md pre code{display:block;white-space:pre;background:none;border:0;padding:0;
+    font-size:calc(12px * var(--fs));line-height:1.55}
+  .md blockquote{margin:9px 0;padding:2px 0 2px 11px;border-left:3px solid var(--line2);color:var(--dim)}
+  .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+  /* A link is read as prose, so it takes `--accent-txt` — the accent walked to a legible lightness
+     for this theme — while the accent itself stays on the borders and the fills. */
+  .md a{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+  .md del{opacity:.7}
+  /* A wide table scrolls inside the bubble instead of stretching the transcript. */
+  .md table{border-collapse:collapse;margin:9px 0;font-size:calc(12.5px * var(--fs));
+    display:block;width:max-content;max-width:100%;overflow-x:auto}
+  .md th,.md td{border:1px solid var(--line);padding:5px 9px;text-align:left;vertical-align:top}
+  .md th{background:var(--bg2);font-weight:700}
+  .m.plan{background:var(--card2);border:1px solid var(--line2)}
+  .m.plan .who{color:#B9A6FF}
+  body.light .m.plan .who{color:#5B3FD1}
+  .m.final{background:var(--card2);border:1px solid var(--line2)}
+  .m.final .who{color:#7FE3B6}
+  body.light .m.final .who{color:#15724B}
+  /* A reply shows the message it answers above its own text, the way any chat app does, so the
+     reply reads on its own even when the message it points at has scrolled away. */
+  .m .quote{border-left:2px solid var(--accent);background:var(--hov);border-radius:7px;
+    padding:6px 9px;margin-bottom:7px}
+  .m .quote .qw{font-size:calc(10.5px * var(--fs));font-weight:700;color:var(--accent-txt);
+    text-transform:uppercase;letter-spacing:.4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .m .quote .qt{font-size:calc(12.5px * var(--fs));color:var(--dim);line-height:1.45;margin-top:2px;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .m .fwd{font-size:calc(11px * var(--fs));color:var(--dim2);font-style:italic;margin-bottom:4px}
+  /* Reply and Forward: on the message you point at, out of the text's way and inside the bubble's
+     own width, so they can never push the transcript sideways. */
+  .m{position:relative}
+  .m .acts{position:absolute;top:-12px;right:6px;z-index:5;display:flex;gap:2px;opacity:0;pointer-events:none;
+    transition:opacity .12s;background:var(--card);border:1px solid var(--line2);border-radius:999px;
+    padding:2px;box-shadow:0 6px 18px rgba(0,0,0,.4);white-space:normal}
+  .m.user .acts{right:auto;left:6px}
+  .m:hover .acts,.m:focus-within .acts{opacity:1;pointer-events:auto}
+  .m .acts .ab{background:transparent;border:0;color:var(--dim);cursor:pointer;font-family:var(--font);
+    font-size:calc(11.5px * var(--fs));padding:6px 11px;border-radius:999px;white-space:nowrap;line-height:1.35}
+  .m .acts .ab:hover{background:var(--hov);color:var(--txt)}
+  /* A touch screen has no hover to reveal them, so there they sit inside the bubble instead — and
+     `pointer-events` has to come back with the visibility, or the buttons sit there unclickable. */
+  @media (hover:none){
+    .m .acts{position:static;opacity:1;pointer-events:auto;justify-content:flex-end;margin-top:8px;background:transparent;
+      border:0;box-shadow:none;padding:0}
+  }
+  .speak{margin-top:8px;display:inline-flex;gap:6px;align-items:center;font-weight:600;font-size:calc(11.5px * var(--fs));font-family:var(--font);color:var(--dim);
+    background:transparent;border:1px solid var(--line2);border-radius:8px;padding:4px 9px;cursor:pointer}
+  .speak:hover{color:var(--txt);border-color:var(--accent)}
+  .speak svg{width:13px;height:13px;display:block}
+  .approval{align-self:flex-start;max-width:min(680px,92%);background:var(--card);border:1px solid var(--line2);
+    border-left:3px solid var(--warn);border-radius:14px;padding:14px 15px;animation:pop .26s cubic-bezier(.2,.8,.3,1)}
+  .approval .t{color:var(--warn);font-weight:700;font-size:calc(13px * var(--fs));margin-bottom:9px;display:flex;align-items:center;gap:7px}
+  .approval .t svg{width:15px;height:15px;flex:0 0 15px}
+  .approval code{display:block;font-size:calc(12.5px * var(--fs));line-height:1.5;font-family:var(--mono);background:var(--bg);border:1px solid var(--line);border-radius:9px;
+    padding:9px 11px;margin-bottom:11px;overflow-wrap:anywhere;color:#E8D9B0}
+  body.light .approval code{background:#FBF6E8;color:#6B4E08}
+  .row{display:flex;gap:9px}
+  .empty{align-self:center;text-align:center;margin:auto;max-width:520px;padding:20px}
+  .empty .big{font-size:calc(20px * var(--fs));font-weight:700;letter-spacing:-.3px;margin-bottom:6px}
+  .empty .sub{color:var(--dim);font-size:calc(13.5px * var(--fs))}
+  .ex{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:16px auto 0;max-width:420px}
+  .ex button{background:var(--card);border:1px solid var(--line2);color:var(--txt);border-radius:999px;
+    padding:8px 14px;font-size:calc(12.5px * var(--fs));cursor:pointer;transition:background .15s,border-color .15s}
+  .ex button:hover{background:var(--card2);border-color:var(--accent)}
+  .composer{padding:14px 22px 18px;border-top:1px solid var(--line);background:var(--bg)}
+  /* Reserve the bottom-right corner for the dock mascot — but only while it is actually there, so
+     hiding the mascot gives the composer its full width back instead of leaving a 150px gap. */
+  body:not(.nodock) .composer{padding-right:150px}
+  /* Who is working in the room on screen, one row per bot, above the box you type in. It is a strip
+     and not a line in the transcript because a bot does dozens of things in a turn: a line per thing
+     would bury the conversation it is working on, and a strip can be updated in place instead. The
+     row carries its own solid --card, which is what makes a name in it measurable on every theme —
+     the transcript's notices read over the glass themes' own base and have to be exempted there, and
+     this one is not. The strip is capped and scrolls on its own: five bots working at once is 270px
+     of column above the composer, which is a third of a phone screen taken from the conversation it
+     is reporting on. 132px is three rows and a hint of the fourth. */
+  .working{margin-bottom:8px;display:flex;flex-direction:column;gap:5px;overflow:hidden;max-height:132px;overflow-y:auto}
+  .working[hidden]{display:none}
+  .working .wrow{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line2);
+    border-left:2px solid var(--accent);border-radius:10px;padding:6px 11px;white-space:nowrap;overflow:hidden;
+    font-size:calc(12px * var(--fs));color:var(--dim)}
+  /* The name pulses while its bot works — and what pulses is a halo behind the glyphs, never the
+     glyphs' own paint. Dimming the name instead would need a dip to 0.89 to keep 4.5:1 on the light
+     themes (tests/test_name_colour.mjs measures the floor), which is not a flash anybody can see;
+     this way every name keeps the full-strength ratio that same check already proves. One breath
+     every 3.2s, so nothing here is near the 3-flashes-a-second WCAG 2.3.1 draws the line at. */
+  .working .wname{flex:0 0 auto;font-weight:700;animation:livepulse 1.6s ease-in-out infinite alternate}
+  @keyframes livepulse{from{text-shadow:0 0 0 transparent}
+    to{text-shadow:0 0 7px color-mix(in srgb,currentColor 55%,transparent)}}
+  /* The global reduced-motion rule already stops every animation; this says so for this one, so the
+     pulse is never left as a single flash frame. The clock and the phase word keep the row live. */
+  @media (prefers-reduced-motion:reduce){.working .wname{animation:none}}
+  /* The title and the activity are the two that give way on a narrow screen, and both clip with one
+     ellipsis. The activity is the wider of the two: it is the thing being watched. */
+  .working .wtitle{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .working .wact{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--dim2)}
+  .working .wphase,.working .wdot{flex:0 0 auto;color:var(--dim2)}
+  /* The queue sits above the box you type in: tasks sent while a turn was already running, each with
+     the one decision it needs — hand it to the running turn now, or let it wait its turn. Capped and
+     scrollable for the same reason the working strip is: three queued tasks should not eat the phone. */
+  .queue{margin-bottom:8px;display:flex;flex-direction:column;gap:6px;max-height:132px;overflow-y:auto}
+  .queue[hidden]{display:none}
+  .qhead{color:var(--dim);font-size:calc(11.5px * var(--fs));text-transform:uppercase;letter-spacing:.4px}
+  .qitem{display:flex;align-items:center;gap:9px;background:var(--card);border:1px solid var(--line2);
+    border-left:2px solid var(--accent);border-radius:10px;padding:7px 9px 7px 11px}
+  .qitem .qtext{flex:1;min-width:0;font-size:calc(13px * var(--fs));color:var(--txt);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .qitem .qnote{flex:0 0 auto;color:var(--dim);font-size:calc(11.5px * var(--fs))}
+  .qsteer{flex:0 0 auto;background:transparent;border:1px solid var(--line2);color:var(--txt);cursor:pointer;
+    border-radius:999px;padding:4px 11px;font-size:calc(12px * var(--fs));font-family:var(--font);
+    transition:background .15s,border-color .15s}
+  .qsteer:hover{background:var(--card2);border-color:var(--accent)}
+  .qx{flex:0 0 auto;background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:16px;line-height:1;
+    padding:5px 9px;border-radius:7px}
+  .qx:hover{color:var(--txt);background:var(--hov)}
+  .qhint{color:var(--dim2);font-size:calc(11.5px * var(--fs))}
+  /* The message you are quoting, sitting directly above the box you type in until you send it. */
+  .reply{margin-bottom:8px;display:flex;align-items:center;gap:10px;background:var(--card);
+    border:1px solid var(--line2);border-left:2px solid var(--accent);border-radius:10px;padding:7px 9px 7px 11px}
+  .reply[hidden]{display:none}
+  .reply .rtext{flex:1;min-width:0}
+  .reply .rw{font-size:calc(11px * var(--fs));font-weight:700;color:var(--accent-txt);text-transform:uppercase;
+    letter-spacing:.4px}
+  .reply .rt{font-size:calc(12.5px * var(--fs));color:var(--dim);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .reply .rx{flex:0 0 auto;background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:16px;
+    line-height:1;padding:5px 9px;border-radius:7px}
+  .reply .rx:hover{color:var(--txt);background:var(--hov)}
+  .inwrap{position:relative;display:flex;gap:10px;align-items:flex-end;background:var(--card);border:1px solid var(--line2);
+    border-radius:14px;padding:8px 8px 8px 14px;transition:border-color .15s,box-shadow .15s}
+  .inwrap:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+  /* The @mention picker: a room's members, above the box you are typing in. */
+  .mentionpop{position:absolute;left:0;bottom:calc(100% + 8px);z-index:40;min-width:236px;max-width:360px;
+    max-height:264px;overflow:auto;background:var(--card);border:1px solid var(--line2);border-radius:12px;
+    box-shadow:0 14px 34px rgba(0,0,0,.42);padding:6px}
+  .mentionpop[hidden]{display:none}
+  .mentionpop .mi{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:9px;cursor:pointer}
+  .mentionpop .mi.on{background:var(--card2)}
+  .mentionpop .mi .av{width:24px;height:24px;border-radius:7px;flex:0 0 auto;display:grid;place-items:center;
+    font-size:12px;font-weight:700;color:#fff}
+  .mentionpop .mi .sub{color:var(--dim);font-size:12px}
+  #input{flex:1;background:transparent;border:0;color:var(--txt);font-size:calc(14.5px * var(--fs));line-height:1.5;font-family:var(--font);resize:none;
+    outline:none;max-height:140px;padding:6px 0}
+  #input::placeholder{color:var(--dim2)}
+
+  /* ---------- dock mascot ---------- */
+  #dock{position:fixed;right:22px;bottom:20px;width:104px;height:104px;z-index:60;
+    filter:drop-shadow(0 12px 26px rgba(0,0,0,.5));transition:transform .18s,opacity .2s}
+  body.overlay #dock, body.overlay #dockTip{opacity:0;pointer-events:none}
+  /* The poke target is its own button, not the wrapper: a real <button> (the hide ×) nested inside a
+     role="button" wrapper is invalid and may not reach a screen reader at all. */
+  #dockPoke{all:unset;display:block;width:104px;height:104px;cursor:pointer;border-radius:50%}
+  #dockPoke:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  #dock canvas{width:104px;height:104px;display:block}
+  /* The put-away button only appears when the pointer is over the mascot, so the corner stays clean
+     but the way to hide it is right where you would look for it. 28px because 22 is under the 24px
+     hit target WCAG 2.5.8 asks for, and `pointer-events` follows the opacity so the invisible button
+     stops swallowing the first poke at the mascot under it. */
+  #dockHide{position:absolute;top:2px;right:2px;width:28px;height:28px;border-radius:50%;border:1px solid var(--line2);
+    background:var(--card2);color:var(--dim);font-size:14px;line-height:1;cursor:pointer;opacity:0;pointer-events:none;
+    transition:opacity .15s;padding:0}
+  #dock:hover #dockHide,#dockHide:focus{opacity:1;pointer-events:auto}
+  #dockHide:hover{color:var(--txt);border-color:var(--line)}
+  #dockTip{position:fixed;right:26px;bottom:132px;z-index:60;background:var(--card2);border:1px solid var(--line2);
+    color:var(--txt);font-size:calc(12px * var(--fs));padding:6px 11px;border-radius:10px;opacity:0;transform:translateY(6px);
+    transition:opacity .18s,transform .18s;pointer-events:none;white-space:nowrap;max-width:60vw;overflow:hidden;text-overflow:ellipsis}
+  #dockTip.on{opacity:1;transform:none}
+
+  /* ---------- modal / settings ---------- */
+  .scrim{position:fixed;inset:0;background:rgba(4,4,8,.62);backdrop-filter:blur(4px);display:none;z-index:200;
+    align-items:center;justify-content:center;padding:22px}
+  .scrim.on{display:flex}
+  .modal{width:min(940px,100%);height:min(640px,90vh);background:var(--card);border:1px solid var(--line2);
+    border-radius:20px;box-shadow:0 40px 90px -30px #000;display:flex;flex-direction:column;overflow:hidden;
+    animation:pop .24s cubic-bezier(.2,.8,.3,1)}
+  .mhead{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+  .mhead h2{margin:0;font-size:calc(17px * var(--fs));letter-spacing:-.2px}
+  .mhead .x{margin-left:auto;background:transparent;border:0;color:var(--dim);font-size:calc(22px * var(--fs));cursor:pointer;line-height:1;padding:2px 6px;border-radius:8px}
+  .mhead .x:hover{background:var(--card2);color:var(--txt)}
+  /* The settings dialog is the one modal whose nav is a list that grows: fourteen sections under three
+     group headings no longer fit the shared 640px, so the last two (Appearance, Help) fell below the
+     fold with nothing to say they were there. Taller here, and the rail tightened to match, so the
+     whole map is on screen at once instead of behind a scroll you have to guess at. */
+  #scrim .modal{height:min(700px,90vh)}
+  .mbody{display:flex;min-height:0;flex:1}
+  .mtabs{width:196px;flex:0 0 196px;border-right:1px solid var(--line);padding:8px;overflow-y:auto;background:var(--bg2)}
+  .mtab{display:flex;align-items:center;gap:9px;padding:7px 11px;border-radius:10px;cursor:pointer;color:var(--dim);font-size:calc(13.5px * var(--fs));font-weight:600}
+  .mtab:hover{background:var(--card2);color:var(--txt)}
+  .mtab.on{background:var(--card2);color:var(--txt);box-shadow:inset 0 0 0 1px var(--line2)}
+  .mtab .ico{display:flex;align-items:center;justify-content:center;width:18px;flex:0 0 18px}
+  .mtab .ico svg{width:17px;height:17px}
+  .mgrp{margin:9px 0 2px;padding:0 11px;font-size:calc(10.5px * var(--fs));font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);opacity:.7}
+  .mgrp:first-child{margin-top:2px}
+  .mpanel{flex:1;overflow-y:auto;padding:20px 22px;min-width:0}
+  .mpanel h3{margin:0 0 3px;font-size:calc(15px * var(--fs));letter-spacing:-.2px}
+  .mpanel .hint{margin:0 0 18px;color:var(--dim);font-size:calc(12.5px * var(--fs))}
+  /* Help: a tutorial, not a settings form. Prose with a jump list, and a definition list for the
+     approval levels — the same building blocks as the rest of the panel, so it reads as part of
+     the app rather than a page bolted on. */
+  /* 780px of 13px prose is about 120 characters to the line, which is twice what the eye tracks
+     comfortably. `min()` keeps the panel's own cap and adds the reading one, so the column narrows
+     only when the line would run long. */
+  .help{max-width:min(780px,68ch)}
+  .help .toc{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 20px}
+  .help .toc button{font-size:calc(12px * var(--fs));color:var(--dim);background:transparent;border:1px solid var(--line);border-radius:999px;padding:4px 11px;cursor:pointer}
+  .help .toc button:hover{color:var(--txt);border-color:var(--line2);background:var(--hov)}
+  .help .hsec{padding:18px 0;border-top:1px solid var(--line)}
+  .help .hsec:first-of-type{border-top:0;padding-top:0}
+  .help .hsec>h4{margin:0 0 9px;font-size:calc(14px * var(--fs));letter-spacing:-.2px}
+  .help .hsec p{margin:0 0 10px;font-size:calc(13px * var(--fs));line-height:1.65}
+  .help .hsec p.dim{color:var(--dim)}
+  .help .hsec ul,.help .hsec ol{margin:0 0 10px;padding-left:20px;font-size:calc(13px * var(--fs));line-height:1.65}
+  .help .hsec li{margin-bottom:5px}
+  .help .hsec code,.help kbd{font-family:var(--mono);font-size:calc(12px * var(--fs));background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:1px 5px}
+  .help kbd{border-bottom-width:2px;border-color:var(--line2)}
+  .help .lvl{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--bg2);margin-bottom:10px}
+  body.light .help .lvl{background:#fff}
+  .help .lvl .hd{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .help .lvl .hd b{font-size:calc(13.5px * var(--fs))}
+  .help .lvl .hd .tag{margin-left:auto;font-family:var(--mono)}
+  .help .lvl .one{font-size:calc(12.5px * var(--fs));color:var(--dim);margin-top:3px}
+  .help .lvl .acc{font-size:calc(12.5px * var(--fs));line-height:1.6;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line)}
+  .help .feat{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px}
+  .help .feat .ico{flex:0 0 20px;color:var(--dim);margin-top:2px}
+  .help .feat .ico svg{width:18px;height:18px}
+  .help .feat b{font-size:calc(13px * var(--fs))}
+  .help .feat .d{font-size:calc(12.5px * var(--fs));color:var(--dim);line-height:1.6}
+  .help .kbdrow{display:flex;justify-content:space-between;gap:14px;padding:6px 0;border-bottom:1px dashed var(--line);font-size:calc(12.5px * var(--fs))}
+  .help .kbdrow:last-child{border-bottom:0}
+  .help .kbdrow span:last-child{color:var(--dim);text-align:right}
+  .fld{margin-bottom:16px}
+  .fld>label{display:block;font-size:calc(10.5px * var(--fs));letter-spacing:.7px;text-transform:uppercase;color:var(--dim2);font-weight:700;margin-bottom:6px}
+  .fld .desc{font-size:calc(12px * var(--fs));color:var(--dim);margin-top:5px}
+  input:not([type]),input[type=text],input[type=number],input[type=password],select,textarea{width:100%;background:var(--bg2);
+    border:1px solid var(--line2);color:var(--txt);border-radius:10px;padding:9px 11px;font-size:calc(13.5px * var(--fs));font-family:var(--font);outline:none}
+  body.light input,body.light select,body.light textarea{background:#fff}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+  input::placeholder,textarea::placeholder{color:var(--dim2)}
+  .fldrow{display:flex;gap:8px;align-items:center}
+  .fldrow input{flex:1;min-width:0}
+  /* Repo folder picker: browse the disk instead of pasting a path. Directories only. */
+  .modal.pick{width:min(560px,100%);height:min(600px,88vh)}
+  .bpick{display:flex;flex-direction:column;flex:1;min-height:0;padding:14px 16px 0}
+  .bpath{font-size:calc(12px * var(--fs));line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);background:var(--bg2);
+    border:1px solid var(--line);border-radius:9px;padding:8px 10px;user-select:all;word-break:break-all;
+    max-height:66px;overflow-y:auto}
+  body.light .bpath{background:#fff}
+  .blist{margin-top:10px;flex:1;min-height:0;overflow-y:auto}
+  .brow{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:9px;cursor:pointer;
+    font-size:calc(13.5px * var(--fs));color:var(--txt);border:1px solid transparent}
+  .brow:hover{background:var(--hov)}
+  .brow.dim{color:var(--dim2);cursor:default;font-size:calc(12.5px * var(--fs))}
+  .brow.dim:hover{background:transparent}
+  .bico{display:inline-flex;color:var(--dim2);flex:0 0 auto}
+  .bico svg{width:13px;height:13px}
+  .bfoot{display:flex;align-items:center;gap:9px;padding:12px 16px;border-top:1px solid var(--line)}
+  .bfoot .grow{flex:1}
+  .bfoot .hint{font-size:calc(12px * var(--fs));color:var(--dim2)}
+  /* What you are about to forward, shown as the message it is, so the picker is not a blind list. */
+  .bpick .fwdprev{font-size:calc(12.5px * var(--fs));line-height:1.5;color:var(--dim);background:var(--bg2);
+    border:1px solid var(--line);border-left:2px solid var(--accent);border-radius:8px;padding:8px 10px;
+    max-height:120px;overflow:hidden}
+  .sidebot{width:46px;height:46px;flex:0 0 46px}
+  /* A company is a group: the caret folds it, its bots nest inside it. A nested row is the same
+     bot you created — clicking it opens that bot's chat *inside this company*, so the same bot
+     under two companies is two conversations. */
+  #chans > li.group{list-style:none}
+  .caret{flex:0 0 13px;width:13px;height:13px;color:var(--dim2);display:inline-flex;align-items:center;
+    justify-content:center;transition:transform .18s;cursor:pointer;margin-left:-5px}
+  .caret svg{width:12px;height:12px;display:block}
+  .caret.open{transform:rotate(90deg)}
+  .caret:hover{color:var(--txt)}
+  ul.sub{list-style:none;margin:0;padding:0 0 0 18px}
+  ul.sub.shut{display:none}
+  :is(#bots, #chans) .bot.subbot{gap:10px;padding:7px 10px;border-radius:11px}
+  :is(#bots, #chans) .bot.subbot .mc{flex:0 0 46px;width:46px;height:46px;border-radius:11px;font-size:calc(13px * var(--fs))}
+  :is(#bots, #chans) .bot.subbot .nm{font-size:calc(12.8px * var(--fs))}
+  :is(#bots, #chans) .bot.subbot .rl{font-size:calc(11px * var(--fs))}
+  :is(#bots, #chans) .bot.subbot.sel::before{top:8px;bottom:8px}
+  .bot.subbot .sidebot{width:46px;height:46px;flex:0 0 46px}
+  textarea{resize:vertical;min-height:80px;font-size:calc(13px * var(--fs));line-height:1.5;font-family:var(--font)}
+  .seg{display:flex;gap:7px;flex-wrap:wrap}
+  .seg button{background:var(--bg2);border:1px solid var(--line2);color:var(--dim);border-radius:10px;
+    padding:8px 12px;font-size:calc(12.5px * var(--fs));cursor:pointer;font-weight:600}
+  .seg button:hover{color:var(--txt)}
+  .seg button.on{background:color-mix(in srgb,var(--accent) 22%,transparent);border-color:var(--accent);color:var(--txt)}
+  .switch{display:flex;align-items:center;gap:10px;padding:11px 13px;border:1px solid var(--line);border-radius:11px;background:var(--bg2);margin-bottom:9px}
+  body.light .switch{background:#fff}
+  .switch .txt{flex:1;min-width:0}
+  .switch .txt b{display:block;font-size:calc(13.5px * var(--fs))}
+  .switch .txt span{font-size:calc(12px * var(--fs));color:var(--dim)}
+  .tg{width:42px;height:24px;border-radius:999px;background:var(--track);border:0;position:relative;cursor:pointer;flex:0 0 42px;transition:background .18s}
+  /* The thumb is a surface of the theme's own, not a hardcoded white: white on `--track` is 1.5:1 on
+     the light themes, and white on the accent is 1.3:1 on Monochrome. Off, it is the card with a
+     hairline of text colour around it so it reads as a thumb on the track; on, it is the ink the
+     accent already carries, which is the one colour proven to sit on that accent. */
+  .tg::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:var(--card);box-shadow:0 0 0 1px color-mix(in srgb,var(--txt) 22%,transparent),0 1px 2px rgba(0,0,0,.3);transition:transform .18s}
+  .tg.on{background:var(--accent)}
+  .tg.on::after{transform:translateX(18px);background:var(--accent-ink);box-shadow:0 1px 2px rgba(0,0,0,.3)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  /* ---------- layout primitives ---------- */
+  /* A bento: equal-minimum tracks that fill the row they are given, so cards of different heights
+     still line up on the same tracks. `auto-fit` means the column count follows the width on its
+     own — no breakpoint per layout, and nothing to keep in sync. */
+  .bento{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:var(--space-4);align-items:stretch}
+  .bento>*{margin-bottom:0;min-width:0}
+  /* A grouped form: a titled section, so one long editor reads as three short ones. */
+  .fgroup{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--bg2);margin-bottom:12px}
+  body.light .fgroup{background:#fff}
+  .fgroup>h4{margin:0 0 12px;font-size:calc(11px * var(--fs));letter-spacing:.8px;text-transform:uppercase;
+    color:var(--dim2);font-weight:700}
+  .fgroup>.fld:last-child,.fgroup>.switch:last-child{margin-bottom:0}
+  /* A tiered card: head, body, foot. The head says what this is, the body carries the facts, the
+     foot carries the verb — so an eye scanning the list finds the name, then the numbers, then
+     the action, always in that order. */
+  .tcard{display:flex;flex-direction:column;gap:var(--space-3)}
+  .tcard .tc-body{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:var(--space-3)}
+  .tcard .metric{min-width:0}
+  /* One metric in a card is a path, and a path is long. It gets the whole row rather than
+     breaking mid-word in a half-width column. */
+  .tcard .metric.wide{grid-column:1/-1}
+  .tcard .metric .k{font-size:calc(10px * var(--fs));letter-spacing:.7px;text-transform:uppercase;color:var(--dim2);font-weight:700}
+  .tcard .metric .v{font-size:calc(13px * var(--fs));overflow-wrap:anywhere}
+  .tcard .tc-foot{display:flex;gap:var(--space-2);align-items:center;margin-top:auto}
+  .card{border:1px solid var(--line);border-radius:12px;padding:13px 14px;background:var(--bg2);margin-bottom:10px}
+  body.light .card{background:#fff}
+  .card .ct{display:flex;align-items:center;gap:10px}
+  .card .ct .ico{display:flex;align-items:center;justify-content:center;width:22px;flex:0 0 22px;color:var(--dim)}
+  .card .ct .ico svg{width:20px;height:20px}
+  .card .ct b{font-size:calc(13.5px * var(--fs))}
+  .card .ct .sub{font-size:calc(11.5px * var(--fs));color:var(--dim)}
+  .card .ct .rt{margin-left:auto;display:flex;gap:7px;align-items:center}
+  /* ZenPilot missing: same warning grammar as the approval card, so a fix reads as a fix. */
+  .zpwarn{display:flex;gap:10px;align-items:flex-start;margin-top:11px;padding:11px 12px;border-radius:11px;
+    border:1px solid var(--line);border-left:3px solid var(--warn);background:var(--bg2);font-size:calc(12.5px * var(--fs));line-height:1.55}
+  body.light .zpwarn{background:#FFF8EC}
+  .zpwarn .zi{color:var(--warn);flex:0 0 auto;display:inline-flex;margin-top:1px}
+  .zpwarn .zi svg{width:15px;height:15px;display:block}
+  .zpwarn b{font-size:calc(12.5px * var(--fs))}
+  .zpwarn .zsub{color:var(--dim);margin:3px 0 9px}
+  .zpwarn code{font-size:calc(12px * var(--fs));font-family:var(--mono);background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:1px 5px;overflow-wrap:anywhere}
+  .bpick code{font-size:calc(12px * var(--fs));font-family:var(--mono);background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:1px 5px;overflow-wrap:anywhere}
+  /* The link takes the same `--accent-txt` the transcript's links do: it is prose on a surface, and
+     the accent is a fill colour. */
+  .bpick a{color:var(--accent-txt)}
+  .tag{font-size:calc(10.5px * var(--fs));padding:2px 8px;border-radius:999px;border:1px solid var(--line2);color:var(--dim)}
+  .tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+  .tag.off{color:var(--dim2)}
+  .rt{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--line);
+    border-radius:10px;background:var(--bg2);margin-bottom:8px;font-size:calc(12.5px * var(--fs));align-items:center}
+  body.light .rt{background:#fff}
+  .sklist{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .sk{display:flex;gap:9px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:9px 11px;background:var(--bg2);cursor:pointer}
+  .sk:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  body.light .sk{background:#fff}
+  .sk.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+  .sk .ck{width:16px;height:16px;border-radius:5px;border:1.5px solid var(--line2);flex:0 0 16px;margin-top:2px;position:relative}
+  .sk.on .ck{background:var(--accent);border-color:var(--accent)}
+  /* The tick rides on `--accent`, so it is drawn in `--accent-ink` — the one colour that is known to
+     sit on the accent, instead of a white that is 1.3:1 on Monochrome's near-white accent. */
+  .sk.on .ck::after{content:"✓";position:absolute;inset:0;font-size:calc(11px * var(--fs));color:var(--accent-ink);display:flex;align-items:center;justify-content:center}
+  .sk b{font-size:calc(12.5px * var(--fs));display:block}
+  .sk .hd{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .sk .hd b{display:inline}
+  .sk span{font-size:calc(11.5px * var(--fs));color:var(--dim)}
+  /* model picker + model list */
+  .mpick{display:flex;flex-direction:column;gap:8px}
+  .mpick .row{align-items:center}
+  .mpick .desc{margin:0}
+  /* The field is a button that looks like an input and opens the list in place. In place, not
+     floating: the settings panel scrolls, and an absolutely-positioned menu would be clipped by it. */
+  .mfield{display:flex;align-items:center;gap:8px;width:100%;background:var(--bg2);border:1px solid var(--line2);
+    color:var(--txt);border-radius:10px;padding:9px 11px;font:inherit;font-size:calc(13.5px * var(--fs));cursor:pointer;text-align:left}
+  body.light .mfield{background:#fff}
+  .mfield:hover{border-color:var(--accent)}
+  .mfield b{flex:1;min-width:0;font-weight:500;overflow-wrap:anywhere}
+  .mfield .ph{color:var(--dim2)}
+  .mfield svg{width:15px;height:15px;flex:0 0 auto;color:var(--dim);transition:transform .16s}
+  .mfield[aria-expanded=true] svg{transform:rotate(90deg)}
+  .mlist.scroll{max-height:240px}
+  .sklist.scroll{max-height:280px;overflow:auto;padding-right:4px}
+  .sk .btn{margin-left:auto}
+  /* The zip picker: what a zip holds, shown before anything is written. */
+  .zpick{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px dashed var(--line2);border-radius:12px;padding:11px;margin:0 0 14px}
+  .zpick>.desc,.zpick>.row{grid-column:1/-1}
+  .zpick .sk .n{display:block;margin-top:2px;opacity:.7}
+  .zpick .sklist{max-height:240px;overflow:auto}
+
+  /* ---------- side panels (computer, files) ----------
+     Two right-hand overlays share one set of chrome rules — the shell, the header, the scrolling body
+     and the monospace meta line are the same panel twice, and only the frame inside the computer one
+     is its own thing. The shared rules hang off the class both asides already carry; the widths stay
+     per-panel, because a list you read wants less of the screen than a picture you watch.
+     A panel hangs *under* the toolbar rather than over it: the chips up there are what you reach for
+     while a panel is open, and a panel starting at the top covered the very button that opened it.
+     The offset is measured by `panelTop` because the bar's height follows the font scale and the
+     breakpoint — a number written here would be wrong at the other end of both. */
+  .sidepanel{position:fixed;top:var(--panel-top,0px);right:0;bottom:0;background:var(--bg2);border-left:1px solid var(--line2);
+    z-index:150;transform:translateX(102%);transition:transform .28s cubic-bezier(.2,.8,.3,1);display:flex;flex-direction:column;
+    box-shadow:-30px 0 80px -40px #000}
+  .sidepanel.on{transform:none}
+  #comp{width:min(560px,100%)}
+  #files{width:min(420px,100%)}
+  .sidepanel .chead{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .sidepanel .chead b{font-size:calc(15px * var(--fs))}
+  .sidepanel .chead .x{margin-left:auto;background:transparent;border:0;color:var(--dim);font-size:calc(22px * var(--fs));cursor:pointer;line-height:1;padding:2px 6px;border-radius:8px}
+  .sidepanel .chead .x:hover{background:var(--card2);color:var(--txt)}
+  .sidepanel .cbody{flex:1;overflow:auto;padding:16px 18px}
+  .sidepanel .meta{font-size:calc(12px * var(--fs));font-family:var(--mono);color:var(--dim);margin-top:10px;word-break:break-all}
+  #comp .frame{border:1px solid var(--line2);border-radius:12px;overflow:hidden;aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(120% 110% at 50% 0%,#171D2A,#0A0D14 72%)}
+  #comp .frame.live{background:#000}
+  #comp .frame img{width:100%;height:100%;object-fit:contain;display:none}
+  #comp .frame.live img{display:block}
+  #comp .frame canvas{width:44%;max-width:210px;height:auto;aspect-ratio:1;display:block}
+  #comp .frame.live canvas{display:none}
+
+  /* ---------- files panel ----------
+     A row is the whole click target and carries three things on one line: the glyph, the name, and —
+     for a file only, since a folder's byte count says nothing — a right-aligned size, so a directory
+     scans as a column of numbers instead of a ragged sentence. */
+  #files .frow{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:9px;cursor:pointer;
+    font-size:calc(13px * var(--fs))}
+  #files .frow:hover{background:var(--hov)}
+  #files .frow .fico{flex:0 0 16px;display:inline-flex;color:var(--dim)}
+  #files .frow .fico svg{width:16px;height:16px;display:block}
+  /* The folder glyph takes the accent where the accent is legible as a glyph, so what descends is
+     distinguishable from what opens at a glance and not only by reading the name. */
+  #files .frow.dir .fico{color:var(--accent-txt)}
+  #files .frow .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #files .frow .fsize{flex:0 0 auto;font-family:var(--mono);font-size:calc(11.5px * var(--fs));color:var(--dim2);
+    font-variant-numeric:tabular-nums}
+  /* The server's own sentence, or "… and N more": a note in the list, not a row you can act on. */
+  #files .fnote{padding:9px;color:var(--dim);font-size:calc(12.5px * var(--fs))}
+  /* An empty note is not a note: the confirmation line sits between the path and the list, and would
+     otherwise hold a strip of padding open whenever there is nothing to say. */
+  #files .fnote:empty{display:none}
+  #files .fnote.bad{color:var(--err)}
+  #files #filesList{margin-top:8px}
+  /* The same quiet note the computer panel's field carries. It is not inside a `.fld`, so it does not
+     inherit `.fld .desc` and would otherwise be drawn at body size in body colour. */
+  #files .desc{font-size:calc(12px * var(--fs));color:var(--dim);margin-top:14px}
+
+  /* ---------- context menu ---------- */
+  #ctx{position:fixed;z-index:300;background:var(--card2);border:1px solid var(--line2);border-radius:12px;
+    padding:6px;min-width:196px;box-shadow:0 24px 60px -20px #000;display:none}
+  #ctx.on{display:block}
+  #ctx .it{display:flex;align-items:center;gap:10px;padding:8px 11px;border-radius:8px;cursor:pointer;font-size:calc(13px * var(--fs));
+    position:relative}
+  #ctx .it:hover{background:var(--hov)}
+  body.light #ctx .it:hover{background:var(--hov)}
+  #ctx .it .ico{display:flex;align-items:center;justify-content:center;width:17px;flex:0 0 17px;color:var(--dim)}
+  #ctx .it .ico svg{width:16px;height:16px}
+  #ctx .it.danger{color:var(--err)}
+  #ctx .sep{height:1px;background:var(--line);margin:5px 4px}
+  /* A submenu is a second menu beside the first, drawn inside `#ctx` so the one outside-click handler
+     and the one Escape branch close both. It picks its side in JS: the menu is placed at the click
+     point, which for a row in the files panel is the right edge of the window, and a flyout that
+     always opened rightward would hang off the screen there. */
+  #ctx .it .fly{display:inline-flex;margin-left:auto;color:var(--dim2)}
+  #ctx .it .fly svg{width:13px;height:13px}
+  #ctx .flyout{display:none;position:absolute;left:100%;top:-7px;margin-left:4px;min-width:180px;
+    background:var(--card2);border:1px solid var(--line2);border-radius:12px;padding:6px;
+    box-shadow:0 24px 60px -20px #000}
+  #ctx .flyout.on{display:block}
+  #ctx .flyout.left{left:auto;right:100%;margin-left:0;margin-right:4px}
+
+  /* ---------- chat list (past conversations) ----------
+     A chat is a row you scan, not a row you read: who it is, the last thing said, and when. The
+     search box above filters on all three, so a chat you half-remember is two letters away. */
+  .chsearch{padding:2px 8px 6px}
+  .chsearch input{width:100%;background:var(--bg2);border:1px solid var(--line);color:var(--txt);
+    border-radius:9px;padding:6px 9px;font-size:calc(12.5px * var(--fs));font-family:var(--font);outline:none}
+  .chsearch input:focus{border-color:var(--accent)}
+  .chsearch input::placeholder{color:var(--dim2)}
+  body.light .chsearch input{background:#fff}
+  /* The chat list is capped and scrolls on its own, so a long history cannot push the channels and
+     the bots out of reach — the sidebar's other two sections stay where you expect them however many
+     conversations you have. `overscroll-behavior` keeps the list's own end from scrolling the
+     sidebar behind it. */
+  #chats{margin:0;padding:0 2px 0 0;list-style:none;max-height:min(38vh,420px);overflow-y:auto;
+    overscroll-behavior:contain}
+  #chats .chat{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:11px;cursor:pointer;
+    border:1px solid transparent;position:relative;transition:background .16s,border-color .16s}
+  #chats .chat:hover{background:var(--hov)}
+  #chats .chat.sel{background:var(--card2);border-color:var(--line2)}
+  #chats .chat.sel::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--accent)}
+  #chats .chat .ck{flex:0 0 26px;width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
+    background:var(--card2);border:1px solid var(--line);color:var(--dim)}
+  #chats .chat .ck svg{width:14px;height:14px;display:block}
+  #chats .chat .cmin{min-width:0;flex:1}
+  #chats .chat .cnm{font-weight:650;font-size:calc(13px * var(--fs));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* The company a scoped chat belongs to, set beside the bot's name rather than in place of it. */
+  #chats .chat .csc{font-weight:500;font-size:calc(11.5px * var(--fs));color:var(--dim2);margin-left:6px}
+  #chats .chat .clast{font-size:calc(11.5px * var(--fs));color:var(--dim);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;margin-top:1px}
+  #chats .chat .cts{flex:0 0 auto;font-size:calc(10.5px * var(--fs));color:var(--dim2);font-variant-numeric:tabular-nums}
+  #chats .chatempty{padding:8px 10px;color:var(--dim2);font-size:calc(12px * var(--fs))}
+
+  /* ---------- tool & step rows ----------
+     A tool call is one line until you ask for the rest: what ran, and whether it worked. The body
+     (output, or a diff for a write) only exists once the row is open, which is what keeps a long
+     turn readable instead of a wall of terminal. */
+  .m.tool{padding:0;overflow:hidden}
+  .m.tool .thead{display:flex;align-items:center;gap:9px;width:100%;background:transparent;border:0;
+    color:inherit;font:inherit;text-align:left;cursor:pointer;padding:9px 13px;border-radius:12px}
+  .m.tool .thead:hover{background:var(--hov)}
+  .m.tool .tico{flex:0 0 15px;display:inline-flex;color:var(--dim)}
+  .m.tool .tico svg{width:15px;height:15px;display:block}
+  .m.tool .tmain{min-width:0;flex:1;display:flex;align-items:baseline;gap:8px;overflow:hidden}
+  .m.tool .who{margin:0;flex:0 0 auto;white-space:nowrap;overflow:visible;max-width:none}
+  .m.tool .h{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500;color:var(--dim)}
+  .m.tool .tstate{flex:0 0 auto;font-size:calc(11px * var(--fs));color:var(--dim2);font-family:var(--font)}
+  .m.tool .tstate.ok{color:var(--ok)}
+  .m.tool .tstate.err{color:var(--err)}
+  .m.tool .tcaret{flex:0 0 13px;display:inline-flex;color:var(--dim2);transition:transform .18s}
+  .m.tool .tcaret svg{width:13px;height:13px;display:block}
+  .m.tool.open .tcaret{transform:rotate(90deg)}
+  .m.tool .tbody{display:none;padding:0 13px 12px;border-top:1px solid var(--line)}
+  .m.tool.open .tbody{display:block}
+  .m.tool pre.out{margin:9px 0 0;padding:9px 11px;background:var(--bg);border:1px solid var(--line);
+    border-radius:9px;overflow:auto;max-height:320px;font-size:calc(12px * var(--fs));line-height:1.5;
+    font-family:var(--mono);color:#C3D0DE;white-space:pre-wrap;word-break:break-word}
+  body.light .m.tool pre.out{background:#EFEFF5;color:#333}
+  /* a running step spins, so a long turn still shows that something is happening */
+  .m.tool .tstate .spin,.qnote .spin,.working .wrow .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line2);
+    border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;vertical-align:-1px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ---------- inline diff (a file the bot wrote) ---------- */
+  .diff{margin-top:9px;border:1px solid var(--line);border-radius:9px;overflow:auto;max-height:340px;
+    font-family:var(--mono);font-size:calc(12px * var(--fs));line-height:1.5;background:var(--bg)}
+  .diff .dl{display:block;padding:1px 10px;white-space:pre-wrap;word-break:break-word}
+  .diff .dctx{color:var(--dim2)}
+  .diff .ddel{background:color-mix(in srgb,var(--err) 16%,transparent);color:#FFC2C9}
+  .diff .dadd{background:color-mix(in srgb,var(--ok) 16%,transparent);color:#B6F0DA}
+  body.light .diff .ddel{color:#8A1424}
+  body.light .diff .dadd{color:#0A5B3C}
+  .diff .dh{color:var(--dim2);padding:4px 10px;border-bottom:1px solid var(--line);font-family:var(--font);
+    font-size:calc(11px * var(--fs));text-transform:uppercase;letter-spacing:.4px}
+
+  /* ---------- thinking ---------- */
+  .m.think{align-self:flex-start;background:transparent;border:1px dashed var(--line2);color:var(--dim);
+    font-size:calc(12.5px * var(--fs));padding:8px 13px;max-width:min(680px,92%);cursor:pointer}
+  .m.think .trow{display:flex;align-items:center;gap:9px}
+  .m.think .tstate{flex:0 0 auto;display:inline-flex;color:var(--dim2)}
+  .m.think .tstate svg{width:13px;height:13px;display:block}
+  .m.think .tlabel{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .m.think .tcaret{flex:0 0 12px;display:inline-flex;color:var(--dim2);transition:transform .18s}
+  .m.think .tcaret svg{width:12px;height:12px;display:block}
+  .m.think.open .tcaret{transform:rotate(90deg)}
+  .m.think .tbody{display:none;margin-top:8px;color:var(--dim2);line-height:1.6;white-space:pre-wrap}
+  .m.think.open .tbody{display:block}
+  .m.think:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* The clock on a step or a running command, so a long task reads as a long task rather than a
+     frozen screen. Tabular figures keep it from twitching as the digits change. */
+  .telapsed{flex:0 0 auto;font-size:calc(11px * var(--fs));color:var(--dim2);
+    font-variant-numeric:tabular-nums;font-family:var(--font)}
+  .telapsed.long{color:var(--warn)}
+
+  /* ---------- code block copy ---------- */
+  .md .codeblk{position:relative;margin:9px 0}
+  .md .codeblk pre{margin:0}
+  .md .cbcopy{position:absolute;top:6px;right:6px;background:var(--card2);border:1px solid var(--line2);
+    color:var(--dim);font-family:var(--font);font-size:calc(11px * var(--fs));padding:3px 9px;border-radius:7px;
+    cursor:pointer;opacity:0;transition:opacity .14s,color .14s}
+  .md .codeblk:hover .cbcopy,.md .cbcopy:focus{opacity:1}
+  .md .cbcopy:hover{color:var(--txt);border-color:var(--accent)}
+  @media (hover:none){.md .cbcopy{opacity:.85}}
+
+  /* ---------- composer: stop + grow ---------- */
+  /* The ink on Stop is dark because the error red is a mid-tone fill. On a light theme that red is
+     darker, and on Monochrome Light it is near-black — the dark ink landed at 1.07:1 there, so the
+     light themes take the same pale ink the Allow button keeps. */
+  .btn.stop{background:var(--err);color:#2A0206}
+  body.light .btn.stop{color:#FFF3F4}
+  .btn.stop:hover{filter:brightness(1.08)}
+  #input{transition:height .1s ease-out}
+
+  /* ---------- startup splash ----------
+     The window paints before the first API call answers, so the splash covers that gap instead of a
+     blank frame. It is the app's own mark, and it leaves the moment boot() has a config. */
+  #splash{position:fixed;inset:0;z-index:500;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:18px;background:linear-gradient(180deg,#000 0%,var(--bg) 100%);
+    transition:opacity .38s ease-out}
+  #splash.gone{opacity:0;pointer-events:none}
+  #splash .smark{width:96px;height:96px;border-radius:24px;background:var(--accent);display:grid;place-items:center;
+    box-shadow:0 30px 80px -20px color-mix(in srgb,var(--accent) 70%,transparent);
+    animation:splashpop .5s cubic-bezier(.2,.9,.3,1.25)}
+  @keyframes splashpop{from{opacity:0;transform:scale(.86)}to{opacity:1;transform:none}}
+  #splash .smark svg{width:52px;height:52px;display:block}
+  #splash .stx{text-align:center}
+  #splash .stx b{display:block;font-size:calc(19px * var(--fs));letter-spacing:-.3px;font-weight:700}
+  #splash .stx span{display:block;margin-top:5px;font-size:calc(11.5px * var(--fs));letter-spacing:.9px;
+    text-transform:uppercase;color:var(--dim2);font-weight:600}
+
+  /* ---------- backdrop for mobile drawer ---------- */
+  #backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:35;display:none}
+  #backdrop.on{display:block}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:900px){
+    /* Below 900px the sidebar stops being a column and becomes a drawer over the content, so the
+       grid has one column and the rail control is meaningless — the menu button does that job. */
+    :root{--sb:0px;--rail:0px}
+    body,body.rail{grid-template-columns:minmax(0,1fr)}
+    /* The glass themes set `position:relative;z-index:1` on #side for their own stacking, and that
+       rule out-specifies the drawer's — so below 900px the sidebar stayed in the grid, at content
+       height, and once it was fixed it still sat under the backdrop. Restated at matching
+       specificity: the drawer must be fixed and above the backdrop to be reachable. */
+    body[data-theme="glass"] #side,body[data-theme="glass-light"] #side{position:fixed;z-index:40}
+    #side{position:fixed;left:0;top:0;bottom:0;width:min(300px,86vw);z-index:40;
+      transform:translateX(-102%);transition:transform .26s cubic-bezier(.2,.8,.3,1)}
+    #side.open{transform:none}
+    .railbtn{display:none}
+    .iconbtn{display:inline-flex}
+    #msgs{padding:18px 14px 132px}
+    .topbar{padding:11px 14px;min-height:64px}
+    /* Keep the status line on a phone: it is where "Working…", "Approval needed" and "NAME is working"
+       are written, and without it the only cue left is the dot's colour. It already ellipsizes, so
+       cap its width instead of deleting it. */
+    .topbar .h2{max-width:38vw}
+    .chips{gap:5px}
+    .chip{padding:6px 10px;font-size:calc(11.5px * var(--fs))}
+    /* touch: hit areas reach ~44px and controls that only appeared on hover are always shown */
+    .btn{min-height:44px}
+    .btn.sm{min-height:38px;padding:8px 12px;font-size:calc(13px * var(--fs))}
+    .ex button{padding:11px 16px}
+    .mtab{min-height:40px}
+    :is(#bots, #chans) .bot .kebab{opacity:.6;pointer-events:auto;padding:6px 9px}
+    :is(#bots, #chans) .bot{padding:12px 11px}
+    #chats .chat{padding:10px 9px}
+    .md .cbcopy{opacity:.85;padding:6px 11px}
+    .composer{padding:10px 12px 14px}
+    body:not(.nodock) .composer{padding-right:112px}
+    .m{max-width:94%}
+    .m.tool,.approval,.m.shot{max-width:97%}
+    #dock{width:84px;height:84px;right:12px;bottom:12px}
+    #dockPoke{width:84px;height:84px}
+    #dock canvas{width:84px;height:84px}
+    #dockTip{bottom:106px;right:14px}
+    .scrim{padding:0}
+    .modal{width:100%;max-height:100%;height:100%;border-radius:0;border:0}
+    .mbody{flex-direction:column}
+    .mtabs{width:100%;flex:0 0 auto;display:flex;flex-wrap:wrap;gap:6px;border-right:0;border-bottom:1px solid var(--line);padding:8px}
+    .mtab{white-space:nowrap;padding:7px 10px;font-size:calc(12px * var(--fs))}
+    .mtab .lbl{display:inline}   /* labels stay visible — an icon alone is not a label */
+    /* Wrapped into a chip row, a group heading would read as a chip that does nothing — so the
+       groups drop out on a narrow screen and the flat row of labels is the whole navigation. */
+    .mgrp{display:none}
+    .mpanel{padding:16px 14px}
+    .grid2{grid-template-columns:1fr}
+    .sklist{grid-template-columns:1fr}
+    .zpick{grid-template-columns:1fr}
+    :is(#comp,#files){width:100%}
+  }
+  @media (max-width:420px){ .brand b{font-size:calc(14.5px * var(--fs))} .ex button{font-size:calc(12px * var(--fs));padding:7px 12px} }
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+    #msgs{scroll-behavior:auto}
+  }
+</style>
+</head>
+<body>
+<div id="splash" aria-hidden="true">
+  <div class="smark"><svg viewBox="0 0 64 64" fill="none" aria-hidden="true"><circle cx="20" cy="32" r="5" fill="#fff"/><circle cx="32" cy="32" r="5" fill="#fff"/><circle cx="44" cy="32" r="5" fill="#fff"/></svg></div>
+  <div class="stx"><b>Anzen-bot</b><span>Self-hosted workspace</span></div>
+</div>
+<aside id="side" aria-label="Sidebar">
+  <div class="brand">
+    <canvas class="bm" width="80" height="80" aria-hidden="true"></canvas>
+    <div class="brandtx"><b>Anzen-bot</b><span>Self-hosted workspace</span></div>
+    <button class="railbtn" id="btnRail" type="button" title="Collapse the sidebar" aria-label="Collapse the sidebar" aria-expanded="true" aria-controls="navwrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 6.5 9 12l5.5 5.5"/></svg></button>
+  </div>
+  <nav class="navwrap" id="navwrap" aria-label="Rooms and bots">
+    <section class="navgroup" aria-labelledby="chatsLabel">
+      <div class="navlabel" id="chatsLabel"><span class="lbl">CHATS</span> <span class="add" id="btnNewChat" title="Start a new chat — clears this transcript" role="button" aria-label="Start a new chat, clearing this transcript"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg></span></div>
+      <div class="chsearch"><input id="chatSearch" type="search" placeholder="Search chats…" aria-label="Search chats"></div>
+      <ul id="chats"></ul>
+    </section>
+    <section class="navgroup" aria-labelledby="chansLabel">
+      <div class="navlabel" id="chansLabel"><span class="lbl">ROOMS</span> <span class="add" id="addChannel" title="New room" role="button" aria-label="New room"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg></span></div>
+      <ul id="chans" style="list-style:none;margin:0;padding:0"></ul>
+    </section>
+    <section class="navgroup" aria-labelledby="botsLabel">
+      <div class="navlabel" id="botsLabel"><span class="lbl">BOTS</span> <span class="add" id="addBot" title="New bot" role="button" aria-label="New bot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg></span></div>
+      <ul id="bots" style="list-style:none;margin:0;padding:0"></ul>
+    </section>
+  </nav>
+  <div class="sfoot">
+    <button class="btn ghost" id="btnInstall" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v11M7.5 10.5 12 15l4.5-4.5"/><path d="M4 19.5h16"/></svg><span class="lbl">Install app</span></button>
+    <button class="btn ghost" id="btnHelp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.4 9.4a2.7 2.7 0 0 1 5.2.9c0 1.8-2.6 2.3-2.6 4"/><path d="M12 17.4v.2"/></svg><span class="lbl">Help</span></button>
+    <button class="btn ghost" id="btnSettings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3M5.4 5.4l2.1 2.1M16.5 16.5l2.1 2.1M18.6 5.4l-2.1 2.1M7.5 16.5l-2.1 2.1"/></svg><span class="lbl">Settings</span></button>
+  </div>
+</aside>
+<div id="backdrop"></div>
+
+<main id="main">
+  <header class="topbar">
+    <button class="iconbtn" id="btnMenu" title="Menu" aria-label="Open menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17"/></svg></button>
+    <div class="hdot" id="hDot"></div>
+    <div class="ht"><div class="h1" id="hName">Anzen-bot</div><div class="h2" id="hStatus">idle</div></div>
+    <div class="chips">
+      <button class="chip" id="chipModel" type="button" title="The model that answers this chat. Click to switch" aria-haspopup="dialog" aria-controls="mmPop" aria-expanded="false">Model: none</button>
+      <button class="chip" id="chipMem" type="button" title="What this chat may do without asking. Click to change" aria-haspopup="dialog" aria-controls="apPop" aria-expanded="false">Approval: Ask</button>
+      <span class="ctxwrap">
+        <button class="chip" id="chipCtx" type="button" title="How full this chat's context window is — hover to see what filled it" aria-haspopup="dialog" aria-controls="ctxpop" aria-expanded="false">Context: —</button>
+        <div id="ctxpop" role="dialog" aria-label="Context window breakdown"></div>
+      </span>
+      <button class="iconbtn" id="btnFiles" title="Files" aria-label="Open files panel" style="display:inline-flex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.4a1.6 1.6 0 0 1 1.6-1.6h4.2l2 2.4h7.6A1.6 1.6 0 0 1 20 9.8v8.2a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 18z"/></svg></button>
+      <button class="iconbtn" id="btnComp" title="Computer" aria-label="Open computer panel" style="display:inline-flex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="4.2" width="18.4" height="12.4" rx="2"/><path d="M9 20.4h6M12 16.6v3.8"/></svg></button>
+    </div>
+  </header>
+  <section id="msgs" class="transcript" role="log" aria-live="off" aria-label="Transcript"></section>
+  <button id="jump" class="jump" hidden aria-label="Jump to the newest output">↓ New output</button>
+  <footer class="composer">
+    <div id="working" class="working" role="region" aria-label="Bots working in this room" aria-live="polite" aria-atomic="false" hidden></div>
+    <div id="queue" class="queue" role="status" aria-live="polite" aria-label="Queued tasks" hidden></div>
+    <div id="reply" class="reply" role="status" aria-live="polite" aria-label="Replying to" hidden></div>
+    <div class="inwrap">
+      <label class="sr" for="input">Message this chat</label>
+      <textarea id="input" rows="1" placeholder="Message the room… (@mention a bot)" role="combobox" aria-haspopup="listbox" aria-controls="mentionPop" aria-autocomplete="list" aria-expanded="false"></textarea>
+        <div class="mentionpop" id="mentionPop" role="listbox" aria-label="Mention a bot" hidden></div>
+      <button class="btn stop" id="btnStop" hidden>Stop</button>
+      <button class="btn pri" id="btnSend">Send</button>
+    </div>
+  </footer>
+</main>
+
+<div id="dock"><button id="dockPoke" type="button" title="Poke the mascot" aria-label="Poke the mascot"><canvas id="dockMochi" width="192" height="192" aria-hidden="true"></canvas></button><button id="dockHide" type="button" title="Hide the mascot (bring it back in Settings → Appearance)" aria-label="Hide the corner mascot">×</button></div>
+<div id="dockTip" role="status" aria-live="polite"></div>
+<!-- Turn milestones for a screen reader. The transcript itself is aria-live="off": it is rewritten
+     every 120ms while a bot streams, so a live transcript re-announces the whole answer dozens of
+     times. This small region says only what changed. -->
+<div id="live" class="sr" role="status" aria-live="polite"></div>
+
+<aside id="comp" class="sidepanel" aria-label="Computer panel" inert>
+  <div class="chead"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="4.2" width="18.4" height="12.4" rx="2"/><path d="M9 20.4h6M12 16.6v3.8"/></svg></span><b>Computer</b>
+    <button class="btn ghost sm" id="compRefresh" style="margin-left:auto">Refresh</button>
+    <button class="x" id="compClose" aria-label="Close computer panel">×</button></div>
+  <div class="cbody">
+    <div class="frame" id="compFrame"><canvas id="compFace" aria-hidden="true"></canvas><img id="compShot" alt="The bot's screen"></div>
+    <div class="meta" id="compMeta">no screen yet</div>
+    <div class="fld" style="margin-top:16px"><label for="compUrl">POINT THE BOT AT A PAGE</label>
+      <div class="row"><input type="text" id="compUrl" placeholder="https://example.com" style="flex:1">
+      <button class="btn pri sm" id="compOpen">Open</button></div>
+      <div class="desc">The bot you are chatting with opens the page in its real browser, and the frame above becomes its live screen. The panel belongs to the chat you are in: a chat whose bot is not using the computer shows nothing, rather than another chat's bot at work. Click anywhere outside the panel to close it.</div>
+    </div>
+  </div>
+</aside>
+
+<aside id="files" class="sidepanel" aria-label="Files panel" inert>
+  <div class="chead"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.4a1.6 1.6 0 0 1 1.6-1.6h4.2l2 2.4h7.6A1.6 1.6 0 0 1 20 9.8v8.2a1.6 1.6 0 0 1-1.6 1.6H4.6A1.6 1.6 0 0 1 3 18z"/></svg></span><b>Files</b>
+    <button class="btn ghost sm" id="filesRefresh" style="margin-left:auto">Refresh</button>
+    <button class="x" id="filesClose" aria-label="Close files panel">×</button></div>
+  <div class="cbody">
+    <div class="meta" id="filesRoot"></div>
+    <div class="fnote" id="filesSay" role="status" aria-live="polite"></div>
+    <div id="filesList" role="list"></div>
+    <div class="desc">This lists the repo the chat you are in works in. Click a folder to open it, and a file to open it in your default app. Right-click a file or a folder for Open, Open with, Open in Finder, Copy path, and Add to chat.</div>
+  </div>
+</aside>
+
+<div class="scrim" id="scrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <header class="mhead"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3M5.4 5.4l2.1 2.1M16.5 16.5l2.1 2.1M18.6 5.4l-2.1 2.1M7.5 16.5l-2.1 2.1"/></svg></span><h2 id="setTitle">Settings</h2><button class="x" id="sClose" aria-label="Close settings">×</button></header>
+    <div class="mbody">
+      <nav class="mtabs" id="setTabs" role="tablist" aria-orientation="vertical" aria-label="Settings sections"></nav>
+      <section class="mpanel" id="setPanel" role="tabpanel" aria-label="Section content"></section>
+    </div>
+  </div>
+</div>
+
+<div id="ctx" role="menu" aria-label="Chat actions"></div>
+
+<!-- Inside the desktop app the page comes from disk, so `bridge.js` carries the API over Electron
+     IPC. In a browser it does nothing and `app.js` talks to the server as it always has. -->
+<script src="bridge.js"></script>
+<script type="module" src="app.js"></script>
+<script>
+  // Installable app: register the service worker (skipped on file:// and if unsupported).
+  if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+  }
+</script>
+</body>
+</html>

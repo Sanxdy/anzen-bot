@@ -1,0 +1,71 @@
+{
+  "name": "anzen-bot",
+  "productName": "Anzen-bot",
+  "version": "1.0.0",
+  "description": "Anzen-bot — a self-hosted agent workspace",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "bot.anzen.app",
+    "productName": "Anzen-bot",
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "selftest.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-backend",
+        "to": "backend"
+      },
+      {
+        "from": "../../",
+        "to": "app",
+        "filter": [
+          "index.html",
+          "app.js",
+          "bridge.js",
+          "mochi.js",
+          "sound.js",
+          "sw.js",
+          "manifest.webmanifest",
+          "*.png",
+          "*.ico"
+        ]
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity",
+      "identity": null
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "tar.gz"
+      ],
+      "category": "Utility"
+    }
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}

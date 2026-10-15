@@ -1,0 +1,7 @@
+{
+  "router": "http://127.0.0.1:11434/v1",
+  "key": "",
+  "default_model": "llama3.1",
+  "vision_model": "",
+  "models": ["llama3.1"]
+}

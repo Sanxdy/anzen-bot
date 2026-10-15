@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------- your data
+# Everything the app writes at runtime lives here: your bots, rooms, chats,
+# bot memory, work logs, room logos, and config.json (which holds your router
+# URL and API key). It is created on first run and is never published.
+data/
+sandbox/
+shots/
+
+# ------------------------------------------------------------------ secrets
+# Minted by the app, never committed.
+data/access_token
+data/relay_secret
+
+# ------------------------------------------------------------- build output
+# Build artefacts are produced by .github/workflows/build.yml, not committed.
+# The installers alone are ~240-270 MB each, over GitHub's 100 MB file limit.
+release/
+desktop/build/
+desktop/dist/
+desktop/dist-backend/
+android/build/
+android/dist/
+
+# ------------------------------------------------------ downloaded toolchain
+# Restored by `npm install` from desktop/electron/package-lock.json.
+desktop/electron/node_modules/
+
+# ------------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ------------------------------------------------------------------- macOS
+.DS_Store
+
+# ------------------------------------------------------------- editor tools
+.zcode/
+.zcodeignore
