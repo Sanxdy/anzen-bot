@@ -37,7 +37,7 @@ A_BOT = {"id": "producer", "name": "Producer", "title": "Chief of Staff", "role"
          "instructions": "x", "skills": [], "tools_allow": None, "hidden": False, "pinned": False,
          "emoji": "🎬", "face": "", "outfit": "", "accessory": "", "avatar": 0}
 A_CH = {"id": "room", "name": "Room", "members": ["producer"], "mode": "lead", "lead": "producer",
-        "instructions": "", "folder": "", "pinned": False}
+        "instructions": "", "folder": "", "pinned": False, "color": ""}
 
 PASS = []; FAIL = []
 def check(name, ok, extra=""):
@@ -85,6 +85,55 @@ for f in CH_FIELDS:
         check("a room with no %s still starts and is whole" % f, False,
               "%s: %s" % (type(e).__name__, e))
 
+# --- the same field, present but null ------------------------------------------------------------------
+# `setdefault` fills an *absent* key; a client serialising an unset value writes an explicit null, and
+# that is not absent. A room with `"members": null` used to pass the loader and then 500 the next bot
+# delete; a bot with `"instructions": null` failed on every turn.
+print("--- bots: one field written as null at a time ---")
+for f in BOT_FIELDS:
+    rec = dict(A_BOT); rec[f] = None
+    S.save_bots([rec]); S.save_channels([])
+    try:
+        boot_records()
+        got = S.load_bots()[0]
+        unusable = [k for k in BOT_FIELDS if got.get(k) is None and k != "tools_allow"]
+        check("a bot with a null %s still starts and is usable" % f, not unusable, "null=%s" % unusable)
+    except Exception as e:
+        check("a bot with a null %s still starts and is usable" % f, False, "%s: %s" % (type(e).__name__, e))
+
+print("--- rooms: one field written as null at a time ---")
+for f in CH_FIELDS:
+    rec = dict(A_CH); rec[f] = None
+    S.save_bots([dict(A_BOT)]); S.save_channels([rec])
+    try:
+        boot_records()
+        got = S.load_channels()[0]
+        unusable = [k for k in CH_FIELDS if got.get(k) is None]
+        check("a room with a null %s still starts and is usable" % f, not unusable, "null=%s" % unusable)
+    except Exception as e:
+        check("a room with a null %s still starts and is usable" % f, False, "%s: %s" % (type(e).__name__, e))
+
+# ...and the field a null actually broke a route with: `bot/delete` iterates the room's members.
+S.save_bots([dict(A_BOT), dict(A_BOT, id="qa", name="Qa")])
+S.save_channels([dict(A_CH, members=None)])
+boot_records()
+try:
+    chs = S.load_channels(); chs[0]["members"] = [m for m in chs[0]["members"] if m != "qa"]
+    S.save_channels(chs)
+    check("the bot-delete loop over a room that arrived with null members does not raise",
+          S.load_channels()[0]["members"] == [], S.load_channels()[0]["members"])
+except Exception as e:
+    check("the bot-delete loop over a room that arrived with null members does not raise", False,
+          "%s: %s" % (type(e).__name__, e))
+
+# --- a deliberate False, 0 or "" is a value, not a gap ------------------------------------------------
+S.save_bots([dict(A_BOT, memory=False, pinned=False, hidden=False, avatar=0, voice="", face="")])
+S.save_channels([])
+got = S.load_bots()[0]
+check("a field the record deliberately set to False, 0 or \"\" is left exactly as written",
+      got["memory"] is False and got["pinned"] is False and got["hidden"] is False and
+      got["avatar"] == 0 and got["voice"] == "" and got["face"] == "", got)
+
 # --- the literal bug: neither id nor name ---------------------------------------------------------
 print("--- the shape that broke it ---")
 S.save_bots([dict(A_BOT)]); S.save_channels([{"members": ["producer"], "mode": "lead"}])
@@ -116,6 +165,34 @@ try:
     check("two rooms with the same name get two chats, not one", len(set(ids)) == 2, ids)
 except Exception as e:
     check("two rooms with the same name get two chats, not one", False, "%s: %s" % (type(e).__name__, e))
+
+# --- an id the record supplied is never the one that is renamed -----------------------------------
+# It names a session and a logo file on disk, so renaming it orphans both. A record with no id of its
+# own is the one that yields.
+S.save_bots([dict(A_BOT)])
+S.save_channels([{"name": "Standup", "members": ["producer"]},
+                 {"id": "standup", "name": "Weekly", "members": ["producer"]}])
+try:
+    boot_records()
+    ids = [c["id"] for c in S.load_channels()]
+    check("a room that named its own id keeps it, and the one without an id yields",
+          ids == ["standup-2", "standup"], ids)
+except Exception as e:
+    check("a room that named its own id keeps it, and the one without an id yields", False,
+          "%s: %s" % (type(e).__name__, e))
+
+# --- the third writer: the team importer ------------------------------------------------------------
+print("--- the team importer writes whole records ---")
+S.save_bots([]); S.save_channels([])          # an empty file is re-seeded with the default roster
+made, rooms = S.build_team(S.TEAM_TEMPLATE)
+check("the shipped template imports", bool(made), made)
+check("...and every bot it made is whole in the file",
+      not [k for b in S.load_bots() for k in BOT_FIELDS if k not in b],
+      [k for b in S.load_bots() for k in BOT_FIELDS if k not in b])
+check("...and every room it made is whole in the file",
+      bool(rooms) and not [k for c in S.load_channels() for k in CH_FIELDS if k not in c],
+      [k for c in S.load_channels() for k in CH_FIELDS if k not in c])
+boot_records()   # what the importer's own two new_session loops do, over what it wrote
 
 # --- the create endpoints: what they write is already whole ---------------------------------------
 print("--- the create endpoints write whole records ---")

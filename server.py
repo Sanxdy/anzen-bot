@@ -444,6 +444,16 @@ _STALE_BRIEFS = [
 def _slug(s, fallback):
     return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or fallback
 
+def _fill(x, k, v):
+    """A field the record left out, or left null.
+
+    `setdefault` only covers the absent case, and a key written as an explicit `null` — which is what
+    a client serialising an unset value sends — is not absent. So a room with `"members": null`
+    passed the loader and then 500'd on the next bot delete, and a bot with `"instructions": null`
+    failed on every turn: present, but nothing a reader could use. Only `None` counts as unfilled, so
+    a deliberate `False`, `0` or `""` is left exactly as written."""
+    if x.get(k) is None: x[k] = v
+
 def _fill_id_name(x, fallback, taken):
     """An id and a name for a record the file left without them.
 
@@ -451,8 +461,17 @@ def _fill_id_name(x, fallback, taken):
     prints it, `bot_by_id` matches on the id — so one nameless record in bots.json or channels.json
     used to raise KeyError inside `boot()` and stop the backend from starting at all. The id is
     derived from the name (the same slug rule the create endpoints use) and made unique against the
-    records already seen, so two rooms called the same cannot end up sharing a chat."""
-    base = x.get("id") or _slug(x.get("name"), fallback)
+    ids already claimed, so two rooms called the same cannot end up sharing a chat.
+
+    An id the record supplied is its own and is never the one that yields: it names a session and a
+    logo or avatar file on disk, so renaming it would orphan both. `taken` therefore arrives
+    pre-seeded with every explicit id in the file, and only a derived id steps aside."""
+    own = x.get("id")
+    if own:
+        taken.add(own)
+        x["name"] = x.get("name") or own.replace("-", " ").title()
+        return x
+    base = _slug(x.get("name"), fallback)
     x["id"] = base
     n = 2
     while x["id"] in taken: x["id"] = "%s-%d" % (base, n); n += 1
@@ -461,27 +480,27 @@ def _fill_id_name(x, fallback, taken):
     return x
 
 def _norm_bots(b):
-    """Every field a bot record is read for, filled in. One definition, shared by the loader and
-    the create endpoint: the two drifting apart is exactly how a record got into the file with no
-    `name`, and then stopped the app from booting."""
+    """Every field a bot record is read for, filled in. One definition, shared by the loader, the
+    create endpoint and the team importer: those drifting apart is exactly how a record got into the
+    file with no `name`, and then stopped the app from booting."""
     known = CFG.get("models") or []
-    taken = set()
+    taken = {x["id"] for x in b if x.get("id")}
     for x in b:
         x.pop("mascot", None)   # avatars are emoji-on-colour now; mascot was the old key
         _fill_id_name(x, "bot", taken)
-        x.setdefault("title", "Teammate"); x.setdefault("role", ""); x.setdefault("color", "blue")
-        x.setdefault("approval", "ask"); x.setdefault("memory", True); x.setdefault("voice", "")
-        x.setdefault("hidden", False); x.setdefault("pinned", False); x.setdefault("skills", [])
-        x.setdefault("tools_allow", None)
-        x.setdefault("instructions", "You are " + x["name"] + ".")
-        x.setdefault("emoji", BOT_EMOJI.get(x["id"], ""))
-        x.setdefault("face", "")   # blank = the client derives a species from the id
+        _fill(x, "title", "Teammate"); _fill(x, "role", ""); _fill(x, "color", "blue")
+        _fill(x, "approval", "ask"); _fill(x, "memory", True); _fill(x, "voice", "")
+        _fill(x, "hidden", False); _fill(x, "pinned", False); _fill(x, "skills", [])
+        _fill(x, "tools_allow", None)
+        _fill(x, "instructions", "You are " + x["name"] + ".")
+        _fill(x, "emoji", BOT_EMOJI.get(x["id"], ""))
+        _fill(x, "face", "")   # blank = the client derives a species from the id
         # The look the avatar editor edits: an outfit and an accessory the client draws, and the
         # version of an uploaded avatar (0 = none, so the drawn face shows).
-        x.setdefault("outfit", ""); x.setdefault("accessory", ""); x.setdefault("avatar", 0)
+        _fill(x, "outfit", ""); _fill(x, "accessory", ""); _fill(x, "avatar", 0)
         # A record with no model, or one the current router does not serve, would 404 on every turn —
         # and `_agent_loop` reads `bot["model"]` unguarded, so a missing one is a TypeError mid-turn.
-        x.setdefault("model", DEFAULT_MODEL)
+        _fill(x, "model", DEFAULT_MODEL)
         if known and x["model"] not in known: x["model"] = DEFAULT_MODEL
         if x.get("instructions") in _STALE_BRIEFS:
             d = next((d for d in DEFAULT_BOTS if d["id"] == x.get("id")), None)
@@ -504,15 +523,18 @@ DEFAULT_CHANNELS = [
 ]
 def _norm_channels(c):
     """Every field a room record is read for, filled in — the same shared definition the create
-    endpoint uses. `members` and `lead` are what the room's own turns iterate, so a room the file
-    left without them used to fail later, inside a turn, instead of at boot."""
-    taken = set()
+    endpoint and the team importer use. `members` and `lead` are what the room's own turns iterate,
+    so a room the file left without them used to fail later, inside a turn, instead of at boot."""
+    taken = {x["id"] for x in c if x.get("id")}
     for x in c:
         _fill_id_name(x, "room", taken)
-        x.setdefault("members", [])
-        x.setdefault("mode", "lead")
-        x.setdefault("lead", (x["members"] or ["producer"])[0])
-        x.setdefault("instructions", ""); x.setdefault("folder", ""); x.setdefault("pinned", False)
+        _fill(x, "members", [])
+        _fill(x, "mode", "lead")
+        _fill(x, "lead", (x["members"] or ["producer"])[0])
+        _fill(x, "instructions", ""); _fill(x, "folder", ""); _fill(x, "pinned", False)
+        # The colour of the room's letter avatar. Both clients default it, so this is only what the
+        # row is drawn with before the user picks one — but it is a field they read, so it is filled.
+        _fill(x, "color", "")
     return c
 
 def load_channels():
@@ -1284,7 +1306,7 @@ def build_team(text):
                      "model": DEFAULT_MODEL, "approval": "ask", "memory": True, "voice": "",
                      "instructions": (a.get("description") or ("You are " + name + ", " + title + ".")).strip(),
                      "skills": skills, "tools_allow": None, "hidden": False, "pinned": False, "emoji": emoji})
-    bots.extend(made); save_bots(bots)
+    bots.extend(_norm_bots(made)); save_bots(bots)   # the one shared definition, as for a single bot
     rooms = []
     for r in team["rooms"]:
         rid = re.sub(r"[^a-z0-9]+", "-", (r.get("key") or r.get("name") or "room").lower()).strip("-") or "room"
@@ -1297,8 +1319,11 @@ def build_team(text):
     if rooms:
         chs = load_channels(); have = {c["id"] for c in chs}
         for c in rooms:
-            while c["id"] in have: c["id"] += "-2"
-            have.add(c["id"]); chs.append(c)
+            while c["id"] in have: c["id"] += "-2"   # an imported room yields to the one already there
+            have.add(c["id"])
+        # ...and every field default comes from the one shared definition, so an imported room is
+        # whole in the file rather than repaired on every read.
+        chs.extend(_norm_channels(rooms))
         save_channels(chs)
     for b in made: new_session(b["id"], bot=b["id"], title=b["name"])
     for c in rooms: new_session(c["id"], bot=None, title=c["name"])
