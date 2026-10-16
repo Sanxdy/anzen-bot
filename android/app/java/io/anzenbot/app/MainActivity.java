@@ -2,7 +2,14 @@ package io.anzenbot.app;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -11,6 +18,7 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -35,7 +43,6 @@ import android.widget.TextView;
  */
 public class MainActivity extends Activity {
     private static final String PREFS = "anzen";
-    private static final int BG = Pal.BG, FG = Pal.FG, DIM = Pal.DIM, ACCENT = Pal.ACCENT;
     private static final long RETRY_MS = 3000;      // how often a blocked app looks again
     private static final long KEEPALIVE_MS = 10000; // how often a live one checks it still is
 
@@ -48,6 +55,7 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean checking = false;    // one probe at a time: a retry must not stack up behind it
     private boolean live = false;        // the desktop app answered, so a probe must not blank the screen
+    private boolean resumed = false;     // the screen is on: a probe's answer is still worth acting on
 
     private final Runnable retry = new Runnable() {
         @Override public void run() { check(); }
@@ -59,8 +67,12 @@ public class MainActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        // The colours have to be in place before the first view is built: every one of them reads
+        // `Pal` once, at construction, and a background painted from a not-yet-loaded palette is a
+        // transparent one. The server is the owner of the setting; this only reads the cache of it.
+        ChatView.wear(this);
         root = new FrameLayout(this);
-        root.setBackgroundColor(BG);
+        root.setBackgroundColor(Pal.BG);
         chat = new ChatView(this);
         setup = buildSetup();
         offline = buildOffline();
@@ -75,9 +87,25 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
+        if (chat != null) chat.resume();
         // Coming back to the phone is exactly when the computer may have gone away, so the door is
         // checked again — unless the user is on the setup screen, where there is nothing to check yet.
         if (setup.getVisibility() != View.VISIBLE) check();
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        resumed = false;
+        // The probe goes to sleep with the screen. Left running it is a request every 10 s while the
+        // desktop is up — and every 3 s, the retry pace, for as long as the desktop is down, which is
+        // the state this phone sits in whenever you quit the app on your computer and pocket it. What
+        // it bought was only that the offline screen was already painted on the way back in, and
+        // `onResume` runs the same probe the moment you come back anyway. Both timers are cancelled,
+        // not just the fast one: the retry is the one that runs hottest.
+        ui.removeCallbacks(keepAlive);
+        ui.removeCallbacks(retry);
+        if (chat != null) chat.pause();
     }
 
     // ---- the door: is the desktop app there? -------------------------------------------------
@@ -98,6 +126,13 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         checking = false;
                         if (isFinishing() || isDestroyed()) return;
+                        // The phone left the app while this probe was in flight. Acting on the answer
+                        // is the whole of what used to keep the poll alive in the background: this is
+                        // where the workspace would come back, where the watch stream would open (with
+                        // `pause` already behind it, so nothing would close it), and where the next
+                        // probe gets armed — each of which re-arms the one after it. `onResume` asks
+                        // the same question again, so nothing is lost by dropping this answer.
+                        if (!resumed) return;
                         if (why == null) reachable(url, token);
                         else { showOffline("Anzen-bot is not running", why); ui.postDelayed(retry, RETRY_MS); }
                     }
@@ -128,84 +163,148 @@ public class MainActivity extends Activity {
         int p = dp(24);
         col.setPadding(p, dp(40), p, p);
 
-        TextView title = new TextView(this);
-        title.setText("Anzen-bot");
-        title.setTextColor(FG);
-        title.setTextSize(30);
+        col.addView(mark());
+
+        TextView title = text("Anzen-bot", Pal.TXT, 19);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setPadding(0, dp(18), 0, 0);
         col.addView(title);
 
-        TextView sub = new TextView(this);
-        sub.setText("Your bots, on your own computer. Point this app at the server running there.");
-        sub.setTextColor(DIM);
-        sub.setTextSize(14);
-        sub.setPadding(0, dp(8), 0, dp(24));
+        TextView sub = text("SELF-HOSTED WORKSPACE", Pal.DIM2, 11);
+        sub.setLetterSpacing(0.09f);
+        sub.setPadding(0, dp(5), 0, 0);
         col.addView(sub);
 
-        col.addView(label("Server address"));
+        TextView blurb = text("Your bots, on your own computer. Point this app at the server running there.",
+                              Pal.DIM, 14);
+        blurb.setPadding(0, dp(16), 0, dp(24));
+        col.addView(blurb);
+
         urlField = new EditText(this);
         urlField.setHint("http://192.168.1.10:8093  ·  https://your-relay");
         urlField.setInputType(InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        urlField.setId(View.generateViewId());
         style(urlField);
+        col.addView(label("SERVER ADDRESS", urlField));
         col.addView(urlField);
 
-        col.addView(label("Access token"));
         tokenField = new EditText(this);
         tokenField.setHint("paste the token from the terminal");
         tokenField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        tokenField.setId(View.generateViewId());
         style(tokenField);
+        col.addView(label("ACCESS TOKEN", tokenField));
         col.addView(tokenField);
 
-        Button go = new Button(this);
-        go.setText("Connect");
-        go.setTextColor(0xFFFFFFFF);
-        go.setBackgroundColor(ACCENT);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(50));
+        Button go = button("Connect", Pal.ACCENT, Pal.ACCENT_INK);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(44));
         lp.topMargin = dp(22);
         col.addView(go, lp);
         go.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { connect(); }
         });
 
-        status = new TextView(this);
-        status.setTextColor(DIM);
-        status.setTextSize(13);
+        status = text("", Pal.DIM, 14);
         status.setPadding(0, dp(14), 0, 0);
         col.addView(status);
 
-        TextView hint = new TextView(this);
-        hint.setText("On the computer, open Anzen-bot and turn on phone access — it prints this address "
-                   + "and token. You can paste the whole printed link into the address box above; the "
-                   + "token is taken out of it for you. On your own wifi that is all you need.\n\n"
-                   + "Away from home, paste the relay address from Settings → Phone → From anywhere "
-                   + "instead — the same box, the same token. The computer dials out to that relay, so "
-                   + "it works on cellular or hotel wifi without anything being exposed.");
-        hint.setTextColor(DIM);
-        hint.setTextSize(12);
+        TextView hint = text("On the computer, open Settings → Phone and turn on Allow devices on this "
+                   + "network. Then press Copy the link for the phone and paste the whole link into the "
+                   + "address box above — the token is taken out of it for you. On your own wifi that is "
+                   + "all you need.\n\n"
+                   + "The first time that switch goes on, the computer may ask whether Anzen-bot may "
+                   + "accept incoming connections; say yes, or the phone cannot get through.\n\n"
+                   + "Away from home, fill in From anywhere in that same tab and paste the link it gives "
+                   + "you here instead — the same box, the same token. The computer dials out to the "
+                   + "relay, so it works on cellular or hotel wifi without anything being exposed.",
+                   Pal.DIM2, 12);
         hint.setPadding(0, dp(22), 0, 0);
         col.addView(hint);
 
         ScrollView sc = new ScrollView(this);
-        sc.setBackgroundColor(BG);
+        sc.setBackground(page());
         sc.addView(col, new ViewGroup.LayoutParams(-1, -2));
-        return sc;
+        return belowStatusBar(sc);
     }
 
-    private TextView label(String text) {
+    /** The desktop splash's mark at the size the splash draws it: the accent squircle, and the app's
+        three dots inside it. */
+    private View mark() {
+        View v = new View(this) {
+            private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final float corner = dp(24), step = dp(10), dot = dp(4);
+
+            @Override protected void onDraw(Canvas c) {
+                ink.setColor(Pal.ACCENT);
+                c.drawRoundRect(0, 0, getWidth(), getHeight(), corner, corner, ink);
+                ink.setColor(0xFFFFFFFF);
+                float mid = getWidth() / 2f, y = getHeight() / 2f;
+                for (int i = -1; i <= 1; i++) c.drawCircle(mid + i * step, y, dot, ink);
+            }
+        };
+        v.setLayoutParams(new LinearLayout.LayoutParams(dp(96), dp(96)));
+        return v;
+    }
+
+    /** The page a door stands on: the splash's own gradient, black down into the app's background. */
+    private GradientDrawable page() {
+        return new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                                    new int[]{ 0xFF000000, Pal.BG });
+    }
+
+    /** A button as the desktop draws one — a flat fill with rounded corners, no elevation, no
+        capitals, and the 44dp floor a thumb needs. The ripple is the fill's own press state. */
+    private Button button(String s, int fill, int ink) {
+        Button b = new Button(this);
+        b.setText(s);
+        b.setTextColor(ink);
+        b.setTextSize(14);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setAllCaps(false);
+        b.setGravity(Gravity.CENTER);
+        b.setMinHeight(0);       // the theme's 48dp floor and its press animation are not the desktop's
+        b.setMinimumWidth(0);
+        b.setStateListAnimator(null);
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(Pal.FOCUS),
+                                           shape(fill, dp(11)), shape(fill, dp(11))));
+        return b;
+    }
+
+    /** A flat fill behind the desktop's 11dp corners: a button, or the box a field is typed into. */
+    private GradientDrawable shape(int fill, int radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(fill);
+        d.setCornerRadius(radius);
+        return d;
+    }
+
+    /** One line of the door's own voice: colour and size are the whole of its styling. */
+    private TextView text(String s, int color, int size) {
         TextView t = new TextView(this);
-        t.setText(text);
-        t.setTextColor(DIM);
-        t.setTextSize(12);
+        t.setText(s);
+        t.setTextColor(color);
+        t.setTextSize(size);
+        return t;
+    }
+
+    private TextView label(String s, View field) {
+        TextView t = text(s, Pal.DIM2, 12);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setLetterSpacing(0.07f);
         t.setPadding(dp(2), dp(14), 0, dp(4));
+        t.setLabelFor(field.getId());   // so a screen reader names the box, not just its hint
         return t;
     }
 
     private void style(EditText e) {
-        e.setTextColor(FG);
-        e.setHintTextColor(Pal.FAINT);
-        e.setTextSize(16);
+        e.setTextColor(Pal.TXT);
+        e.setHintTextColor(Pal.DIM2);
+        e.setTextSize(15);
         e.setSingleLine(true);
         e.setPadding(dp(12), dp(12), dp(12), dp(12));
-        e.setBackgroundColor(Pal.CARD);
+        GradientDrawable box = shape(Pal.CARD, dp(11));
+        box.setStroke(dp(1), Pal.LINE2);
+        e.setBackground(box);
     }
 
     private void showSetup(String message) {
@@ -255,60 +354,48 @@ public class MainActivity extends Activity {
         int p = dp(24);
         col.setPadding(p, dp(40), p, p);
 
-        offlineTitle = new TextView(this);
-        offlineTitle.setText("Anzen-bot is not running");
-        offlineTitle.setTextColor(FG);
-        offlineTitle.setTextSize(26);
+        col.addView(mark());
+
+        offlineTitle = text("Anzen-bot is not running", Pal.TXT, 19);
+        offlineTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        offlineTitle.setPadding(0, dp(18), 0, 0);
         col.addView(offlineTitle);
 
-        offlineMsg = new TextView(this);
-        offlineMsg.setTextColor(DIM);
-        offlineMsg.setTextSize(14);
+        offlineMsg = text("", Pal.DIM, 14);
         offlineMsg.setPadding(0, dp(10), 0, 0);
         col.addView(offlineMsg);
 
-        offlineAddr = new TextView(this);
-        offlineAddr.setTextColor(Pal.FAINT);
-        offlineAddr.setTextSize(12);
+        offlineAddr = text("", Pal.DIM2, 12);
         offlineAddr.setPadding(0, dp(8), 0, 0);
         col.addView(offlineAddr);
 
-        Button again = new Button(this);
-        again.setText("Try again");
-        again.setTextColor(0xFFFFFFFF);
-        again.setBackgroundColor(ACCENT);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(50));
+        Button again = button("Try again", Pal.ACCENT, Pal.ACCENT_INK);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(44));
         lp.topMargin = dp(24);
         col.addView(again, lp);
         again.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { check(); }
         });
 
-        Button change = new Button(this);
-        change.setText("Change address");
-        change.setTextColor(FG);
-        change.setBackgroundColor(Pal.CARD);
-        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-1, dp(46));
+        Button change = button("Change address", Pal.CARD, Pal.TXT);
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(-1, dp(44));
         lp2.topMargin = dp(10);
         col.addView(change, lp2);
         change.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { showSetup(""); }
         });
 
-        TextView hint = new TextView(this);
-        hint.setText("This app talks to Anzen-bot on your computer — it has nothing to show on its own. "
-                   + "Open Anzen-bot there and turn on phone access in Settings; this screen keeps "
-                   + "checking by itself, so it will open as soon as the app is running. Nothing here "
-                   + "leaves your own network.");
-        hint.setTextColor(DIM);
-        hint.setTextSize(12);
+        TextView hint = text("This app talks to Anzen-bot on your computer — it has nothing to show on "
+                   + "its own. Open Anzen-bot there and turn on phone access in Settings → Phone; this "
+                   + "screen keeps checking by itself, so it will open as soon as the app is running. "
+                   + "Nothing here leaves your own network.", Pal.DIM2, 12);
         hint.setPadding(0, dp(22), 0, 0);
         col.addView(hint);
 
         ScrollView sc = new ScrollView(this);
-        sc.setBackgroundColor(BG);
+        sc.setBackground(page());
         sc.addView(col, new ViewGroup.LayoutParams(-1, -2));
-        return sc;
+        return belowStatusBar(sc);
     }
 
     // ---- back ---------------------------------------------------------------------------------
@@ -318,6 +405,35 @@ public class MainActivity extends Activity {
         // door there is nowhere to go back to: the workspace behind it is not usable.
         if (chat.getVisibility() == View.VISIBLE && chat.back()) return;
         super.onBackPressed();
+    }
+
+    /** The one result this app asks another screen for: the image picked for a room's logo or a bot's
+        avatar. A view has no result of its own, so it is handed on to the chat, which knows what was
+        waiting for it. */
+    @Override protected void onActivityResult(int req, int result, Intent data) {
+        super.onActivityResult(req, result, data);
+        if (req == ChatView.PICK_PICTURE) chat.picturePicked(result == RESULT_OK ? data : null);
+    }
+
+    @Override protected void onDestroy() {
+        // The speech engine holds a system service and a callback; the view that made it is going, so
+        // it goes with it.
+        if (chat != null) chat.shutdown();
+        super.onDestroy();
+    }
+
+    /** The status bar is drawn over the app, not beside it, from Android 15 — so a screen that began
+        at the top of the window would start under the clock. Both door screens are a ScrollView, so
+        the inset becomes top padding: the text starts below the clock, the background runs up behind
+        it, and on an older Android the inset arrives already spent and nothing moves. */
+    private ScrollView belowStatusBar(ScrollView sc) {
+        sc.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+                v.setPadding(0, insets.getSystemWindowInsetTop(), 0, 0);
+                return insets;
+            }
+        });
+        return sc;
     }
 
     private int dp(int n) {

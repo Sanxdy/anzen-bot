@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """The Android app's non-Android logic, checked on a plain JVM.
 
-The app needs a phone to run and this machine has no emulator image, so the parts that can be checked
-here are checked here. Targets (turning what the user typed into a server address), Json (reading
-what the server sends), Model (folding a turn's events into a transcript) and Api (the HTTP and
-stream transport) are deliberately free of Android, and this compiles the app's own copies of them —
-not duplicates — together with the checks and runs them.
+The app needs a phone to run, so the parts that can be checked here are checked here. Targets (turning
+what the user typed into a server address), Json (reading what the server sends), Model (folding a
+turn's events into a transcript) and Api (the HTTP and stream transport) are deliberately free of
+Android, and this compiles the app's own copies of them — not duplicates — together with the checks
+and runs them. ChatView and MainActivity are the Android half and are not covered here: they are
+driven by hand on the emulator, which is where the layout itself is the thing being checked.
 
 Usage:  python3 tests/test_android.py
 """
@@ -17,8 +18,8 @@ import build_apk  # the same javac lookup the APK build uses
 
 APP = os.path.join(ROOT, "android", "app", "java", "io", "anzenbot", "app")
 # Everything in the app that does not import android.* — so it runs here as well as on a phone.
-PURE = ["Targets.java", "Json.java", "Model.java", "Api.java", "Pal.java"]
-CHECKS = ["TargetsCheck.java", "ModelCheck.java"]
+PURE = ["Targets.java", "Json.java", "Model.java", "Api.java", "Pal.java", "Md.java"]
+CHECKS = ["TargetsCheck.java", "ModelCheck.java", "MdCheck.java"]
 
 jc = build_apk.javac()
 out = tempfile.mkdtemp(prefix="anzen-android-")

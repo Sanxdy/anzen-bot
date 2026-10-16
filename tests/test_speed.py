@@ -152,9 +152,15 @@ server.log_append("tester", "did a thing")
 check("log_append writes the entry", "did a thing" in server.log_read("tester"))
 check("log_append keeps the work-log header", open(server.log_path("tester"), encoding="utf-8").readline().strip() == "# Work log")
 
-# --- the turn budget helper: a saved number wins, 0 follows the default.
-check("max_seconds default", server.max_seconds({"context": {}}) == server.DEFAULT_TURN_SECONDS)
+# --- the turn's clock is opt-in: none unless a machine sets one. A wall-clock cap fires on work that is
+# merely slow, and slow is what real browser work is, so the step budget is the bound (see
+# DEFAULT_TURN_SECONDS).
+check("there is no turn clock by default", server.max_seconds({"context": {}}) == 0)
+check("...and the shipped default really is no cap", server.DEFAULT_TURN_SECONDS == 0)
 check("max_seconds honours a save", server.max_seconds({"context": {"max_seconds": 30}}) == 30)
+check("a nonsense clock reads as no clock, not a broken range",
+      server.max_seconds({"context": {"max_seconds": -5}}) == 0
+      and server.max_seconds({"context": {"max_seconds": "abc"}}) == 0)
 
 # --- est_tokens: a cheap chars/4 estimate off the fields, not a full re-serialization.
 m1 = [{"role": "user", "content": "x" * 400}]

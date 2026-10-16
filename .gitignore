@@ -36,6 +36,11 @@ venv/
 # ------------------------------------------------------------------- macOS
 .DS_Store
 
+# -------------------------------------------------------------- debug traces
+# A Chromium trace left behind by a debugging run; it is megabytes of JSON about
+# the browser's own threads and nothing the app reads.
+*.log
+
 # ------------------------------------------------------------- editor tools
 .zcode/
 .zcodeignore

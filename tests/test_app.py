@@ -50,6 +50,22 @@ def png1x1():
             + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
             + chunk(b"IEND", b""))
 
+def png_blob(n=256, bg=(255, 255, 255), fg=(230, 126, 34)):
+    """A plain background with a centred subject — the shape the image model returns for an avatar.
+    A flat single-colour image is the wrong fixture: the engine keys out whatever colour all four
+    corners agree on, so a uniform picture would be erased entirely instead of becoming a body."""
+    import zlib, struct
+    cx = cy = n / 2.0; rad = n * 0.30
+    rows = b"".join(b"\x00" + b"".join(bytes(fg if (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad else bg)
+                                      for x in range(n)) for y in range(n))
+    def chunk(t, d):
+        body = t + d
+        return struct.pack(">I", len(d)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6))
+            + chunk(b"IEND", b""))
+
 def raw_get(url, origin=None, host=None, path_as_is=False, headers=None):
     """One HTTP/1.1 GET over a raw socket, so the request line is sent exactly as written
     (`..` included) and Origin/Host can be forged the way a browser or an attacker would.
@@ -91,6 +107,17 @@ def main():
         errors = []
         pg.on("pageerror", lambda e: errors.append(str(e)))
         pg.on("console", lambda m: errors.append("console:" + m.text) if m.type == "error" else None)
+        # Every response that was not a success, with its URL: a console "404 (Not Found)" names no
+        # resource, and a failed check has to say *what* failed. Reported alongside the JS errors.
+        badresp = []
+        pg.on("response", lambda r: badresp.append("%d %s" % (r.status, r.url)) if r.status >= 400 else None)
+
+        def js_errs():
+            """Console errors that are the app misbehaving. app.js reports a dropped turn stream with
+            `console.error("turn failed:")` on purpose — and this suite reloads the page mid-turn,
+            because a reload is how reopening a chat is tested. That abort is the test's, not a defect
+            in the code path under test; a real error in it arrives as a `pageerror` or its own line."""
+            return [e for e in errors if "turn failed:" not in e]
 
         pg.goto(BASE, wait_until="load"); pg.wait_for_timeout(1200)
 
@@ -963,30 +990,48 @@ def main():
         # loaded at start-up, and every list check below would be measuring the bypass, not the app.
         pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')]"
                     ".find(b=>/^Detect all models$/.test(b.textContent.trim())).click()")
-        pg.wait_for_timeout(900)
+        # The detect is a live round-trip to the router — several hundred ids over a link that can take
+        # a second or more. Reading the panel before it lands measures the list from *before* the click
+        # against a count from after it, and the mismatch reads as a broken cap. Wait for the button to
+        # come back, then take the count from the panel itself: that is the same list the cap counts, so
+        # the comparison is the app's own consistency rather than the router's mood.
+        pg.wait_for_function("()=>{const b=[...document.querySelectorAll('#setPanel .btn')]"
+                             ".find(x=>x.textContent.trim()==='Detect all models');return !!b&&!b.disabled}",
+                             timeout=60000)
+        subline = pg.evaluate("""()=>{const c=[...document.querySelectorAll('#setPanel .card')]
+            .find(x=>/^Models/.test((x.querySelector('.ct b')||{}).textContent||''));
+            return c?(c.querySelector('.sub')||{}).textContent:''}""")
+        mcount = int((re.search(r"(\d+) available", subline) or re.match(r"(\d+)", subline or "0")).group(1))
         check("model list renders with remove buttons",
               pg.eval_on_selector_all("#setPanel .sklist.scroll .sk .btn", "e=>e.length") > 5)
         # A router can hand back several hundred ids. Rendering every one of them pushed the Context
         # and Image cards off the panel — a settings screen nobody scrolls to the end of — so the list
         # shows a dozen and offers the rest behind a count.
-        mcount = mdet.get("count", 0)
         shown = pg.eval_on_selector_all("#setPanel .sklist.scroll .sk", "e=>e.length")
         check("a long model list is capped, not dumped", shown == min(12, mcount), "%d rows of %d" % (shown, mcount))
         if mcount > 12:
-            check("the cap says how many are behind it",
-                  pg.evaluate("()=>{const b=[...document.querySelectorAll('#setPanel .sklist button')]"
-                              ".find(x=>/^Show all/.test(x.textContent));return b?b.textContent.trim():''}")
-                  == "Show all %d" % mcount)
+            capt = pg.evaluate("()=>{const b=[...document.querySelectorAll('#setPanel .sklist button')]"
+                               ".find(x=>/^Show all/.test(x.textContent));return b?b.textContent.trim():''}")
+            check("the cap says how many are behind it", capt == "Show all %d" % mcount,
+                  "%r vs 'Show all %d'" % (capt, mcount))
             pg.evaluate("()=>[...document.querySelectorAll('#setPanel .sklist button')]"
                         ".find(x=>/^Show all/.test(x.textContent)).click()")
             pg.wait_for_timeout(400)
-            check("Show all reveals the whole list",
-                  pg.eval_on_selector_all("#setPanel .sklist.scroll .sk", "e=>e.length") == mcount)
-        pg.wait_for_timeout(900)   # let the media card fetch /api/media/models
+            revealed = pg.eval_on_selector_all("#setPanel .sklist.scroll .sk", "e=>e.length")
+            check("Show all reveals the whole list", revealed == mcount, "%d of %d" % (revealed, mcount))
+        # The media card fills its picker from /api/media/models, which is a round-trip to the router
+        # and takes anywhere from one to eight seconds — so this waits for the options to appear rather
+        # than for a guessed number of milliseconds, which only passes when the router happens to be
+        # quick. The deadline is generous and the check below still reports an empty picker as a failure.
+        mdeadline = time.time() + 60
+        while time.time() < mdeadline:
+            pg.wait_for_timeout(400)
+            if pg.eval_on_selector_all("#setPanel select option", "e=>e.length"): break
         check("AI model has an 'Image generation' card",
               pg.evaluate("()=>[...document.querySelectorAll('#setPanel .card .ct b')].some(b=>/Image generation/.test(b.textContent))"))
         check("image model picker is filled from the API key",
-              pg.eval_on_selector_all("#setPanel select option", "e=>e.length") > 0)
+              pg.eval_on_selector_all("#setPanel select option", "e=>e.length") > 0,
+              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .card')].map(c=>(c.querySelector('.ct b')||{}).textContent+': '+(c.querySelector('.desc')||{}).textContent).join(' | ')")[:200])
         # The browser is its own tab now, so the card checks below run there rather than here.
         pg.eval_on_selector("#tab-browser", "e=>e.click()"); pg.wait_for_timeout(400)
         check("the Browser tab has a Browser card",
@@ -1426,10 +1471,13 @@ def main():
         check("the room's transcript carries no shell log",
               "tool" not in seen and "run_shell" not in room_text, seen + " | " + room_text[:200])
         # ...and the bot's words are *not* split away with them: a channel that keeps only the reports
-        # reads as the user talking to nobody, which is what this room was.
+        # reads as the user talking to nobody, which is what this room was. Read from the observer's log
+        # of what was on screen *during* the turn, not the DOM after it: the redraw at the end replaces
+        # the live view with the record, and a row redrawn from the record carries no `data-raw`, so
+        # asking the DOM afterwards measures the redraw instead of the room. A plain `m bot` row — no
+        # tool, plan, sys or final — is the bot talking, which is the thing that must be there.
         check("the room draws what the bot said, not only its closing report",
-              pg.evaluate("""()=>[...document.querySelectorAll('#msgs .m')].some(n=>
-                n.dataset && n.dataset.raw !== undefined && (n.textContent||'').trim().length > 0)"""))
+              pg.evaluate("()=>window.__seen.includes('m bot')"), seen)
         check("the room says where each bot's steps went", pg.evaluate("()=>!!window.__work"))
         check("the room's saved history keeps the report and no tool rows",
               pg.evaluate("""async(r)=>{const h=await (await fetch('/api/history?session='+encodeURIComponent(r))).json();
@@ -1750,7 +1798,7 @@ def main():
         check("the forward arrives as a plain copy, with no quote attached",
               pg.evaluate("""async(s)=>{const h=await (await fetch('/api/history?session='+encodeURIComponent(s))).json();
                 const m=(h.messages||[]).find(x=>x.fwd);return !!m && !m.quote;}""", qf["dst"]))
-        check("no JS errors across quoting and forwarding", not errors, str(errors[:3]))
+        check("no JS errors across quoting and forwarding", not js_errs(), str(js_errs()[:3]) + " | " + str(badresp[:3]))
 
         # ---- 13. mobile ----
         mp = ctx.new_page()
@@ -1776,6 +1824,33 @@ def main():
         pg.wait_for_timeout(300)
         check("import panel shows a single heading", pg.eval_on_selector_all("#setPanel h3", "e=>e.length") == 1)
         check("import panel explains the paste", "botmrr.io" in pg.eval_on_selector("#setPanel textarea", "e=>e.placeholder"))
+        # The button must hand out the structure the server accepts — so the copied text is what we
+        # assert on, not that a button exists. It is read from a stubbed clipboard because the real
+        # one is permission-gated in headless Chromium and would silently copy nothing.
+        check("import panel offers 'Copy the structure'",
+              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')].some(b=>/Copy the structure/.test(b.textContent))"))
+        pg.evaluate("()=>{window.__copied=null;navigator.clipboard.writeText=async t=>{window.__copied=t}}")
+        pg.eval_on_selector_all("#setPanel .btn", "els=>els.find(x=>/Copy the structure/.test(x.textContent)).click()")
+        pg.wait_for_timeout(250)
+        copied = pg.evaluate("()=>window.__copied")
+        check("the copy button hands over a playbook", bool(copied) and copied.startswith("---\nbotmrr: 1"), repr((copied or "")[:24]))
+        check("what it copies is the server's own template",
+              copied == pg.evaluate("async()=>(await (await fetch('/api/config')).json()).team_template"))
+        check("the button confirms the copy",
+              "Copied" in pg.eval_on_selector_all("#setPanel .btn", "els=>els.find(x=>/Copy|Copied/.test(x.textContent)).textContent"))
+        # A playbook we refuse must name every missing part, so it can be revised.
+        bad = ("---\nbotmrr: 1\nagents:\n  - key: e2e-lead\n    name: Lea\n    title: Producer\n    description: Runs it.\n"
+               "  - key: e2e-dev\n    name: Dima\n    title: Engineer\nrooms:\n  - key: e2e-bad\n    name: Bad\n"
+               "    members:\n      - e2e-lead\n      - ghost\n    defaultResponder:\n      agent: ghost\n---\n")
+        pg.eval_on_selector("#setPanel textarea", f"e=>{{e.value={json.dumps(bad)};e.dispatchEvent(new Event('input'))}}")
+        pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(1200)
+        probs = pg.eval_on_selector_all("#setPanel ul.probs li", "els=>els.map(e=>e.textContent)")
+        check("a playbook missing parts is refused", "not the structure we accept" in pg.eval_on_selector("#setPanel", "e=>e.innerText"))
+        check("the refusal names the missing field", any("Dima" in p and "description" in p for p in probs), str(probs))
+        check("the refusal names the unknown member", any("ghost" in p and "member" in p for p in probs), str(probs))
+        check("the refusal names the unknown lead", any("ghost" in p and "lead" in p for p in probs), str(probs))
+        check("a refused playbook builds no bots",
+              not any(b["id"] == "e2e-dev" for b in pg.evaluate("async()=>(await (await fetch('/api/config')).json()).bots")))
         playbook = ("---\nbotmrr: 1\nagents:\n"
                     "  - key: e2e-lea\n    name: Lea\n    title: Producer\n    description: Runs the show.\n"
                     "    appearance:\n      color: purple\n"
@@ -2010,8 +2085,14 @@ def main():
               row_img("e2e-logo-room").startswith("/api/logo/e2e-logo-room?"), row_img("e2e-logo-room"))
 
         # the logo endpoint is a lookup, never a path
+        n0 = len(errors)
         code = pg.evaluate("async()=>{const r=await fetch('/api/logo/no-such-channel');return r.status}")
         check("an unknown channel has no logo to serve", code == 404, str(code))
+        # That 404 is the point of the check, and Chromium logs every failed load as a console error —
+        # so the line this probe just added is dropped here rather than blamed on the app at the end of
+        # the run. Only lines added since `n0` are considered, so nothing earlier is discarded.
+        errors[:] = errors[:n0] + [e for e in errors[n0:] if "Failed to load resource" not in e]
+        badresp[:] = [b for b in badresp if "no-such-channel" not in b]
         code2 = raw_get(BASE + "api/logo/..%2f..%2fetc%2fpasswd", path_as_is=True)[0]
         check("a traversing logo id is not a path", code2 == 404, str(code2))
         nologo = pg.evaluate("async()=>{const c=await (await fetch('/api/config')).json();"
@@ -2149,6 +2230,59 @@ def main():
         check("a room falls back to the general Mochi face",
               pg.eval_on_selector("#dockMochi", "e=>e.dataset.species") == "mochi",
               pg.eval_on_selector("#dockMochi", "e=>e.dataset.species"))
+
+        # ---- 16b. a bot's look: outfit, accessory and an uploaded avatar ----
+        # The three wardrobe axes live in the Look group and are drawn by mochi.js, so these checks
+        # are about the *editor* wiring: the pickers exist and repaint the preview, the choice is
+        # saved on the bot, and an uploaded picture becomes the body the sidebar draws. The engine
+        # itself (every garment on every species) is covered by tests/test_mochi.mjs.
+        pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
+        pg.eval_on_selector_all("#setTabs .mtab", f"els=>els[{tabs.index('Bots')}].click()"); pg.wait_for_timeout(300)
+        pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(400)   # New bot
+        looktxt = pg.eval_on_selector("#setPanel", "e=>e.innerText")
+        check("the bot editor offers a look: outfit, accessory and avatar",
+              all(k in looktxt for k in ["OUTFIT", "ACCESSORY", "AVATAR"]))
+        segs = pg.evaluate("""()=>{const g=[...document.querySelectorAll('#setPanel .fgroup')]
+            .find(e=>e.querySelector('h4') && e.querySelector('h4').textContent==='Look');
+            return g ? [...g.querySelectorAll('.seg')].map(s=>[...s.children].map(c=>c.textContent.trim())) : [];}""")
+        check("the Look group has face, outfit and accessory pickers", len(segs) == 3, str(segs))
+        check("the outfit picker lists the garments and a None",
+              len(segs) == 3 and all(k in segs[1] for k in ["None", "Scarf", "Tie", "Collar", "Apron", "Mantle", "Bow tie"]), str(segs[1:2]))
+        check("the accessory picker lists the accessories and a None",
+              len(segs) == 3 and all(k in segs[2] for k in ["None", "Glasses", "Hat", "Crown"]), str(segs[2:3]))
+        pg.eval_on_selector_all("#setPanel input", "els=>{els[0].value='E2E Look';els[0].dispatchEvent(new Event('change'))}")
+        prev_png = "()=>{const g=[...document.querySelectorAll('#setPanel .fgroup')].find(e=>e.querySelector('h4')&&e.querySelector('h4').textContent==='Look');const cv=g&&g.querySelector('canvas');return cv?cv.toDataURL():'';}"
+        bare = pg.evaluate(prev_png)
+        check("the Look group has its own preview canvas", bool(bare), str(len(bare)))
+        pg.eval_on_selector_all("#setPanel .seg button", "els=>{const b=els.find(x=>x.textContent.trim()==='Scarf');if(b)b.click()}")
+        pg.wait_for_timeout(350)
+        dressed = pg.evaluate(prev_png)
+        check("picking an outfit repaints the preview", dressed and dressed != bare)
+        pg.eval_on_selector_all("#setPanel .seg button", "els=>{const b=els.find(x=>x.textContent.trim()==='Crown');if(b)b.click()}")
+        pg.wait_for_timeout(350)
+        check("picking an accessory repaints it again",
+              pg.evaluate(prev_png) not in (bare, dressed))
+        pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(1000)   # Save bot
+        lookbot = next((b for b in pg.evaluate("async()=>(await (await fetch('/api/config')).json()).bots")
+                        if b["name"] == "E2E Look"), {})
+        check("the outfit and accessory are saved on the bot",
+              lookbot.get("outfit") == "scarf" and lookbot.get("accessory") == "crown", str(lookbot)[:120])
+        # A picture becomes the body. The fixture is a plain background with a centred subject —
+        # a flat single-colour image would be keyed out entirely, which is the point of the keying.
+        av = pg.evaluate("""async(id)=>{
+            const png = %s;
+            const r = await fetch('/api/avatar',{method:'POST',headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({id, data: 'data:image/png;base64,'+png})});
+            return (await r.json()).avatar || 0; }""" % json.dumps(__import__("base64").b64encode(png_blob()).decode()), lookbot.get("id"))
+        check("a picture is accepted as the bot's avatar", bool(av), str(av))
+        check("the avatar is served back as an image",
+              pg.evaluate("async(id)=>{const r=await fetch('/api/avatar/'+id);return [r.status, r.headers.get('content-type')]}", lookbot.get("id")) == [200, "image/png"])
+        pg.reload(wait_until="load"); pg.wait_for_timeout(1200)
+        drawn_av = pg.evaluate("""()=>{const li=[...document.querySelectorAll('#chans .sub .subbot, #bots .subbot')]
+            .find(x=>x.innerText.includes('E2E Look'));const cv=li&&li.querySelector('canvas.sidebot');
+            return cv?cv.toDataURL():'';}""")
+        check("the sidebar draws the avatar as the body", bool(drawn_av), str(len(drawn_av)))
+        check("no JS error from the look editor", not js_errs(), str(js_errs()[:3]) + " | " + str(badresp[:3]))
 
         # ---- 17. a bot's markdown reply is rendered, not shown raw ----
         # The reply is stubbed so the checks are about the renderer, not about what a model happens

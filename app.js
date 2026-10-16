@@ -1,6 +1,6 @@
 /* app.js — Anzen-bot UI. Wires the canvas mascot to the real backend.
    Channels + bots as chats, layered settings, a computer panel, and voice. */
-import { attach, detach, speciesFor, SPECIES } from "./mochi.js";
+import { attach, detach, speciesFor, SPECIES, OUTFITS, ACCESSORIES } from "./mochi.js";
 import { cue, unlock, CUE_FOR } from "./sound.js";
 
 const $ = s => document.querySelector(s);
@@ -156,6 +156,12 @@ const avatar = (name, color, cls, emoji, logo) => logo
    Coucou paints a small bot as a flat fill of its colour — no gradient, no white wash — and that
    is what makes its team read as saturated rather than pastel, so we do the same. */
 function sideFace(color) { return { flat: AV[color] || AV.blue }; }
+/* What a bot is wearing and whether it has an avatar: the three things that are not its colour or
+   its species. Kept in one place so every face the bot appears as — the sidebar row, the editor's
+   preview, the dock, the computer panel — is dressed the same, the way `faceOf` keeps them all the
+   same species. `avatar` is a version number, not a URL, so a new upload busts the cache. */
+const avatarUrl = b => b && b.avatar ? `/api/avatar/${encodeURIComponent(b.id)}?v=${b.avatar}` : "";
+const lookOf = b => ({ outfit: (b && b.outfit) || "", accessory: (b && b.accessory) || "", image: avatarUrl(b) });
 /* The dock is the one big face, so it keeps Coucou's full grading — a soft body lit from the top —
    and that is also what carries the state: a flat fill has nowhere to put the working / searching
    tint, so a flat dock would stop telling you what the bot is doing. Only the colour changes here. */
@@ -189,12 +195,19 @@ let pinned = true;
    reach it, and every message after that — yours and the bot's — is drawn below the fold with nothing
    to bring it back. So the pause is timed. It is restarted by each further scroll away from the bottom
    and cancelled by anything that puts the transcript at the bottom, so it only fires once the reader
-   has actually stopped reading back. */
+   has actually stopped reading back.
+
+   What it hands back is the *follow*, not a scroll. Firing used to drag the transcript to the bottom
+   as well, and that is the second reported bug: the timer is armed whenever the reader has stopped
+   short of the bottom, so reading back pulled them down a few seconds later with nothing having been
+   sent — and pulled them down again on every further scroll, which is what made it read as the app
+   polling. The trip down belongs to the next message, so this re-arms the follow and leaves the view
+   where the reader put it; `stick` is the only thing that moves it, and only a message calls that. */
 const RESUME_MS = 4000;
 let resumeTimer = 0;
 function holdFollow() {
   clearTimeout(resumeTimer);
-  resumeTimer = setTimeout(() => { toBottom($("#msgs")); $("#jump").hidden = true; }, RESUME_MS);
+  resumeTimer = setTimeout(() => { pinned = true; }, RESUME_MS);
 }
 /* Put the transcript at the bottom without animating the trip there. An animated follow would re-target
    on every append, and — worse for this — the browser fires a scroll event for each step of the
@@ -245,16 +258,46 @@ function subSink(T, sid) {
    first and formatting is layered onto the escaped string, so a bot can never inject HTML.
    A link keeps its href only for http/https/mailto — a `javascript:` URL renders as inert text. */
 const safeHref = u => (/^(https?:|mailto:|\/|#)/i.test(u) ? u : "#");
+/* A sentence puts punctuation after a URL, and the URL does not own it: "see https://x.com." must not
+   link the full stop. What is trimmed is handed back to the text rather than dropped, so the sentence
+   still reads as it was written. A closing bracket is kept only when it closes one the URL itself
+   opened, so a Wikipedia-style `..._(film)` survives while a URL inside a parenthetical does not
+   swallow the bracket that ends it. */
+function trimUrl(u) {
+  let s = u.replace(/[.,;:!?]+$/, "");
+  while (s.endsWith(")") && (s.match(/\(/g) || []).length < (s.match(/\)/g) || []).length) s = s.slice(0, -1);
+  return s;
+}
+/* The one thing that writes an anchor, so a markdown link, a bare URL and a card's own link cannot
+   drift apart. `href` is the only attribute a click is read from, and it is always filtered. */
+const linkHtml = (t, u) => '<a class="lnk" href="' + safeHref(u) + '" target="_blank" rel="noopener noreferrer">' + (t || u) + "</a>";
+/* A bare URL, in text that has already been escaped. `&` is allowed only as `&amp;`, so a query string
+   survives (`?a=1&amp;b=2`) while a `&quot;` ending a sentence stops the match instead of being eaten. */
+const BARE_URL = /(^|[\s(>])(https?:\/\/[^\s&<>"']*(?:&amp;[^\s&<>"']*)*)/g;
+/* Autolink one match, keeping whatever trailing punctuation the URL only happened to be next to. */
+function linkBare(pre, u) {
+  const url = trimUrl(u);
+  return pre + linkHtml(null, url) + u.slice(url.length);
+}
+/* A URL the *reader* typed is still a URL, so it is linked — but nothing else about a person's text is
+   reformatted. Their message stays literal: a shell command with an asterisk must not come back italic. */
+const linkify = s => esc(s || "").replace(BARE_URL, (m, pre, u) => linkBare(pre, u));
 function inlineMd(s) {
-  const codes = [];   // code spans are lifted out first, so `*` inside them stays literal
-  s = s.replace(/`([^`]+)`/g, (m, c) => { codes.push(c); return "\uE000" + (codes.length - 1) + "\uE001"; });
+  /* Code spans and markdown links are lifted out first: a `*` inside a code span stays literal, and
+     the bare-URL pass below cannot match the URL inside a link that already has one. Both come back
+     as finished HTML, so the restore is one substitution for either. */
+  const held = [];
+  const hold = h => "\uE000" + (held.push(h) - 1) + "\uE001";
+  s = s.replace(/`([^`]+)`/g, (m, c) => hold("<code>" + c + "</code>"));
+  s = s.replace(/\[([^\]]*)\]\(([^)\s]*)\)/g, (m, t, u) => hold(linkHtml(t, u)));
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
        .replace(/~~([^~]+)~~/g, "<del>$1</del>")
        .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-       .replace(/(^|[^_\w])_([^_\n]+)_(?![\w])/g, "$1<em>$2</em>")
-       .replace(/\[([^\]]*)\]\(([^)\s]*)\)/g, (m, t, u) =>
-         '<a href="' + safeHref(u) + '" target="_blank" rel="noopener noreferrer">' + (t || u) + "</a>");
-  return s.replace(/\uE000(\d+)\uE001/g, (m, i) => "<code>" + codes[+i] + "</code>");
+       .replace(/(^|[^_\w])_([^_\n]+)_(?![\w])/g, "$1<em>$2</em>");
+  /* A bare URL is what a bot actually writes — the transcripts hold hundreds of them and not one
+     markdown link — so without this every URL in a reply is plain text and nothing is clickable. */
+  s = s.replace(BARE_URL, (m, pre, u) => pre + hold(linkBare("", u)));
+  return s.replace(/\uE000(\d+)\uE001/g, (m, i) => held[+i]);
 }
 function mdToHtml(text, escaped) {
   const lines = (escaped ? String(text || "") : esc(text || "")).replace(/\r\n?/g, "\n").split("\n");
@@ -371,7 +414,7 @@ function setDock(st) {
 function dockFace() {
   if (!S.dock) return;
   const b = S.activeIsChannel ? null : botOf(S.active);
-  S.dock.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null);
+  S.dock.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null);
   S.dock.cv.dataset.species = S.dock.species;
   compDress();                                            // the computer panel's placeholder follows too
 }
@@ -527,6 +570,7 @@ async function boot() {
   S.bots = cfg.bots; S.channels = cfg.channels; S.models = cfg.models;
   S.settings = cfg.settings || {}; S.skills = cfg.skills || []; S.routines = cfg.routines || [];
   S.tools = cfg.tools || []; S.connectorTools = cfg.connector_tools || []; S.fontSizes = cfg.font_sizes || [BASE_PX];
+  S.teamTemplate = cfg.team_template || "";   // the import panel hands this out; without it a cold start copies nothing
   applyAppearance(S.settings.appearance);
   attach($(".bm"), "finished", { species: speciesFor(S.settings.company_name || "anzen") });
   S.dock = attach($("#dockMochi"), "idle", { species: "mochi" });   // re-skinned per context by dockFace()
@@ -606,6 +650,86 @@ function foldGroup(cid) {
   const shut = s.has(cid);
   g.querySelector(".sub")?.classList.toggle("shut", shut);
   g.querySelector(".caret")?.classList.toggle("open", !shut);
+}
+/* A whole section folds the same way, keyed by its own name rather than by a company id — a
+   separate store, so a company that happens to be called "chats" cannot fold the chat list. The
+   list runs to the newest conversation every time a turn ends, and on a short window that pushes
+   the rooms and bots off the bottom; folding it hands the sidebar back. */
+const shutSecs = () => { try { return new Set(JSON.parse(localStorage.getItem("nav.shut") || "[]")); } catch (e) { return new Set(); } };
+function applySecs() {
+  const shut = shutSecs().has("chats");
+  const lab = $("#chatsLabel"); if (!lab) return;
+  lab.parentElement.classList.toggle("shut", shut);
+  lab.setAttribute("aria-expanded", String(!shut));
+  lab.querySelector(".caret")?.classList.toggle("open", !shut);
+}
+function foldSec(name) {
+  const s = shutSecs(); s.has(name) ? s.delete(name) : s.add(name);
+  try { localStorage.setItem("nav.shut", JSON.stringify([...s])); } catch (e) {}
+  applySecs();
+}
+/* ---------------- rearranging the sidebar by hand ----------------
+   Hold a row and drag it: the three lists that are a stored array — the rooms, the loose bots, and
+   one room's members — can be put in any order, and the drop writes that order to channels.json /
+   bots.json. The order is the record's rather than this browser's, so the phone reads what the
+   window arranged, and nothing new is stored to say so.
+
+   The browser's own drag-and-drop, not pointer events: the rows are already in the DOM, and the
+   ghost, the autoscroll near the edge and the touch long-press all come with it. A row only ever
+   drops back into its own list — dragging a bot onto the rooms would be a different act (adding it
+   to a room), and this is not the place for it. */
+let dragRow = null, dragWas = "";
+const dragBox = li => li && li.parentElement;
+const dragRows = box => [...box.children].filter(x => x.dataset.drag);
+/* The three lists whose order is a stored array, and nothing else: a row dragged out of one of
+   them has nowhere to go, so the drag never starts. */
+const isList = box => !!box && (box.id === "chans" || box.id === "bots" || box.matches("ul.sub"));
+function dragStart(e) {
+  const li = e.target.closest ? e.target.closest("[data-drag]") : null;
+  if (!isList(dragBox(li))) return;
+  dragRow = li; dragWas = dragRows(dragBox(li)).map(x => x.dataset.drag).join(",");
+  li.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+  /* Firefox starts no drag at all without something on the clipboard, so the payload is the row's
+     own id — which is also what a drop into another window would carry. */
+  try { e.dataTransfer.setData("text/plain", li.dataset.drag); } catch (err) {}
+}
+function dragOver(e) {
+  if (!dragRow) return;
+  const box = dragBox(dragRow);
+  /* Only the list the row was picked up from accepts it, and it accepts anywhere inside itself —
+     including over a room's members, which are a list of their own. Testing the box rather than the
+     element under the pointer is what makes an expanded room a valid place to drop a room. */
+  if (!box || !e.target || !box.contains(e.target)) return;
+  e.preventDefault(); e.dataTransfer.dropEffect = "move";
+  /* The row follows the pointer rather than being drawn by a CSS rule: the gap it leaves is the
+     list closing up, which is the answer to "where will this land". Half a row is the midpoint, so
+     a drag past the middle of a row means "after it". */
+  const after = dragRows(box).find(x => x !== dragRow &&
+    e.clientY < x.getBoundingClientRect().top + x.getBoundingClientRect().height / 2);
+  after ? box.insertBefore(dragRow, after) : box.appendChild(dragRow);
+}
+/* The drop itself does nothing: `dragend` is the one commit, so a row let go outside any list —
+   which fires no `drop` — is saved exactly like one let go inside it. */
+async function dragEnd() {
+  if (!dragRow) return;
+  const li = dragRow, box = dragBox(li);
+  dragRow = null; li.classList.remove("dragging");
+  if (!box || !box.contains(li)) return;                     // the list was rebuilt under the drag
+  const ids = dragRows(box).map(x => x.dataset.drag);
+  if (ids.join(",") === dragWas) return;                     // put back where it was picked up
+  const kind = box.id === "chans" ? "channels" : box.id === "bots" ? "bots" : "members";
+  const body = { kind, ids };
+  if (kind === "members") body.id = box.closest(".group").dataset.group;
+  const r = await jpost("/api/nav/order", body);
+  if (r.ok === false) { alert(r.error || "Could not save the new order."); return reloadConfig(); }
+  /* The rows are already where they were dropped, so the state is patched and nothing re-renders:
+     a rebuild here would tear down and restart every face in the sidebar for a list that is
+     already right. */
+  if (kind === "bots") S.bots = r.bots; else S.channels = r.channels;
+  /* Pin still floats a room to the top, so a drag across the pinned boundary is undone at the next
+     render. Redrawing now rather than later is what makes the row's landing honest. */
+  if (kind === "channels" && S.channels.some(c => c.pinned)) renderNav();
 }
 
 /* ---------------- chats (past conversations) ----------------
@@ -743,6 +867,9 @@ function subRow(b, scope) {
   const key = scope ? scope + "/" + b.id : b.id;
   const li = el("li", "bot subbot" + (key === S.active ? " sel" : "")); li.dataset.id = key; li.dataset.kind = "bot";
   li.dataset.bot = b.id;                                  // the row's key is scoped; the menu needs the bot id too
+  /* Both lists this row appears in are stored arrays — the loose bots, and one room's members — and
+     the bare bot id is what orders either one, so one attribute serves the drag for both. */
+  li.dataset.drag = b.id; li.draggable = true;
   li.innerHTML = `${avatar(b.name, b.color, "", b.emoji)}
     <div class="min"><div class="nm">${esc(b.name)}${b.pinned ? `<span class="pin">${svg("pin")}</span>` : ""}<i class="dot"></i></div>
     <div class="rl">${esc(b.title || b.role || "")}</div></div><span class="kebab" title="More actions">⋯</span>`;
@@ -756,7 +883,7 @@ function subRow(b, scope) {
   cv.setAttribute("aria-hidden", "true");   // decorative: the row's own name carries the meaning
   cv.dataset.species = faceOf(b);
   holder.replaceWith(cv);
-  S.sideMochi[key] = attach(cv, "idle", { size: 46, species: cv.dataset.species, ...sideFace(b.color) });
+  S.sideMochi[key] = attach(cv, "idle", { size: 46, species: cv.dataset.species, ...sideFace(b.color), ...lookOf(b) });
   return li;
 }
 function renderNav() {
@@ -768,7 +895,9 @@ function renderNav() {
   const shut = collapsed();
   const cbox = $("#chans"); cbox.innerHTML = "";
   const claimed = new Set();                              // bots that live under some company
-  for (const c of S.channels) {
+  /* A pinned room floats, exactly as a pinned bot does, and the sort is stable so the rest keep the
+     order you dragged them into. */
+  for (const c of [...S.channels].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0))) {
     const members = (c.members || []).map(m => bot(m)).filter(b => b && !b.hidden);
     members.forEach(b => claimed.add(b.id));
     const isShut = shut.has(c.id);
@@ -776,7 +905,7 @@ function renderNav() {
     const roster = members.map(b => b.name).join(" · ");
     const repo = (c.folder || "").replace(/\/+$/, "").split("/").pop();   // the row is narrow; the full path is in the header
     li.innerHTML = `<span class="caret${isShut ? "" : " open"}" title="Fold or expand the team" aria-label="Fold or expand the team">${svg("caret")}</span>${avatar(c.name, c.color, "", "", logoOf(c))}
-      <div class="min" title="${esc(roster)}"><div class="nm">${esc(c.name)}<i class="dot"></i></div>
+      <div class="min" title="${esc(roster)}"><div class="nm">${esc(c.name)}${c.pinned ? `<span class="pin">${svg("pin")}</span>` : ""}<i class="dot"></i></div>
       <div class="rl"${c.folder ? ` title="repo: ${esc(c.folder)}"` : ""}>${members.length} member${members.length === 1 ? "" : "s"}${repo ? " · " + esc(repo) : ""}</div></div>
       <span class="kebab" title="More actions">⋯</span>`;
     li.onclick = e => {
@@ -802,7 +931,9 @@ function renderNav() {
     kbd(li, () => { if (c.id !== S.active) select(c.id); });
     kbd(li.querySelector(".kebab"), e => openCtx(e, c.id, "channel"));
     kbd(li.querySelector(".caret"), () => foldGroup(c.id));
-    const group = el("li", "group"); group.dataset.group = c.id;
+    /* A room is dragged by its row, and its members come with it — the unit that moves is the whole
+       group, so a room keeps its team folded up inside it. */
+    const group = el("li", "group"); group.dataset.group = c.id; group.dataset.drag = c.id; group.draggable = true;
     group.appendChild(li);
     const sub = el("ul", "sub" + (isShut ? " shut" : ""));
     for (const b of members) sub.appendChild(subRow(b, c.id));
@@ -1061,8 +1192,9 @@ function addMsg(role, text, who, to, meta, sid) {
   if (label) d.appendChild(el("div", "who", hueSpan(label, "wn", hue) + `<span class="mts">${when}</span>`));
   else d.appendChild(el("div", "who", `<span class="mts">${when}</span>`));
   /* A bot writes markdown, so its reply is rendered. A person types plain text, which is shown
-     exactly as typed — a shell command with an asterisk must not come back italic. */
-  if (role === "user") d.appendChild(document.createTextNode(text || ""));
+     exactly as typed — a shell command with an asterisk must not come back italic. Only a URL in it
+     is dressed up, because a URL you cannot click is the one thing plain text gets wrong. */
+  if (role === "user") d.appendChild(el("span", "", linkify(text)));
   else d.appendChild(el("div", "md", mdToHtml(text || "")));
   if (role !== "user" && text && text.length > 40 && S.settings.voice && S.settings.voice.auto) {
     const sp = el("button", "speak", `${svg("speaker")} Listen`); sp.onclick = () => speak(text); d.appendChild(sp);
@@ -1999,6 +2131,7 @@ function openCtx(e, id, kind, sess, dir) {
     ["sep", "", ""],
     ["add", "Add to chat", "plus"],
   ] : [
+    ["pin", (c && c.pinned ? "Unpin" : "Pin"), "pin"],
     ["edit", "Edit room", "edit"],
     ["sep", "", ""],
     ["clear", "Clear chat", "clear"],
@@ -2143,7 +2276,16 @@ async function ctxAction(act, id, kind, dir) {
     if (S.active === sess) select(sess);          // re-render the chat, now empty
     return;
   }
-  if (act === "pin" || act === "hide") { const b = bot(id); if (!b) return; const key = act === "pin" ? "pinned" : "hidden";
+  if (act === "pin" || act === "hide") {
+    /* A room pins to the top of the sidebar; it has no `hidden` — taking a room out of the sidebar
+       would hide its bots' chats with it, and Delete is the honest way to do that. */
+    if (kind === "channel") {
+      const c = chan(id); if (!c || act === "hide") return;
+      const r = await jpost("/api/channel", { channel: { id, pinned: !c.pinned } });
+      if (r.ok === false) { alert(r.error || "Could not change that."); return; }
+      await reloadConfig(); return;
+    }
+    const b = bot(id); if (!b) return; const key = act === "pin" ? "pinned" : "hidden";
     const r = await jpost("/api/bot", { bot: { id, [key]: !b[key] } });
     if (r.ok === false) { alert(r.error || "Could not change that."); return; }
     await reloadConfig(); return; }
@@ -2157,6 +2299,7 @@ async function reloadConfig() {
   if (!cfg) return;
   S.bots = cfg.bots; S.channels = cfg.channels; S.models = cfg.models; S.settings = cfg.settings || {}; S.routines = cfg.routines || [];
   S.tools = cfg.tools || S.tools; S.connectorTools = cfg.connector_tools || []; S.fontSizes = cfg.font_sizes || S.fontSizes;
+  S.teamTemplate = cfg.team_template || S.teamTemplate;
   applyAppearance(S.settings.appearance); renderNav(); loadChats();
 }
 
@@ -2196,7 +2339,7 @@ function closeComp(restoreFocus = true) {
 function compDress() {
   if (!S.compFace) return;
   const b = S.activeIsChannel ? null : botOf(S.active);
-  S.compFace.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null);
+  S.compFace.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null);
 }
 async function refreshComp(force) {
   // The panel polls this every 2.5s; a transient error must not throw an unhandled rejection each
@@ -2341,6 +2484,75 @@ function addToChat(rel) {
   setTimeout(() => ta.focus(), 0);
 }
 
+/* ---------------- link panel ---------------- */
+/* A link opened beside the chat rather than thrown at the system browser, so you can read the page
+   the bot is talking about without leaving the conversation.
+
+   In the desktop app the frame is a real embedded browser — a `<webview>`, the same thing ZCode's own
+   browser panel is built on. It has to be: the sites these bots cite (Threads, most social and
+   news sites) send X-Frame-Options and render as a blank rectangle in an `<iframe>`, which is
+   exactly the difference measured before choosing. A plain browser has no `<webview>`, so there the
+   frame is an iframe and the header keeps an "Open in browser" for the sites that refuse to be framed. */
+let linkHist = [], linkAt = -1, linkReturn = null;
+const canWebview = () => typeof window.anzen !== "undefined" && !!window.customElements.get("webview");
+/* Built on the first open and reused after, so switching links does not rebuild the browser — but a
+   kind change (iframe in the browser, webview in the app) does, because the element is not swappable. */
+function linkFrame() {
+  const body = $("#linkBody");
+  const want = canWebview() ? "webview" : "iframe";
+  let f = body.querySelector(".linkframe");
+  if (f && f.tagName.toLowerCase() === want) return f;
+  if (f) f.remove();
+  f = document.createElement(want);
+  f.className = "linkframe";
+  /* A webview is a browser of its own: a named partition keeps it off the app's own session, and no
+     `allowpopups` keeps a link inside the page from spawning a window over the chat. */
+  if (want === "webview") f.setAttribute("partition", "persist:links");
+  else f.setAttribute("referrerpolicy", "no-referrer");
+  body.appendChild(f);
+  return f;
+}
+/* `from` is the anchor that was clicked, so closing the panel hands the caret back to the line you
+   were reading rather than to nowhere. */
+function openLink(url, from) {
+  if ($("#comp").classList.contains("on")) closeComp(false);
+  if ($("#files").classList.contains("on")) closeFiles(false);
+  if (from) linkReturn = from;
+  linkHist = linkHist.slice(0, linkAt + 1); linkHist.push(url); linkAt = linkHist.length - 1;
+  showLink();
+  const p = $("#link"); p.classList.add("on"); p.inert = false;
+  document.body.classList.add("overlay");
+  panelTop();
+}
+function showLink() {
+  const url = linkHist[linkAt] || "";
+  const f = linkFrame();
+  /* Set as an attribute, not the property: a webview navigates on the attribute change, and the same
+     write is what an iframe wants too. */
+  if (f.getAttribute("src") !== url) f.setAttribute("src", url);
+  $("#linkTitle").textContent = url;
+  $("#linkTitle").title = url;
+  $("#linkOut").href = url;
+  const back = $("#linkBack");
+  back.disabled = linkAt <= 0;
+  /* Only a browser without `<webview>` can meet a page that refuses to be framed, so only there is
+     the note worth saying. */
+  const note = $("#linkNote");
+  note.hidden = canWebview();
+  note.textContent = "If this stays blank the site does not allow being embedded — use Open in browser.";
+}
+function closeLink(restoreFocus = true) {
+  const p = $("#link"); const wasOpen = p.classList.contains("on");
+  p.classList.remove("on"); p.inert = true;
+  document.body.classList.remove("overlay");
+  /* The page is released rather than left loaded behind a hidden panel: it would keep playing video
+     and running scripts for a panel nobody can see. The history is kept, so reopening a link is
+     instant to re-navigate and the Back button still knows where it was. */
+  const f = $("#linkBody").querySelector(".linkframe"); if (f) f.remove();
+  if (restoreFocus && wasOpen && linkReturn && linkReturn.focus) linkReturn.focus();
+  linkReturn = null;
+}
+
 /* ---------------- settings ---------------- */
 /* The rail, grouped so fourteen sections stay scannable — a group is a heading you read, not a thing
    you click. The order is the order you meet them: what the app runs on, what is in it, how it
@@ -2369,17 +2581,18 @@ let curTab = "general", curEdit = null, settingsReturnFocus = null;
    transcript is not read-only — a stray activation there is a real edit. `inert` removes both at
    once, and the browser lifts focus for us when it goes back on. The dock is named because it is a
    sibling of the shell, not a child of it. */
-const BEHIND = ["#side", "#main", "#dock", "#comp", "#files"];
+const BEHIND = ["#side", "#main", "#dock", "#comp", "#files", "#link"];
 function behindInert(on) {
   for (const s of BEHIND) { const n = $(s); if (n) n.inert = on; }
   /* Each side panel is an overlay of its own: when the dialog lets go, it goes back to whatever it
      was — inert unless it is actually on screen. Clearing it wholesale would leave a hidden panel's
      controls reachable by keyboard and a screen reader. */
-  if (!on) for (const s of ["#comp", "#files"]) { const n = $(s); n.inert = !n.classList.contains("on"); }
+  if (!on) for (const s of ["#comp", "#files", "#link"]) { const n = $(s); n.inert = !n.classList.contains("on"); }
 }
 function openSettings(tab, id) {
   if ($("#comp").classList.contains("on")) closeComp();
-  if ($("#files").classList.contains("on")) closeFiles();   // a dialog owns the screen; both panels yield
+  if ($("#files").classList.contains("on")) closeFiles();   // a dialog owns the screen; the panels yield
+  if ($("#link").classList.contains("on")) closeLink();
   curTab = tab || curTab; curEdit = id || null;
   settingsReturnFocus = document.activeElement;
   $("#scrim").classList.add("on"); document.body.classList.add("overlay"); renderTabs(); renderPanel();
@@ -2727,6 +2940,78 @@ function logoField(p, c) {
   draw();
 }
 
+/* The bot's avatar: an uploaded picture that becomes the body, or a mascot body the image model
+   draws from a photo of your own. Either way it is stored under the bot's id, so — like a channel
+   logo — the bot has to exist before one can be added. The face is still drawn on top by the
+   engine, which is why the Transform prompt asks the model for a body and no face. */
+function avatarField(p, b, redraw) {
+  const prev = el("div", "lgprev"), said = el("div", "lgsaid"), wrap = el("div", "logofld");
+  const msg = el("div", "hint"), row = el("div", "row"), row2 = el("div", "row");
+  const file = el("input"); file.type = "file"; file.style.display = "none";
+  file.accept = "image/png,image/jpeg,image/webp";
+  const up = el("button", "btn ghost sm", "Upload a picture"); up.type = "button";
+  const tr = el("button", "btn ghost sm", "Transform a photo"); tr.type = "button";
+  const rm = el("button", "btn ghost sm", "Remove"); rm.type = "button";
+  let bad = "", photo = "";   // `photo` is the data URL the Transform button sends
+  const draw = () => {
+    const url = avatarUrl(b);
+    prev.innerHTML = url ? `<div class="mc img"><img src="${url}" alt=""></div>` : "";
+    const has = !!b.id;
+    up.disabled = tr.disabled = rm.disabled = !has;
+    rm.style.display = b.avatar ? "" : "none";
+    tr.textContent = photo ? "Transform this photo" : "Transform a photo";
+    msg.style.color = bad ? "#ff6b6b" : "";
+    msg.textContent = bad || (!has ? "Save the bot, then give it an avatar."
+      : b.avatar ? "Your avatar replaces the body; the face is still drawn on top."
+      : "No avatar — the bot's own colour and shape are the body.");
+  };
+  const send = async (url, body, busy) => {
+    up.disabled = tr.disabled = rm.disabled = true; bad = ""; msg.textContent = busy;
+    try {
+      const r = await jpost(url, body);
+      if (!r.ok) throw new Error(r.error || "that did not work");
+      b.avatar = r.avatar || 0;
+      await reloadConfig();
+      redraw();
+    } catch (e) { bad = String(e.message || e); }
+    draw();
+  };
+  up.onclick = () => file.click();
+  file.onchange = () => {
+    const f = file.files[0]; file.value = ""; if (!f) return;
+    bad = f.size > 2e6 ? "That image is larger than 2 MB — try a smaller one." : "";
+    if (bad) return draw();
+    const rd = new FileReader();
+    rd.onload = () => send("/api/avatar", { id: b.id, data: rd.result }, "Uploading…");
+    rd.onerror = () => { bad = "Could not read that file."; draw(); };
+    rd.readAsDataURL(f);
+  };
+  /* The transform runs image-to-image at the router, so it is 30-60s of real work. The button says
+     so while it waits rather than looking hung, and the species and colour already picked are sent
+     along so the drawn body matches the face that will land on it. */
+  tr.onclick = () => {
+    if (photo) return send("/api/avatar/transform",
+      { id: b.id, data: photo, species: b.face || speciesFor(b.id || b.name), color: b.color },
+      "Drawing your bot… this takes up to a minute.");
+    file2.click();
+  };
+  const file2 = el("input"); file2.type = "file"; file2.style.display = "none";
+  file2.accept = "image/png,image/jpeg,image/webp";
+  file2.onchange = () => {
+    const f = file2.files[0]; file2.value = ""; if (!f) return;
+    if (f.size > 6e6) { bad = "That photo is larger than 6 MB — try a smaller one."; return draw(); }
+    const rd = new FileReader();
+    rd.onload = () => { photo = rd.result; bad = ""; draw(); };
+    rd.onerror = () => { bad = "Could not read that file."; draw(); };
+    rd.readAsDataURL(f);
+  };
+  rm.onclick = () => send("/api/avatar/remove", { id: b.id }, "Removing…");
+  row.append(up, rm); row2.append(tr); said.append(row, row2, msg); wrap.append(prev, said, file, file2);
+  fld(p, "AVATAR", wrap,
+      "A picture used as the bot's body, clipped to its shape. Transform draws one from your own photo — the face, its mood and its colour are still the engine's, so it keeps animating.");
+  draw();
+}
+
 function editChannel(c) {
   c = c || { name: "", mode: "lead", members: S.bots.map(b => b.id), lead: (S.bots[0] || {}).id, instructions: "", folder: "" };
   const p = $("#setPanel"); p.innerHTML = "";
@@ -2807,6 +3092,11 @@ function importPanel(p) {
   fld(p, "PASTED TEAM", ta, "A BotMRR playbook builds the bots, their roles and a shared room. A plain list builds the bots.");
   const out = el("div");
   const row = el("div", "row");
+  /* The structure is handed out so it can be handed to a model: copy it, describe the team you want
+     around it, and paste back what comes out. What comes back is held to the same structure, and
+     anything missing is named below the box rather than imported half-built. */
+  const tpl = el("button", "btn ghost sm", `${svg("copy")} Copy the structure`);
+  tpl.onclick = () => copyText(S.teamTemplate || "", tpl);
   const build = el("button", "btn pri", "Build team");
   const back = el("button", "btn ghost", "Back"); back.onclick = () => { curEdit = null; renderPanel(); };
   build.onclick = async () => {
@@ -2816,18 +3106,25 @@ function importPanel(p) {
     try { r = await jpost("/api/team/import", { text: ta.value }); }
     catch (e) { r = { ok: false, error: isOffline(e) ? "could not reach the server" : String(e) }; }
     build.disabled = false; build.textContent = "Build team";
-    if (!r.ok) { out.innerHTML = `<div class="hint">${esc(r.error || "could not read that")}</div>`; return; }
+    if (!r.ok) {
+      const miss = (r.problems || []).map(x => `<li>${esc(x)}</li>`).join("");
+      out.innerHTML = `<div class="hint">${esc(r.error || "could not read that")}${miss ? `<ul class="probs">${miss}</ul>` : ""}</div>`;
+      return;
+    }
     await reloadConfig();
     out.innerHTML = `<div class="card"><div class="ct"><div><b>Added ${r.created.length} bot${r.created.length === 1 ? "" : "s"}</b>
       <div class="sub">${esc(r.created.join(" · "))}${r.room ? ", room: " + esc(r.room) : ""}</div></div></div></div>`;
   };
-  row.append(build, back);
-  p.appendChild(row); p.appendChild(out);
+  row.append(tpl, build, back);
+  p.appendChild(row);
+  p.appendChild(el("div", "hint", "Send the structure to your AI with the team you want, then paste its answer above."));
+  p.appendChild(out);
 }
 function botEditor(p, b) {
   const isNew = !b;
   b = b || { id: "", name: "", title: "", role: "", color: "blue", model: S.models[0], approval: "ask",
-    memory: true, voice: "", instructions: "", skills: [], tools_allow: null, hidden: false, pinned: false, emoji: "", face: "" };
+    memory: true, voice: "", instructions: "", skills: [], tools_allow: null, hidden: false, pinned: false,
+    emoji: "", face: "", outfit: "", accessory: "", avatar: 0 };
   h3(p, isNew ? "New bot" : "Edit " + b.name, "Give the bot a name, a brain, and what it may do.");
   /* The editor is long, so it reads as five short sections — who the bot is, how it looks, how it
      thinks, what it knows, what it may run — instead of one undivided column of fields. */
@@ -2850,7 +3147,22 @@ function botEditor(p, b) {
   let prevM = null;
   const drawFace = () => {
     if (prevM) detach(prevM);
-    prevM = S.facePrev = attach(prev, "idle", { size: 84, species: b.face || speciesFor(b.id || b.name), ...sideFace(b.color) });
+    prevM = S.facePrev = attach(prev, "idle", { size: 84, species: b.face || speciesFor(b.id || b.name), ...sideFace(b.color), ...lookOf(b) });
+  };
+  /* One row of choices per axis. `blank` is the honest default for every one of them — no garment,
+     and a face derived from the name — so a bot left alone still looks like itself. */
+  const picker = (keys, cur, set) => {
+    const wrap = el("div", "seg");
+    for (const [k, label] of [["", "None"], ...keys]) {
+      const x = el("button", cur === k ? "on" : "", label);
+      x.onclick = () => {
+        set(k);
+        [...wrap.children].forEach(n => n.classList.remove("on")); x.classList.add("on");
+        drawFace();
+      };
+      wrap.appendChild(x);
+    }
+    return wrap;
   };
   const faceBtn = (k, label) => {
     const x = el("button", b.face === k ? "on" : "", label);
@@ -2866,9 +3178,14 @@ function botEditor(p, b) {
   p.appendChild(idG);
   const lookG = el("div", "fgroup"); lookG.appendChild(el("h4", "", "Look"));
   fld(lookG, "FACE", faceWrap, "Each bot gets its own shape, ears and idle motion. Leave blank to let the name pick one.");
-  const fp = fld(lookG, "PREVIEW", prev, "Tap a face above. This is the bot as it will look in the sidebar.");
+  const fp = fld(lookG, "PREVIEW", prev, "This is the bot as it will look in the sidebar.");
   fp.querySelector("canvas").style.cssText = "width:84px;height:84px;border-radius:18px;background:var(--card2);border:1px solid var(--line)";
   drawFace();
+  const outfitWrap = picker(Object.entries(OUTFITS).map(([k, v]) => [k, v.label]), b.outfit || "", v => b.outfit = v);
+  fld(lookG, "OUTFIT", outfitWrap, "What it wears on its body. Fixed colours, so a garment stays legible whatever the bot's own colour is.");
+  const accWrap = picker(Object.entries(ACCESSORIES).map(([k, v]) => [k, v.label]), b.accessory || "", v => b.accessory = v);
+  fld(lookG, "ACCESSORY", accWrap, "What it wears on its head or face. Anchored to the bot's own eye row, so it sits right on every shape.");
+  avatarField(lookG, b, drawFace);
   p.appendChild(lookG);
   const brainG = el("div", "fgroup"); brainG.appendChild(el("h4", "", "Brain"));
   modelPicker(brainG, b);
@@ -3044,9 +3361,12 @@ function tabModels(p) {
   const ms = el("input"); ms.type = "number"; ms.min = "0"; ms.step = "5"; ms.value = String(ccfg().max_steps || 0);
   ms.onchange = () => saveSettings({ context: { ...ccfg(), max_steps: Math.max(0, parseInt(ms.value || "0", 10) || 0) } });
   fld(xc, "MAX STEPS PER TURN", ms, "How many model calls one turn may make before it must report. 0 uses the default (80). A step is one action — open a page, read it, click — so a browsing job needs many; raise it if a bot is still being cut off mid-work.");
+  const mt = el("input"); mt.type = "number"; mt.min = "0"; mt.step = "60"; mt.value = String(ccfg().max_seconds || 0);
+  mt.onchange = () => saveSettings({ context: { ...ccfg(), max_seconds: Math.max(0, parseInt(mt.value || "0", 10) || 0) } });
+  fld(xc, "MAX SECONDS PER TURN", mt, "An optional hard cap on how long one turn may keep working, in seconds. 0 — the default — is no cap: the turn runs until it has spent its step budget, so a slow but real job is never cut off for taking a long time. Set a number only if you want a runaway stopped by the clock as well. The cap is checked between steps, so a command or a model answer already running is allowed to finish.");
   const rt = el("input"); rt.type = "number"; rt.min = "0"; rt.max = "10"; rt.step = "1"; rt.value = String(ccfg().model_retries || 0);
   rt.onchange = () => saveSettings({ context: { ...ccfg(), model_retries: Math.min(10, Math.max(0, parseInt(rt.value || "0", 10) || 0)) } });
-  fld(xc, "RETRIES IF THE MODEL GOES QUIET", rt, "How many times to try again when a model call says nothing at all. 0 uses the default (2), so three tries in total. Raise it on a connection that keeps dropping mid-answer.");
+  fld(xc, "RETRIES IF THE MODEL GOES QUIET", rt, "How many times to try again when a model call says nothing at all. 0 uses the default (10), so eleven tries in total. A call that fails fast — a refusal, a dropped connection — gets all of them; a model that has gone silent spends the full wait on each try, so it gets about three before the app stops and reports. Raise it on a connection that keeps dropping mid-answer.");
   const stl = el("input"); stl.type = "number"; stl.min = "0"; stl.max = "3600"; stl.step = "10"; stl.value = String(ccfg().model_stall_seconds || 0);
   stl.onchange = () => saveSettings({ context: { ...ccfg(), model_stall_seconds: Math.min(3600, Math.max(0, parseInt(stl.value || "0", 10) || 0)) } });
   fld(xc, "WAIT BEFORE RETRYING", stl, "How long to wait, in seconds, for the model to say something before giving up on that try and starting another. 0 uses the default (120). Raise it for a slow model that thinks for a long time before it answers.");
@@ -3604,12 +3924,14 @@ function tabHelp(p) {
   list(s, [
     "<b>Identity</b> — name, optional emoji, title, a one-line role, and the colour that paints its avatar.",
     "<b>Look</b> — the face: each bot gets its own shape, ears and idle motion, and the preview shows exactly how it will sit in the sidebar.",
+    "<b>Outfit and accessory</b> — what it wears: a scarf, a tie, a hat, glasses. The outfit is clipped to its body; the accessory is anchored to its own eye row, so both sit right on every shape.",
+    "<b>Avatar</b> — a picture used as the bot's body instead of its colour. Upload one, or hit Transform to have the image model draw a mascot body from your own photo. The face is still drawn on top, so it keeps blinking, looking around and showing what it is doing.",
     "<b>Brain</b> — the model, the approval level, a switch for memory, and the standing instructions (the bot's system prompt).",
     "<b>Skills</b> — tick the skills this bot should lean on.",
     "<b>Tools</b> — all current tools, or a custom selection.",
   ]);
   para(s, "The Bots list shows one card per bot with its title, model, approval and memory, so a team of twenty is scanned rather than read. <b>New bot</b> adds one; <b>Import a team</b> builds a whole roster from a BotMRR playbook, or just a pasted list of names and positions.");
-  para(s, "Right-click a bot in the sidebar (or use its ⋯) for pin, hide, duplicate, clear chat and delete. Pin floats it to the top; hide takes it out of the sidebar without deleting it.");
+  para(s, "Right-click a bot in the sidebar (or use its ⋯) for pin, hide, duplicate, clear chat and delete. Pin floats it to the top; hide takes it out of the sidebar without deleting it. A room's own menu carries pin too — and no hide, since hiding a room would take its bots' chats with it; Delete is the honest way to do that.");
 
   /* ---- channels ---- */
   s = sec("channels", "Rooms");
@@ -3691,6 +4013,8 @@ function tabHelp(p) {
   /* ---- sidebar and dock ---- */
   s = sec("chrome", "The sidebar and the dock");
   para(s, "The sidebar lists your chats, your rooms and your loose bots. Click a row to open its chat, click the caret to fold a team, and right-click (or the ⋯) for pin, hide, duplicate, clear and delete. The rail button collapses the sidebar to a strip of faces.");
+  para(s, "Click the <b>CHATS</b> heading to fold the recent-chat list away and give the rooms and bots the room — the heading stays as the control that brings it back, and the choice is remembered.");
+  para(s, "To put the sidebar in your own order, <b>hold a row and drag it</b>: a room (its team comes with it), a loose bot, or a bot inside a room. The order you drop into is saved on the server, so the phone shows what the window arranged. <b>Pin</b> from a room's menu floats it to the top, above everything else, and unpinning puts it back where you left it.");
   para(s, "The corner face is the dock: it wears the face of whoever you are talking to and shows what it is doing — idle, working at the desk, thinking, searching, needs your approval, done, error. Poke it for fun. The header dot goes live while a turn is running.");
 
   /* ---- keyboard ---- */
@@ -4145,6 +4469,20 @@ $("#btnSettings").onclick = () => openSettings("general");
 $("#btnHelp").onclick = () => openSettings("help");
 kbd($("#btnHelp"), $("#btnHelp").onclick);
 initRail();
+/* ---------------- the chats section, and dragging the sidebar into shape ---------------- */
+/* The label folds the section; the + beside it still opens a new chat, so a click that landed on
+   the add button is left to it. */
+const foldChats = e => { if (!e.target.closest(".add")) foldSec("chats"); };
+$("#chatsLabel").onclick = foldChats;
+kbd($("#chatsLabel"), foldChats);
+applySecs();
+/* Delegated on the wrapper, which is never rebuilt: the rows are, on every renderNav. */
+const navwrap = $("#navwrap");
+navwrap.addEventListener("dragstart", dragStart);
+navwrap.addEventListener("dragover", dragOver);
+navwrap.addEventListener("dragend", dragEnd);
+/* Without this the browser refuses the drop and the row snaps back on the release. */
+navwrap.addEventListener("drop", e => { if (dragRow) e.preventDefault(); });
 /* ---------------- chat list ---------------- */
 /* Search is local: the list is already in memory and is at most a few dozen rows, so filtering it is
    a string compare rather than a round trip per keystroke. */
@@ -4345,8 +4683,9 @@ $("#jump").onclick = () => { toBottom($("#msgs")); $("#jump").hidden = true; };
 /* Your own scrolling is what decides whether the transcript follows new output. Landing at the bottom
    — by scrolling there or by the pill — turns following back on; scrolling up turns it off for as long
    as you keep scrolling, and a few seconds of it is a pause, not a decision: the follow comes back on
-   its own. It has to, because the bottom keeps moving down as the transcript grows, so a reader parked
-   a little short of it is one the app would otherwise never follow again. */
+   its own, and the view stays where you left it, because only a message moves it. It has to come back,
+   because the bottom keeps moving down as the transcript grows, so a reader parked a little short of
+   it is one the app would otherwise never follow again. */
 $("#msgs").addEventListener("scroll", () => {
   pinned = nearBottom($("#msgs"));
   if (pinned) { clearTimeout(resumeTimer); $("#jump").hidden = true; }
@@ -4381,6 +4720,10 @@ $("#compOpen").onclick = async () => { const u = $("#compUrl").value.trim(); if 
 };
 $("#btnFiles").onclick = openFiles;
 $("#filesClose").onclick = closeFiles;
+$("#linkClose").onclick = closeLink;
+/* Back walks the links you followed from inside the panel. A frame is not a history stack we can ask,
+   so the panel keeps its own — which is also what lets the button know when there is nothing behind. */
+$("#linkBack").onclick = () => { if (linkAt > 0) { linkAt--; showLink(); } };
 /* Same reasoning as the computer panel's: the list only changes when the user asks it to, so a click
    with no visible result reads as broken. Hold the word long enough to be read. */
 $("#filesRefresh").onclick = async e => {
@@ -4397,9 +4740,26 @@ $("#filesRefresh").onclick = async e => {
    is left out too: a menu opened from a row in the panel is not "somewhere else", and closing the
    panel on the way to a menu item would take the row the item hands focus back to with it. */
 document.addEventListener("pointerdown", e => {
-  if (inside(e, "#comp, #files, #btnComp, #btnFiles, #ctx")) return;
+  if (inside(e, "#comp, #files, #link, #btnComp, #btnFiles, #ctx")) return;
+  /* A link in the transcript is the panel's own opener, not "somewhere else": closing on the press and
+     reopening on the click would slide the panel out and back in again on every link you follow. */
+  if (e.target.closest && e.target.closest("#msgs a[href]")) return;
   if ($("#comp").classList.contains("on")) { closeComp(false); return; }
   if ($("#files").classList.contains("on")) closeFiles(false);
+  if ($("#link").classList.contains("on")) closeLink(false);
+});
+/* A link in the transcript opens beside the chat instead of taking the window with it. Delegated onto
+   the transcript rather than bound per anchor: the transcript is rebuilt on every redraw and repainted
+   every 120ms while a bot streams, so a handler bound to an anchor is thrown away mid-turn. A modified
+   click (⌘/Ctrl, ⇧, middle) is left to the browser — that is the reader asking for their own browser. */
+$("#msgs").addEventListener("click", e => {
+  const a = e.target.closest ? e.target.closest("#msgs a[href]") : null;
+  if (!a) return;
+  const href = a.getAttribute("href") || "";
+  if (!/^https?:/i.test(href)) return;         // mailto:, an in-page #anchor, or a filtered-out scheme
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+  e.preventDefault();
+  openLink(href, a);
 });
 /* The poke affordance is a real <button>, so Enter and Space come for free — no `kbd` shim. */
 $("#dockPoke").onclick = pokeDock;
@@ -4526,6 +4886,10 @@ document.addEventListener("keydown", e => {
   }
   if ($("#comp").classList.contains("on")) { closeComp(); return $("#btnComp").focus(); }
   if ($("#files").classList.contains("on")) { closeFiles(); return $("#btnFiles").focus(); }
+  /* The link panel is the one side panel with no toolbar button behind it — it opens from a link in
+     the transcript — so there is no opener to hand focus back to; `closeLink` returns it to the line
+     that was clicked instead. */
+  if ($("#link").classList.contains("on")) { closeLink(); return; }
   if ($("#side").classList.contains("open")) { closeDrawer(); return $("#btnMenu").focus(); }
   if ($("#mmPop")) { closeModelMenu(); return $("#chipModel").focus(); }
   if ($("#apPop")) { closeApprovalMenu(); return $("#chipMem").focus(); }

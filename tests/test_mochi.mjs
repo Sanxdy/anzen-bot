@@ -18,7 +18,7 @@ const fakeCanvas = () => ({ width: 0, height: 0, clientWidth: 160, clientHeight:
 
 globalThis.window = { devicePixelRatio: 2, addEventListener() {} };
 
-const { speciesFor, SPECIES, EMOTIONS, STATES, Ease, MochiBot, eyeFrame, softLimit } = await import("../mochi.js");
+const { speciesFor, SPECIES, EMOTIONS, STATES, Ease, MochiBot, eyeFrame, softLimit, OUTFITS, ACCESSORIES, textureFor } = await import("../mochi.js");
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = "") => {
@@ -364,7 +364,7 @@ console.log("\n-- colour grading --");
         if (k === "createRadialGradient") return () => { const g = { addColorStop() {}, grad: "rad" }; return g; };
         return () => {};
       },
-      set(t, k, v) { t[k] = v; if (k === "fillStyle") log.push(typeof v === "object" && v ? v.grad : v); return true; },
+      set(t, k, v) { t[k] = v; if (k === "fillStyle" || k === "strokeStyle") log.push(typeof v === "object" && v ? v.grad : v); return true; },
     });
   };
   const recCanvas = (log) => ({ width: 0, height: 0, clientWidth: 46, clientHeight: 46,
@@ -393,6 +393,75 @@ console.log("\n-- colour grading --");
   rb.skin("mochi", { bodyTop: "#111", bodyBottom: "#222" });
   ok("skin() without a flat colour clears the flat fill", rb.flat === null && rb.bodyTop === "#111",
      rb.flat + "/" + rb.bodyTop);
+
+  /* No cheek blush. The pink was drawn over the body for every emotion and every state tint, so
+     the only way to be sure it is gone is to look at what actually got filled — a leftover
+     `blush` key would otherwise come back as a NaN alpha that silently draws nothing. */
+  const cheekLog = [];
+  const cb = new MochiBot(recCanvas(cheekLog), "idle", { species: "mochi", size: 160 });
+  for (const st of Object.keys(STATES)) { cb.setState(st); for (const emo of Object.keys(EMOTIONS)) {
+    cb.setEmotion(emo); cb.tint = 1; cb.draw(); } }
+  ok("no cheek blush is painted, at any emotion or state",
+     !cheekLog.some(v => typeof v === "string" && /^#FF8FB1$/i.test(v)), JSON.stringify(cheekLog.filter(v => v).slice(0, 8)));
+
+  /* ---- what the bot is wearing ---- */
+  /* Every garment has to actually put something on the canvas, and a key this build does not know
+     has to be ignored rather than drawn as a half-garment or thrown on. The ink is excluded from
+     the "did it paint" count because the eyes and mouth are always drawn in it. */
+  const inkish = v => typeof v === "string" && v.startsWith("#") && v !== "#1A1412";
+  const wears = (opts) => {
+    const log = [];
+    const b = new MochiBot(recCanvas(log), "idle", { species: "mochi", size: 160, ...opts });
+    b.tick(0.05); b.draw();
+    return log;
+  };
+  ok("there are garments to choose from",
+     Object.keys(OUTFITS).length >= 4 && Object.keys(ACCESSORIES).length >= 6,
+     Object.keys(OUTFITS).length + "/" + Object.keys(ACCESSORIES).length);
+  for (const k of Object.keys(OUTFITS))
+    ok("outfit " + k + " paints something", wears({ outfit: k }).some(inkish));
+  for (const k of Object.keys(ACCESSORIES))
+    ok("accessory " + k + " paints something", wears({ accessory: k }).some(inkish));
+  ok("an outfit this build does not know is ignored, not drawn",
+     mk({ outfit: "tutu" }).outfit === "" &&
+     wears({ outfit: "tutu" }).join() === wears({}).join());
+  ok("an accessory this build does not know is ignored, not drawn",
+     mk({ accessory: "monocle" }).accessory === "" &&
+     wears({ accessory: "monocle" }).join() === wears({}).join());
+  /* The eye row is not the same height on every species — a frog's eyes sit on top of its head — so
+     the glasses are anchored to it rather than to a fixed y. Two species whose eyes differ in height
+     must therefore put the frames at different heights; a fixed offset would put them both in the
+     same place and land the frog's lenses on its mouth. */
+  const ringY = sp => {
+    const log = [];
+    const ctx = new Proxy({}, {
+      get(t, k) {
+        if (k in t) return t[k];
+        if (k === "arc") return (x, y) => log.push(y);
+        if (k === "createLinearGradient" || k === "createRadialGradient") return () => ({ addColorStop() {} });
+        return () => {};
+      },
+      set(t, k, v) { t[k] = v; return true; },
+    });
+    const cv = { width: 0, height: 0, clientWidth: 160, clientHeight: 160, getContext: () => ctx,
+                 getBoundingClientRect: () => ({ left: 0, top: 0, width: 160, height: 160 }) };
+    const b = new MochiBot(cv, "idle", { species: sp, size: 160, accessory: "glasses" });
+    b.tick(0.05); b.draw();
+    return log.length ? Math.min(...log) : 0;      // the topmost arc is the frame's
+  };
+  ok("glasses sit on the species' own eye row, not at a fixed height",
+     ringY("frog") < ringY("mochi") - 5, ringY("frog") + " vs " + ringY("mochi"));
+  ok("every species can wear an outfit and an accessory and still show its face",
+     Object.keys(SPECIES).every(sp => wears({ species: sp, outfit: "scarf", accessory: "beanie" }).includes("#1A1412")));
+  /* ---- an uploaded avatar becomes the body ---- */
+  ok("no avatar URL means no texture", textureFor("") === null);
+  ok("an avatar URL is remembered on the bot", mk({ image: "/api/avatar/x?v=1" }).image === "/api/avatar/x?v=1");
+  ok("skin() re-dresses a live bot",
+     (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u" });
+       return b.outfit === "tie" && b.accessory === "crown" && b.image === "u"; })());
+  ok("skin() with no look keeps what the bot is wearing",
+     (() => { const b = mk({ outfit: "tie", accessory: "crown" }); b.skin("cat", { flat: FLAT });
+       return b.outfit === "tie" && b.accessory === "crown"; })());
 }
 
 console.log("\n" + pass + " passed, " + fail + " failed\n");

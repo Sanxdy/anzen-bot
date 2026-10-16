@@ -85,10 +85,14 @@
   /* The wash is one fixed layer under the whole app: a solid base with three slow blooms over it,
      so the chrome has something to be translucent over. It sits at z-index 0 with the two grid
      columns lifted above it, which is the one arrangement that works in every browser — a
-     `z-index:-1` pseudo-element paints behind the canvas background and simply disappears. */
+     `z-index:-1` pseudo-element paints behind the canvas background and simply disappears.
+     It is a real element, not `body::before`, for a measured reason: the same animation on a
+     pseudo-element is not composited, so every frame re-committed the whole document — 800ms of
+     commit per 2.5s on a long transcript, arriving in 200ms stalls, which is exactly the stutter
+     you felt while scrolling. On a real element it composites and the main thread is untouched. */
   body[data-theme="glass"],body[data-theme="glass-light"]{background:transparent}
-  body[data-theme="glass"]::before,body[data-theme="glass-light"]::before{content:"";position:fixed;
-    inset:0;z-index:0;pointer-events:none;
+  #wash{position:fixed;inset:0;z-index:0;pointer-events:none;display:none}
+  body[data-theme="glass"] #wash,body[data-theme="glass-light"] #wash{display:block;
     background:
       radial-gradient(46% 54% at 12% 16%,color-mix(in srgb,var(--accent) 85%,transparent),transparent 66%),
       radial-gradient(42% 50% at 90% 10%,rgba(56,214,190,.55),transparent 68%),
@@ -219,6 +223,14 @@
   .navlabel .add{margin-left:auto;cursor:pointer;color:var(--dim);display:inline-flex;align-items:center;padding:5px 8px;border-radius:6px}
   .navlabel .add svg{width:15px;height:15px;display:block}
   .navlabel .add:hover{background:var(--card2);color:var(--txt)}
+  /* A section folds: the label stays — it is the control that unfolds it again — and what it lists
+     goes. The label carries the whole hit area, because a 10px uppercase word is a poor target. */
+  .navlabel.foldable{cursor:pointer}
+  .navlabel.foldable .caret{flex:0 0 13px;width:13px;height:13px;margin:0}
+  .navlabel.foldable:hover{color:var(--txt)}
+  .navgroup.shut > :not(.navlabel){display:none}
+  /* Reordering: the row you picked up fades, and the list closes up around where it will land. */
+  .bot.dragging,.group.dragging{opacity:.45}
   /* Folded: the faces stay, because a face is how you find a bot. Everything made of words goes.
      Scoped to the desktop width on purpose — below 900px the sidebar is a drawer over the
      content, and a drawer is opened to be read, so it always shows its labels. */
@@ -489,7 +501,8 @@
   .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
   /* A link is read as prose, so it takes `--accent-txt` — the accent walked to a legible lightness
      for this theme — while the accent itself stays on the borders and the fills. */
-  .md a{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+  .md a,.m .lnk{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+  .m .lnk{cursor:pointer}
   .md del{opacity:.7}
   /* A wide table scrolls inside the bubble instead of stretching the transcript. */
   .md table{border-collapse:collapse;margin:9px 0;font-size:calc(12.5px * var(--fs));
@@ -679,6 +692,10 @@
   .mpanel{flex:1;overflow-y:auto;padding:20px 22px;min-width:0}
   .mpanel h3{margin:0 0 3px;font-size:calc(15px * var(--fs));letter-spacing:-.2px}
   .mpanel .hint{margin:0 0 18px;color:var(--dim);font-size:calc(12.5px * var(--fs))}
+  /* What a pasted playbook is missing, one line each: a list you work through, not a sentence you
+     have to parse. It carries the warning colour, so a refusal reads as a to-do. */
+  .mpanel .hint ul.probs{margin:8px 0 0;padding-left:19px}
+  .mpanel .hint ul.probs li{margin:3px 0;color:var(--warn);font-size:calc(12px * var(--fs))}
   /* Help: a tutorial, not a settings form. Prose with a jump list, and a definition list for the
      approval levels — the same building blocks as the rest of the panel, so it reads as part of
      the app rather than a page bolted on. */
@@ -886,6 +903,16 @@
   .sidepanel.on{transform:none}
   #comp{width:min(560px,100%)}
   #files{width:min(420px,100%)}
+  #link{width:min(640px,100%)}
+  /* The link panel is a page, not a list: the frame fills the body and the body keeps no padding, so
+     there is no gutter of app background down the side of somebody else's website. */
+  #link .cbody{padding:0;overflow:hidden;display:flex;flex-direction:column}
+  .linkframe{flex:1;width:100%;border:0;background:#fff;display:flex}
+  /* The title takes the free space, so Back sits left and Open sits right whatever the URL's length —
+     and a long URL ellipsises instead of shoving the buttons off the bar. */
+  #linkTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-size:calc(12.5px * var(--fs));font-family:var(--mono);font-weight:400;color:var(--dim)}
+  #link .lnote{padding:10px 18px;border-top:1px solid var(--line);color:var(--dim);font-size:calc(12px * var(--fs))}
   .sidepanel .chead{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
   .sidepanel .chead b{font-size:calc(15px * var(--fs))}
   .sidepanel .chead .x{margin-left:auto;background:transparent;border:0;color:var(--dim);font-size:calc(22px * var(--fs));cursor:pointer;line-height:1;padding:2px 6px;border-radius:8px}
@@ -1147,6 +1174,7 @@
 </style>
 </head>
 <body>
+<div id="wash" aria-hidden="true"></div>
 <div id="splash" aria-hidden="true">
   <div class="smark"><svg viewBox="0 0 64 64" fill="none" aria-hidden="true"><circle cx="20" cy="32" r="5" fill="#fff"/><circle cx="32" cy="32" r="5" fill="#fff"/><circle cx="44" cy="32" r="5" fill="#fff"/></svg></div>
   <div class="stx"><b>Anzen-bot</b><span>Self-hosted workspace</span></div>
@@ -1159,7 +1187,7 @@
   </div>
   <nav class="navwrap" id="navwrap" aria-label="Rooms and bots">
     <section class="navgroup" aria-labelledby="chatsLabel">
-      <div class="navlabel" id="chatsLabel"><span class="lbl">CHATS</span> <span class="add" id="btnNewChat" title="Start a new chat — clears this transcript" role="button" aria-label="Start a new chat, clearing this transcript"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg></span></div>
+      <div class="navlabel foldable" id="chatsLabel" role="button" tabindex="0" aria-expanded="true" aria-controls="chats" title="Show or hide your recent chats"><span class="caret open" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span><span class="lbl">CHATS</span> <span class="add" id="btnNewChat" title="Start a new chat — clears this transcript" role="button" aria-label="Start a new chat, clearing this transcript"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg></span></div>
       <div class="chsearch"><input id="chatSearch" type="search" placeholder="Search chats…" aria-label="Search chats"></div>
       <ul id="chats"></ul>
     </section>
@@ -1244,6 +1272,16 @@
     <div id="filesList" role="list"></div>
     <div class="desc">This lists the repo the chat you are in works in. Click a folder to open it, and a file to open it in your default app. Right-click a file or a folder for Open, Open with, Open in Finder, Copy path, and Add to chat.</div>
   </div>
+</aside>
+
+<aside id="link" class="sidepanel" aria-label="Link panel" inert>
+  <div class="chead">
+    <button class="btn ghost sm" id="linkBack" title="Back to the previous link" aria-label="Back to the previous link" disabled>←</button>
+    <b id="linkTitle">Link</b>
+    <a class="btn ghost sm" id="linkOut" href="#" target="_blank" rel="noopener noreferrer">Open in browser</a>
+    <button class="x" id="linkClose" aria-label="Close link panel">×</button></div>
+  <div class="cbody" id="linkBody"></div>
+  <div class="lnote" id="linkNote" hidden></div>
 </aside>
 
 <div class="scrim" id="scrim">

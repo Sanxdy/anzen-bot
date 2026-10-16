@@ -45,6 +45,10 @@ final class Json {
 
     static long num(Object o) { return o instanceof Number ? ((Number) o).longValue() : 0; }
 
+    /** The same, keeping the fraction. A font size is 14.5 and a whole number would snap it to the
+        wrong step on the desktop's own grid. */
+    static double dbl(Object o) { return o instanceof Number ? ((Number) o).doubleValue() : 0; }
+
     static boolean truth(Object o) { return Boolean.TRUE.equals(o); }
 
     /** A JSON string literal for a value being sent, escaped so a quote or a newline in what the

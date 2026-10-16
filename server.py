@@ -12,7 +12,7 @@ browser tool needs Playwright (optional).
 Run:  python3 server.py
 Env:  PORT, HOST, DATA_DIR, SANDBOX_DIR, ROUTER_URL, ROUTER_KEY, DEFAULT_MODEL, VISION_MODEL
 """
-import json, os, re, select, signal, socket, socketserver, struct, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3
+import json, os, re, select, signal, socket, socketserver, struct, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3, random
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
@@ -130,7 +130,23 @@ VISION_MODELS = [m.strip() for m in (CFG.get("vision_model") or DEFAULT_MODEL).s
 # Router image generation: an image-capable chat model returns the picture inline as a data URL.
 # OFF by default -- it spends PADUKA's API tokens. The default free route drives a real site in the
 # browser (browser_open / browser_type / browser_save) and costs nothing.
-IMAGE_MODELS = [m.strip() for m in (CFG.get("image_model") or "inf/gemini-3.1-flash-image").split(",") if m.strip()]
+#
+# The router advertises 8 models with `capabilities.imageOutput`, but only the two below actually
+# route -- verified by calling each advertised model: these two answer with a picture, text-to-image
+# and image-to-image alike. The six in IMAGE_MODEL_DEAD answer HTTP 400 "route config not found" or
+# HTTP 503 "unknown model" however they are called, so a config left on one of them draws nothing.
+# Both lists live here so that cannot happen: the fallbacks are always in the list to be tried.
+IMAGE_MODEL_FALLBACKS = ["inf/gemini-2.5-flash-image", "inf/cb/gemini-2.5-flash-image"]
+IMAGE_MODEL_DEAD = {"inf/gemini-3.0-pro-image", "inf/cb/gemini-3.0-pro-image",
+                    "inf/gemini-3.1-flash-image", "inf/cb/gemini-3.1-flash-image",
+                    "inf/gemini-2.5-flash-image-microusd", "inf/gemini-image-2"}
+def _image_models(cfg_value):
+    """What gen_image tries, in order: the configured model(s) that are alive, then the fallbacks.
+    Dead ids are dropped from both, so a config left on a dead route still draws."""
+    want = [m.strip() for m in (cfg_value or "").split(",") if m.strip()]
+    return [m for m in want if m not in IMAGE_MODEL_DEAD] + \
+           [m for m in IMAGE_MODEL_FALLBACKS if m not in want]
+IMAGE_MODELS = _image_models(CFG.get("image_model"))
 
 _lock = threading.Lock()
 OUT_UA = "AnzenBot/1.0"   # WAFs (e.g. Cloudflare 1010) 403 the default Python-urllib signature
@@ -161,6 +177,16 @@ def _load_json(path, default):
 def _save_json(path, obj, indent=2):
     with _lock:
         tmp = path + ".tmp"; json.dump(obj, open(tmp, "w"), indent=indent); os.replace(tmp, path)
+def _migrate_image_model():
+    """A saved image_model naming a route the router does not serve is the reason the tool drew
+    nothing, so move it to a live one and write that back. Runs once at startup: the value is no
+    longer dead afterwards, so a second call does nothing -- and a config we cannot write (a
+    read-only file, a full disk) is left as it is rather than stopping the app from coming up."""
+    if CFG.get("image_model") not in IMAGE_MODEL_DEAD: return
+    CFG["image_model"] = IMAGE_MODEL_FALLBACKS[0]
+    try: _save_json(CFG_PATH, CFG)
+    except Exception as e: print("could not rewrite %s (%s)" % (CFG_PATH, e), flush=True)
+_migrate_image_model()
 def save_connection(patch):
     """Update the router connection from the AI model tab and re-aim the live globals.
     A blank key means 'keep the saved one' so saving other fields never wipes it."""
@@ -211,11 +237,13 @@ DEFAULT_SETTINGS = {
                  "font_size": BASE_FONT_PX, "font": "system", "bubbles": "modern"},
   "api_keys": {"composio": "", "boat": "", "elevenlabs": "", "fish": "", "xai": ""},
   # limit is the token budget for one request; 0 means "follow the model's own context window".
-  # max_steps is how many model calls one turn may make, max_seconds how long it may run — see
-  # DEFAULT_MAX_STEPS and DEFAULT_TURN_SECONDS for why both are generous. 0 means "use the default".
+  # max_steps is how many model calls one turn may make — see DEFAULT_MAX_STEPS for why it is generous.
+  # max_seconds is an optional hard cap on how long a turn may run; 0, the default, is no cap at all
+  # (see DEFAULT_TURN_SECONDS). 0 means "use the default" for both.
   # model_retries is how many times one step tries again after an attempt that came back with
   # nothing, and model_stall_seconds how long one attempt may go silent before it counts as one — see
-  # DEFAULT_MODEL_RETRIES / DEFAULT_MODEL_STALL_SECONDS. 0 means "use the default" for both.
+  # DEFAULT_MODEL_RETRIES / DEFAULT_MODEL_STALL_SECONDS / MODEL_FAIL_SECONDS. 0 means "use the
+  # default" for both.
   "context": {"limit": 0, "compress": True, "max_steps": 0, "max_seconds": 0,
               "model_retries": 0, "model_stall_seconds": 0},
   # port is the one place the debug endpoint is named; the launch command and the CDP URL are both
@@ -413,23 +441,60 @@ _STALE_BRIEFS = [
  "You are Ops. Handle running services, deployment, monitoring and scheduled jobs. Check before you change; "
  "report real status, never invented status.",
 ]
-def load_bots():
-    b = _load_json(BOTS_PATH, None)
-    if not b:
-        _save_json(BOTS_PATH, DEFAULT_BOTS); return json.loads(json.dumps(DEFAULT_BOTS))
+def _slug(s, fallback):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or fallback
+
+def _fill_id_name(x, fallback, taken):
+    """An id and a name for a record the file left without them.
+
+    Both are read unguarded all over the app — `boot()` names a chat after the record, the drawer
+    prints it, `bot_by_id` matches on the id — so one nameless record in bots.json or channels.json
+    used to raise KeyError inside `boot()` and stop the backend from starting at all. The id is
+    derived from the name (the same slug rule the create endpoints use) and made unique against the
+    records already seen, so two rooms called the same cannot end up sharing a chat."""
+    base = x.get("id") or _slug(x.get("name"), fallback)
+    x["id"] = base
+    n = 2
+    while x["id"] in taken: x["id"] = "%s-%d" % (base, n); n += 1
+    taken.add(x["id"])
+    x["name"] = x.get("name") or x["id"].replace("-", " ").title()
+    return x
+
+def _norm_bots(b):
+    """Every field a bot record is read for, filled in. One definition, shared by the loader and
+    the create endpoint: the two drifting apart is exactly how a record got into the file with no
+    `name`, and then stopped the app from booting."""
     known = CFG.get("models") or []
+    taken = set()
     for x in b:
         x.pop("mascot", None)   # avatars are emoji-on-colour now; mascot was the old key
-        x.setdefault("emoji", BOT_EMOJI.get(x.get("id"), ""))
+        _fill_id_name(x, "bot", taken)
+        x.setdefault("title", "Teammate"); x.setdefault("role", ""); x.setdefault("color", "blue")
+        x.setdefault("approval", "ask"); x.setdefault("memory", True); x.setdefault("voice", "")
+        x.setdefault("hidden", False); x.setdefault("pinned", False); x.setdefault("skills", [])
+        x.setdefault("tools_allow", None)
+        x.setdefault("instructions", "You are " + x["name"] + ".")
+        x.setdefault("emoji", BOT_EMOJI.get(x["id"], ""))
         x.setdefault("face", "")   # blank = the client derives a species from the id
-        # A placeholder model the current router does not serve would 404 on every turn.
-        if known and x.get("model") not in known: x["model"] = DEFAULT_MODEL
+        # The look the avatar editor edits: an outfit and an accessory the client draws, and the
+        # version of an uploaded avatar (0 = none, so the drawn face shows).
+        x.setdefault("outfit", ""); x.setdefault("accessory", ""); x.setdefault("avatar", 0)
+        # A record with no model, or one the current router does not serve, would 404 on every turn —
+        # and `_agent_loop` reads `bot["model"]` unguarded, so a missing one is a TypeError mid-turn.
+        x.setdefault("model", DEFAULT_MODEL)
+        if known and x["model"] not in known: x["model"] = DEFAULT_MODEL
         if x.get("instructions") in _STALE_BRIEFS:
             d = next((d for d in DEFAULT_BOTS if d["id"] == x.get("id")), None)
             if d: x["instructions"] = d["instructions"]
     return b
+
+def load_bots():
+    b = _load_json(BOTS_PATH, None)
+    if not b:
+        _save_json(BOTS_PATH, DEFAULT_BOTS); return json.loads(json.dumps(DEFAULT_BOTS))
+    return _norm_bots(b)
 def save_bots(b): _save_json(BOTS_PATH, b)
-def bot_by_id(bots, bid): return next((x for x in bots if x["id"] == bid), None)
+def bot_by_id(bots, bid): return next((x for x in bots if x.get("id") == bid), None)
 
 # ---------------------------------------------------------------- channels
 CH_PATH = os.path.join(DATA, "channels.json")
@@ -437,13 +502,33 @@ DEFAULT_CHANNELS = [
   {"id":"company","name":"Company","members":["producer","researcher","builder","qa","ops"],
    "mode":"lead","lead":"producer","instructions":"","folder":""},
 ]
+def _norm_channels(c):
+    """Every field a room record is read for, filled in — the same shared definition the create
+    endpoint uses. `members` and `lead` are what the room's own turns iterate, so a room the file
+    left without them used to fail later, inside a turn, instead of at boot."""
+    taken = set()
+    for x in c:
+        _fill_id_name(x, "room", taken)
+        x.setdefault("members", [])
+        x.setdefault("mode", "lead")
+        x.setdefault("lead", (x["members"] or ["producer"])[0])
+        x.setdefault("instructions", ""); x.setdefault("folder", ""); x.setdefault("pinned", False)
+    return c
+
 def load_channels():
     c = _load_json(CH_PATH, None)
     if not c:
         _save_json(CH_PATH, DEFAULT_CHANNELS); return json.loads(json.dumps(DEFAULT_CHANNELS))
-    return c
+    return _norm_channels(c)
 def save_channels(c): _save_json(CH_PATH, c)
 def channel_by_id(chs, cid): return next((x for x in chs if x.get("id") == cid), None)
+
+def reorder(seq, ids, key=lambda x: x.get("id")):
+    """Put `seq` in the order `ids` names. Anything the caller did not name keeps its relative
+    place, after the ones it did — so a list from a stale client (a row added on the phone since
+    that window last read config) can reorder the sidebar without ever dropping a bot."""
+    order = {v: i for i, v in enumerate(ids)}
+    return sorted(seq, key=lambda x: order.get(key(x), len(order)))
 
 def resolve_session(sid, bot_field, chs, bots):
     """A session id -> (channel, solo bot). One bot can live under several companies, so a chat
@@ -930,11 +1015,11 @@ def channels_public(chs):
                     "logo": lg["v"], "logo_src": lg["source"], "logo_rel": lg["rel"]})
     return out
 
-def save_logo(cid, data_url):
-    """Store an uploaded logo for one channel. Any older upload for that channel is removed first,
-    so exactly one file decides what the row shows."""
-    cid = _logo_id(cid)
-    if not cid: return {"ok": False, "error": "unknown channel"}
+def _save_image(dirpath, key, data_url, what="logo"):
+    """Decode an uploaded data URL and store it as `<dirpath>/<key>.<ext>`, replacing any older
+    extension for that key, so exactly one file decides what a row shows. The MIME type came from
+    the browser and is only a hint: the bytes have to really be that format, or a renamed file
+    becomes markup served from our own origin."""
     m = re.match(r"^data:(image/[a-z+.-]+);base64,(.+)$", data_url or "", re.S)
     if not m: return {"ok": False, "error": "that is not an image file"}
     mime, b64 = m.group(1).lower(), m.group(2)
@@ -946,28 +1031,73 @@ def save_logo(cid, data_url):
     if len(blob) > MAX_LOGO_BYTES: return {"ok": False, "error": "the image is larger than 2 MB"}
     if not _logo_bytes_ok(blob, ext): return {"ok": False, "error": "that file is not really a " + ext.lstrip(".")}
     try:
-        os.makedirs(LOGO_DIR, exist_ok=True)
+        os.makedirs(dirpath, exist_ok=True)
         for old in LOGO_MIME.values():
-            if old != ext and os.path.isfile(os.path.join(LOGO_DIR, cid + old)):
-                os.remove(os.path.join(LOGO_DIR, cid + old))
-        tmp = os.path.join(LOGO_DIR, cid + ext + ".tmp")
+            if old != ext and os.path.isfile(os.path.join(dirpath, key + old)):
+                os.remove(os.path.join(dirpath, key + old))
+        tmp = os.path.join(dirpath, key + ext + ".tmp")
         with open(tmp, "wb") as f: f.write(blob)
-        os.replace(tmp, os.path.join(LOGO_DIR, cid + ext))
+        os.replace(tmp, os.path.join(dirpath, key + ext))
     except OSError as e:
-        return {"ok": False, "error": "could not save the logo: %s" % e}
+        return {"ok": False, "error": "could not save the %s: %s" % (what, e)}
     return {"ok": True}
 
-def remove_logo(cid):
-    """Drop the uploaded logo. The repo's own logo (if any) takes over again."""
-    cid = _logo_id(cid)
-    if not cid: return False
+def _remove_image(dirpath, key):
+    """Delete every extension a key could have been stored under. True if anything was there."""
     gone = False
     for ext in LOGO_MIME.values():
-        p = os.path.join(LOGO_DIR, cid + ext)
+        p = os.path.join(dirpath, key + ext)
         try:
             if os.path.isfile(p): os.remove(p); gone = True
         except OSError: pass
     return gone
+
+def save_logo(cid, data_url):
+    """Store an uploaded logo for one channel. Any older upload for that channel is removed first,
+    so exactly one file decides what the row shows."""
+    cid = _logo_id(cid)
+    if not cid: return {"ok": False, "error": "unknown channel"}
+    return _save_image(LOGO_DIR, cid, data_url)
+
+def remove_logo(cid):
+    """Drop the uploaded logo. The repo's own logo (if any) takes over again."""
+    cid = _logo_id(cid)
+    return _remove_image(LOGO_DIR, cid) if cid else False
+
+# ---------------------------------------------------------------- bot avatars
+# A bot's face is drawn by the client from its species and colour. An uploaded avatar replaces it
+# with a picture -- either one the user picked, or a mascot body the image model drew from a photo
+# (POST /api/avatar/transform). Upload-only: unlike a channel there is no repo to search, and the
+# file is stored under the bot's id, so the same 2 MB cap and the same magic-byte checks as a logo.
+AVATAR_DIR = os.path.join(DATA, "avatars")
+def avatar_state(b):
+    """A bot's avatar: the stored file and a version that changes whenever it does, or nothing."""
+    bid = _logo_id(b.get("id"))
+    for ext in LOGO_MIME.values():
+        p = os.path.join(AVATAR_DIR, bid + ext)
+        if bid and os.path.isfile(p): return {"path": p, "v": _logo_ver(p), "source": "upload"}
+    return {"path": "", "v": 0, "source": ""}
+
+def save_avatar(bid, data_url):
+    """Store an uploaded avatar for one bot. A bot id is the same slug shape as a channel id, so
+    the same check decides whether it can name a file inside data/avatars."""
+    bid = _logo_id(bid)
+    if not bid: return {"ok": False, "error": "unknown bot"}
+    return _save_image(AVATAR_DIR, bid, data_url, "avatar")
+
+def remove_avatar(bid):
+    """Drop the uploaded avatar; the client draws the bot's face again."""
+    bid = _logo_id(bid)
+    return _remove_image(AVATAR_DIR, bid) if bid else False
+
+def avatar_prompt(species, color):
+    """What the image model is asked for when turning a photo into an avatar: the mascot *body*
+    only. The client draws the face on top afterwards, so eyes and mouth have to be explicitly
+    excluded -- anything the model paints there would end up underneath ours."""
+    return ("Draw a cute flat-vector mascot BODY inspired by the photo: keep its colours, hair and "
+            "distinctive features. NO eyes, NO mouth, NO text. Subject centred, plain flat white "
+            "background, sticker style, square. Species: %s. Colour: %s."
+            % (str(species or "as in the photo")[:60], str(color or "as in the photo")[:40]))
 
 # ---------------------------------------------------------------- team import
 # BotMRR (botmrr.io) hands you a Markdown playbook: YAML frontmatter with an `agents:`
@@ -1004,10 +1134,10 @@ def _scalar(v):
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'": v = v[1:-1]
     return v
 def parse_team(text):
-    """Read a BotMRR playbook into {name, agents, rooms}. Pure stdlib, no YAML dependency."""
+    """Read a BotMRR playbook into {name, chief, agents, rooms}. Pure stdlib, no YAML dependency."""
     m = re.search(r"^---[ \t]*\n(.*?)\n---[ \t]*$", text or "", re.S | re.M)
     body = m.group(1) if m else (text or "")
-    out = {"name": "", "agents": [], "rooms": []}
+    out = {"name": "", "chief": "", "agents": [], "rooms": []}
     section = rec = sub = None
     for raw in body.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"): continue
@@ -1018,13 +1148,17 @@ def parse_team(text):
                 section = "rooms" if k in ("rooms", "channels") else "agents"; rec = sub = None
             else:
                 if k == "name": out["name"] = _scalar(v)
+                elif k == "chiefOfStaff": out["chief"] = _scalar(v)
                 section = rec = sub = None
             continue
         if section is None: continue
         if s.startswith("- "):
             item = s[2:]; k, _, v = item.partition(":"); k = k.strip(); v = _scalar(v)
-            if k == "key" and ind <= 4:
-                rec = {"key": v}; sub = None; out[section].append(rec)
+            # A record starts at whichever of its own fields comes first. BotMRR writes `key` first,
+            # but an entry that opens with `name` is still an agent — reading only `key` here dropped
+            # it entirely, which read as "no agents" instead of "this agent has no key".
+            if ind <= 4 and k in ("key", "name", "title", "description"):
+                rec = {k: v}; sub = None; out[section].append(rec)
             elif rec is not None and sub == "members": rec.setdefault("members", []).append(v or _scalar(item))
             elif rec is not None and sub == "playbooks": rec.setdefault("playbooks", []).append(v or _scalar(item))
             continue
@@ -1033,10 +1167,88 @@ def parse_team(text):
         if ind <= 4:                                  # a field of the record itself
             if k in ("appearance", "defaultResponder", "playbooks", "members"): sub = k; continue
             sub = None
-            if k in ("name", "title", "description", "bulletin", "summary"): rec[k] = v
+            if k in ("key", "name", "title", "description", "bulletin", "summary"): rec[k] = v
             continue
         if sub == "appearance" and k == "color": rec["color"] = v
         elif sub == "defaultResponder" and k == "agent": rec["lead"] = v
+    return out
+# The structure a playbook has to have, and the exact text the copy button hands out. It is a real
+# playbook — every field below is one we read — so a paste built from it imports cleanly, and the
+# checks run `team_problems` over this same string: the template and the validator cannot drift.
+TEAM_TEMPLATE = """---
+botmrr: 1
+name: Your Team
+agents:
+  - key: lead
+    name: Lea
+    title: Producer
+    description: What this bot owns, and how it should work. Two or three sentences.
+    appearance:
+      color: purple
+  - key: dev
+    name: Dima
+    title: Engineer
+    description: What this bot owns, and how it should work. Two or three sentences.
+    appearance:
+      color: green
+chiefOfStaff: lead
+rooms:
+  - key: main-room
+    name: Main Room
+    members:
+      - lead
+      - dev
+    bulletin: The rules everyone in this room works by. One paragraph.
+    defaultResponder:
+      kind: agent
+      agent: lead
+---
+"""
+def _playbook_shaped(text):
+    """True when a paste is claiming to be a playbook rather than the plain list of names the panel
+    also takes. A paste with no `agents:` is not a broken playbook — it is the other input, and it
+    goes to the model."""
+    return bool(re.search(r"^[ \t]*agents[ \t]*:", text or "", re.M)
+                or re.search(r"^---", text or "", re.M) or "botmrr:" in (text or ""))
+def team_problems(text):
+    """Everything a paste is missing, by name, so it can be revised — or [] when it is not a playbook.
+
+    Strict on purpose: an agent or room that exists but is incomplete is reported as such rather than
+    being quietly given a default, because the whole point of handing the structure to a model is to
+    get a team that is actually filled in."""
+    if not _playbook_shaped(text): return []
+    t = parse_team(text); out = []
+    if not t["agents"]:
+        out.append("no `agents:` — add a list with at least one agent")
+    keys = {}
+    for i, a in enumerate(t["agents"], 1):
+        who = (a.get("name") or a.get("key") or "").strip() or ("agent %d" % i)
+        for k in ("key", "name", "title", "description"):
+            if not (a.get(k) or "").strip(): out.append("agent %d (%s) has no `%s`" % (i, who, k))
+        k = (a.get("key") or "").strip().lower()
+        if k:
+            if k in keys: out.append("two agents share the key `%s`" % k)
+            keys[k] = True
+    if not t["rooms"]:
+        out.append("no `rooms:` — add a list with at least one room")
+    for i, r in enumerate(t["rooms"], 1):
+        who = (r.get("name") or r.get("key") or "").strip() or ("room %d" % i)
+        for k in ("key", "name"):
+            if not (r.get(k) or "").strip(): out.append("room %d (%s) has no `%s`" % (i, who, k))
+        mem = [m.strip() for m in (r.get("members") or []) if m.strip()]
+        if not mem: out.append("room %s has no `members`" % who)
+        for m in mem:
+            if m.lower() not in keys: out.append("room %s lists member `%s`, but no agent has that key" % (who, m))
+        lead = (r.get("lead") or "").strip()
+        # Either field can name the room's lead — a playbook that only sets `chiefOfStaff` is complete,
+        # since that bot is the one `build_team` puts in charge. Only a room with neither is a problem.
+        if not lead and not (t.get("chief") or "").strip():
+            out.append("room %s has no `defaultResponder:` `agent:` to lead it" % who)
+        elif lead and lead.lower() not in keys:
+            out.append("room %s names lead `%s`, but no agent has that key" % (who, lead))
+    chief = (t.get("chief") or "").strip()
+    if chief and chief.lower() not in keys:
+        out.append("`chiefOfStaff` names `%s`, but no agent has that key" % chief)
     return out
 IMPORT_SYS = ("Extract the team of AI agents described below into JSON. Reply with ONLY a JSON array, "
               "no prose and no code fence: [{\"name\":\"...\",\"title\":\"...\",\"description\":\"...\"}]. "
@@ -1077,7 +1289,9 @@ def build_team(text):
     for r in team["rooms"]:
         rid = re.sub(r"[^a-z0-9]+", "-", (r.get("key") or r.get("name") or "room").lower()).strip("-") or "room"
         members = [keymap[k.lower()] for k in (r.get("members") or []) if k.lower() in keymap] or [b["id"] for b in made]
-        lead = keymap.get((r.get("lead") or "").lower())
+        # The room's own defaultResponder is the lead; a playbook that only names a `chiefOfStaff`
+        # (BotMRR writes both) still gets that bot in charge rather than whoever happened to be first.
+        lead = keymap.get((r.get("lead") or "").lower()) or keymap.get((team.get("chief") or "").lower())
         rooms.append({"id": rid, "name": r.get("name") or rid.replace("-", " ").title(), "members": members,
                       "mode": "lead", "lead": lead or members[0], "instructions": (r.get("bulletin") or "").strip(), "folder": ""})
     if rooms:
@@ -2131,7 +2345,7 @@ class Browser:
         self._thr = {}                              # thread -> {"pp": driver, "hb": browser, "hpage": page, "ctxs": {}}
     def _mine(self):
         """This thread's own Playwright holdings, made on first use."""
-        return self._thr.setdefault(threading.current_thread(), {"pp": None, "hb": None, "hpage": None, "ctxs": {}})
+        return self._thr.setdefault(threading.current_thread(), {"pp": None, "hb": None, "hctx": None, "hpage": None, "ctxs": {}})
     def start(self):
         if self.thread and self.thread.is_alive(): return
         self.ready.clear(); self.ok = False; self.err = ""; self.attached = False
@@ -2181,6 +2395,7 @@ class Browser:
         d = own_profile_dir(name); os.makedirs(d, exist_ok=True)
         ctx = self._driver().chromium.launch_persistent_context(
             d, viewport={"width": 1280, "height": 820}, **_launch_opts(hl))
+        if hl: _no_headless_token(ctx)
         self._mine()["ctxs"][name] = (ctx, hl)
         return ctx
     def _drop_ctx(self, name):
@@ -2484,7 +2699,7 @@ class Browser:
                 except Exception: pass
             else:
                 self.browser = self.pw.chromium.launch(**_launch_opts(True))
-                self.page = self.browser.new_page(viewport={"width": 1280, "height": 820})
+                self.page = _plain_ctx(self.browser).new_page()
                 self.engine = "own"
             self.ok = True
         except Exception as e: self.err = str(e)
@@ -2561,10 +2776,11 @@ class Browser:
         try:
             if me["hpage"] is None:
                 me["hb"] = self._driver().chromium.launch(**_launch_opts(True))
-                me["hpage"] = me["hb"].new_page(viewport={"width": 1280, "height": 820})
+                me["hctx"] = _plain_ctx(me["hb"])
+                me["hpage"] = me["hctx"].new_page()
             return me["hpage"]
         except Exception as e:
-            me["hb"] = None; me["hpage"] = None
+            me["hb"] = None; me["hctx"] = None; me["hpage"] = None
             self.err = "headless: %s" % e
             return None
     def open(self, url):
@@ -2864,16 +3080,69 @@ def _launch_opts(headless, channel=None):
     itself as automated is exactly what Google's sign-in turns away."""
     o = {"headless": bool(headless),
          "args": ["--disable-blink-features=AutomationControlled"],
-         "ignore_default_args": ["--enable-automation"]}
-    # Chromium will not start at all as root without --no-sandbox, and in a container /dev/shm is too
-    # small to hold a page — but neither is true on a desktop, where asking for the sandbox off buys
-    # nothing and paints "unsupported command-line flag ... stability and security will suffer" across
-    # the top of the sign-in window. Only asked for where it is actually needed.
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        o["args"] += ["--no-sandbox", "--disable-dev-shm-usage"]
+         "ignore_default_args": ["--enable-automation"],
+         # The sandbox has to be asked for by name, because Playwright turns it off unless it is:
+         # the driver pushes `--no-sandbox` whenever `chromiumSandbox !== true`, on every platform.
+         # So a desktop that never asked for it had Chrome's process sandbox switched off and
+         # "unsupported command-line flag: --no-sandbox. Stability and security will suffer" painted
+         # across the top of the sign-in window. That flag is a real security boundary and a real
+         # warning, and nothing here needed either. A container running as root is the one place the
+         # flag is genuine — Chromium refuses to start there without it — and that is the only case
+         # left with the sandbox off.
+         "chromium_sandbox": not (hasattr(os, "geteuid") and os.geteuid() == 0)}
     ch = browser_channel() if channel is None else channel
     if ch: o["channel"] = ch
     return o
+
+def _plain_ua(browser):
+    """A launched browser's own user agent with the headless token taken out — or "" if it cannot be
+    read, in which case the caller sets nothing and gets the default.
+
+    `HeadlessChrome` in the user agent is what a bot check looks for, and it is a lie about what this
+    browser is: it is a real, installed Chrome, launched without Playwright's automation switch. The
+    token is Playwright's own addition and survives `--headless=new`, so the only way to be rid of it
+    is to set the UA — and the *browser's* UA, asked over CDP, is the one string that cannot go stale
+    the way a version pinned in the source would. Verified 2026-10-16: with this token, DuckDuckGo
+    answered a 305-byte challenge, Brave a 429 and Google "unusual traffic"; with it swapped back to
+    `Chrome/`, all three answered the real page from this same machine."""
+    try:
+        v = browser.new_browser_cdp_session().send("Browser.getVersion")
+        return (v.get("userAgent") or "").replace("HeadlessChrome/", "Chrome/")
+    except Exception:
+        return ""
+
+def _plain_ctx(browser):
+    """A context on a browser we launched that does not announce `HeadlessChrome` — see `_plain_ua`
+    for why the token matters. A context of our own rather than `browser.new_page()`'s implicit one,
+    because the user agent has to be set when the context is made and the implicit one is made before
+    the browser can be asked what its own is.
+
+    No locale is set here, deliberately. The language a job needs is carried by the job — the query it
+    types and the address it opens — and that is what the engines actually answer in: an Indonesian
+    query returned Indonesian results from Google, Brave and DuckDuckGo with this context announcing
+    `en-US,en;q=0.9`. A locale set at launch would be one language for every job on the machine, which
+    is the pin the request is supposed to decide instead."""
+    ua = _plain_ua(browser)
+    return browser.new_context(viewport={"width": 1280, "height": 820},
+                               **({"user_agent": ua} if ua else {}))
+
+def _no_headless_token(ctx):
+    """The same repair for a saved profile, which cannot be made at launch the way the throwaway is.
+
+    A persistent context *is* the browser — it is started with its user agent already set, before
+    anything can be asked what that user agent is — so the override goes on the pages instead, and on
+    every page after, because a CDP session belongs to one page and a profile opens them one at a time.
+    Only asked for when the profile is launched headless: a headed browser never carries the token, and
+    this is a CDP round trip per page. Verified 2026-10-16: a headless profile announced
+    `HeadlessChrome/155.0.0.0` before this and `Chrome/155.0.0.0` after, across a navigation and a new
+    page."""
+    ua = _plain_ua(ctx.browser)
+    if not ua: return
+    def fix(pg):
+        try: ctx.new_cdp_session(pg).send("Network.setUserAgentOverride", {"userAgent": ua})
+        except Exception: pass
+    ctx.on("page", fix)
+    for pg in ctx.pages: fix(pg)
 
 def first_site(sites):
     """The address a row's own button lands on: the first site *that row* lists, as it was written —
@@ -3138,12 +3407,38 @@ DEFAULT_MODEL_STALL_SECONDS = 120
 # correct and safe — the router dropped the call, and nothing was streamed, so there is no text to
 # duplicate — and it is the *only* attempt worth retrying: once a delta has gone out the bot has
 # already spoken, and a second attempt would append a second answer to the first (see `chat_stream`).
-# 2 retries is 3 tries in total, which is 3 x 120s + backoff ≈ 6 minutes worst case: inside the 900s
-# turn budget with room left for the work. This is why the old 240s stall budget could afford to shrink.
-DEFAULT_MODEL_RETRIES = 2
-MODEL_RETRY_BACKOFF = 2          # seconds before try 2, doubled for try 3 — room for a router that blipped
+#
+# 11 tries, the count ZCode's own retry loop uses. The user's point is the right one: a bot that keeps
+# trying is worth more than a bot that stops and waits to be asked again, because the whole reason it
+# runs unattended is that nobody is watching. What made 11 safe to take was not the count but the
+# *cost* of an attempt — see MODEL_FAIL_SECONDS, which is what stops a router that has gone quiet from
+# turning one step into a half-hour. The setting offers 0-10, so 11 tries is the ceiling either way.
+DEFAULT_MODEL_RETRIES = 10
+# The wait before the next try: ZCode's schedule exactly — an exponential backoff off a two-second
+# base, capped at a minute, jittered. The cap keeps a long run of failures from turning into a long
+# silence between them, and the jitter matters because a router that just refused a hundred bots should
+# not get all hundred back at the same instant.
+MODEL_RETRY_BACKOFF = 2          # seconds before try 2; doubled for each try after that, up to the cap
+MODEL_RETRY_BACKOFF_MAX = 60
+# The most one step may spend *failing*, across every attempt it makes. This is what makes a high try
+# count safe rather than reckless, and it needs no setting of its own because it counts both kinds of
+# failure the same way. A router that is refusing calls fails in milliseconds, so all eleven tries and
+# their backoff (about six minutes of waiting) fit inside this comfortably; an attempt that went
+# *quiet*, on the other hand, burns the whole stall budget before it counts as a failure, so a router
+# that has stopped answering reaches this ceiling after three tries and the turn reports instead of
+# waiting out an hour of silence. Same policy, same number, and the cheap case — by far the common one
+# — is the one that gets all eleven.
+MODEL_FAIL_SECONDS = 400
 MODEL_RETRIES = DEFAULT_MODEL_RETRIES
 MODEL_STALL_SECONDS = DEFAULT_MODEL_STALL_SECONDS
+# How many tokens one answer may use. This is a *ceiling*, not a cost — nothing is billed for room
+# that goes unused — and a thin ceiling is what makes a step come back with nothing at all: the
+# router counts a reasoning model's thinking against this budget, so at the old 1600 a model that
+# spent 1600 tokens working out what to do had no room left to say it, and the step arrived as a
+# blank that read like a dead router. ZCode sends the model's own maximum for exactly this reason.
+# The ceiling is clamped to half the context window so a model with a small window cannot be asked
+# for more than it holds.
+MAX_OUTPUT_TOKENS = 8192
 def model_retries(settings):
     """How many times one step may try again after an attempt that said nothing: the saved number when
     there is one, else the default. 0 means "use the default", like max_steps. The ceiling is the one
@@ -3164,6 +3459,24 @@ def sync_model_policy(s):
     the settings when they load and re-aimed whenever they are saved."""
     global MODEL_RETRIES, MODEL_STALL_SECONDS
     MODEL_RETRIES = model_retries(s); MODEL_STALL_SECONDS = model_stall_seconds(s)
+def _retry_limit(attempts):
+    """How many tries one step may make: the caller's number when it gives one — the wrap-up asks for
+    a single attempt — and the saved policy otherwise."""
+    return max(1, int(attempts or (MODEL_RETRIES + 1)))
+def _retry_wait(attempt):
+    """Seconds to wait before try number `attempt` + 1, on ZCode's schedule: an exponential backoff
+    off MODEL_RETRY_BACKOFF, capped at MODEL_RETRY_BACKOFF_MAX and jittered to somewhere between half
+    the interval and all of it. The jitter is the point of it — a router that just refused a hundred
+    bots should not get all hundred back at the same instant — so the wait is a bound, not a promise,
+    and the cap holds the *bound*: nothing here ever waits longer than MODEL_RETRY_BACKOFF_MAX."""
+    return min(MODEL_RETRY_BACKOFF * (2 ** (attempt - 1)), MODEL_RETRY_BACKOFF_MAX) * (0.5 + 0.5 * random.random())
+def output_budget(model, want=None):
+    """The ceiling on one answer: what the caller asked for, else MAX_OUTPUT_TOKENS, and never more
+    than half the window the model holds. The caller's number wins so a deliberately short call stays
+    short, but see MAX_OUTPUT_TOKENS for why the *default* is generous: on a reasoning model a thin
+    ceiling is not a short answer, it is no answer."""
+    n = int(want) if want else MAX_OUTPUT_TOKENS
+    return max(64, min(n, model_context(model) // 2))
 # A stall is a fact about one endpoint and one model, and the point of naming them is that the cure is
 # not in this app: a router that keeps going quiet will keep going quiet, and the only thing the user
 # can do about it is move off it. What marks an outage is a *run* of failures — three blips an hour
@@ -3191,6 +3504,43 @@ def _ordinal(n):
     """2 -> "2nd", for a notice that reads as a sentence rather than as a counter."""
     suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return "%d%s" % (n, suf)
+def _elapsed(secs):
+    """A wait, in the unit that reads best: seconds under a minute, minutes above it."""
+    secs = max(0.0, float(secs or 0))
+    return "%ds" % max(1, round(secs)) if secs < 60 else "%dm" % max(1, round(secs / 60.0))
+def _model_failure_note(bot, model, msg, reason=""):
+    """What the room is told when a step spent every attempt and still ended with nothing.
+
+    A stall, an empty completion and a 5xx are one thing to the reader — the step came back with
+    nothing — so one notice covers them and all of them count toward the same run. What the notice
+    must never omit is the cost: how many times the router was tried, and how long that took. A
+    "the model stopped answering" with neither number is a report the user cannot act on, and it
+    reads as though nothing was tried at all."""
+    n = note_stall(model)
+    where = "%s on %s" % (model or "the model", _endpoint_label())
+    tries = int(msg.get("attempts") or 1)
+    if msg.get("spoke"):
+        note = ("%s's model stopped answering part-way through — %s went quiet for %s mid-answer, and "
+                "that step was abandoned. Retrying would have appended a second answer to the first."
+                % (bot["name"], where, _elapsed(msg.get("waited"))))
+    elif msg.get("stalled"):
+        mins = max(1, round(MODEL_STALL_SECONDS / 60.0))
+        waited = max(1, round(float(msg.get("waited") or 0) / 60.0))
+        note = ("%s's model stopped answering — %s. Tried %d time%s, waiting up to %d minute%s each "
+                "(about %d minute%s in total): every attempt went silent."
+                % (bot["name"], where, tries, "" if tries == 1 else "s",
+                   mins, "" if mins == 1 else "s", waited, "" if waited == 1 else "s"))
+    else:
+        note = ("%s's model call failed — %s. Tried %d time%s over %s, and every attempt came back the "
+                "same way: %s."
+                % (bot["name"], where, tries, "" if tries == 1 else "s",
+                   _elapsed(msg.get("waited")), reason or "no answer"))
+    if n > 1:
+        note += (" That is the %s turn in a row it has failed — it is the router, not the task: "
+                 "switch this bot to another model or endpoint." % _ordinal(n))
+    else:
+        note += " Nothing it had already done was lost: retry the task, or give this bot another model."
+    return note
 def _post(path, body, timeout=None):
     """One non-streaming request, read against a real deadline.
 
@@ -3212,16 +3562,43 @@ def _post(path, body, timeout=None):
             if time.time() > deadline:
                 raise socket.timeout("the router was still sending after %ds" % timeout)
         return b"".join(out).decode("utf-8", "replace")
-def chat(model, messages, tools=None, max_tokens=1600, tool_choice="auto", timeout=None, attempts=None):
+def _nothing_came(msg):
+    """True when a response carried no words, no tool call and no thinking — the router answered with
+    nothing at all.
+
+    Thinking counts as an answer here, and that is the whole point of the check. A reasoning model
+    puts its work in `reasoning_content` and leaves `content` EMPTY whenever it decides to call a
+    tool, so judging by `content` alone calls a working model a dead router. ZCode draws the line in
+    the same place: its empty-response test requires the reasoning length to be zero."""
+    return (not (msg.get("content") or "").strip() and not msg.get("tool_calls")
+            and not (msg.get("reasoning") or "").strip())
+def chat(model, messages, tools=None, max_tokens=None, tool_choice="auto", timeout=None, attempts=None):
     """One non-streaming answer. `attempts` caps how many tries this call may make — 1 is what the
-    wrap-up asks for; the default follows the settings policy."""
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.3}
+    wrap-up asks for; the default follows the settings policy. `max_tokens` is the ceiling on the
+    answer; the default is generous on purpose (see MAX_OUTPUT_TOKENS).
+
+    A call that spends every attempt and still comes back with nothing returns the error *and* what it
+    cost — `attempts` and `waited` — because a failure report that does not say how many times the
+    router was tried, or how long that took, is a report the user cannot act on (see
+    `_model_failure_note`)."""
+    body = {"model": model, "messages": messages, "max_tokens": output_budget(model, max_tokens),
+            "temperature": 0.3}
     if tools: body["tools"] = tools; body["tool_choice"] = tool_choice
     last = ""; tried = []; stalled = False
-    tries = max(1, int(attempts or (MODEL_RETRIES + 1)))
+    tries = _retry_limit(attempts)
+    made = 0                           # attempts actually sent: the budget can stop the loop early
+    t0 = time.time()
     for attempt in range(1, tries + 1):
         stalled = False                # whatever failed *last* is what this call reports
-        if attempt > 1: time.sleep(MODEL_RETRY_BACKOFF * (attempt - 1))
+        if attempt > 1:
+            # Give up on retrying before starting another attempt rather than after it: what this
+            # bounds is how long the step may keep *trying*, and an attempt already begun is allowed to
+            # reach its own end. A router refusing calls fails in milliseconds and spends nothing here,
+            # so the whole policy fits; one that has gone quiet has already spent the stall budget on
+            # each attempt, and this is what stops it at a few (see MODEL_FAIL_SECONDS).
+            if time.time() - t0 >= MODEL_FAIL_SECONDS: break
+            time.sleep(_retry_wait(attempt - 1))
+        made = attempt
         try:
             # One parser for a completion body, shared with the streamed path's fallback, so a body
             # that is not a completion is reported the same way whichever path reached it — with an
@@ -3231,10 +3608,10 @@ def chat(model, messages, tools=None, max_tokens=1600, tool_choice="auto", timeo
             whole = _completion_from(_post("/chat/completions", body, timeout=timeout))
             if whole["content"].startswith("[model error"):
                 last = whole["content"].split(": ", 1)[-1].rstrip("]"); continue
-            # A 200 with neither words nor tool calls is not an answer — it is the router having
-            # nothing to say, which used to end a turn on a blank and vanish from the log. Treat it as
-            # a failed attempt so the retry runs, exactly as a 5xx would.
-            if not whole["content"].strip() and not whole["tool_calls"]:
+            # A 200 with no words, no tool call and no thinking is not an answer — it is the router
+            # having nothing to say, which used to end a turn on a blank and vanish from the log.
+            # Treat it as a failed attempt so the retry runs, exactly as a 5xx would.
+            if _nothing_came(whole):
                 last = "empty response from the router"; continue
             return whole
         except urllib.error.HTTPError as e:
@@ -3252,29 +3629,54 @@ def chat(model, messages, tools=None, max_tokens=1600, tool_choice="auto", timeo
             # gets, instead of as a bare error string.
             stalled = isinstance(e, (socket.timeout, TimeoutError)) or isinstance(
                 getattr(e, "reason", None), (socket.timeout, TimeoutError))
-    out = {"content": f"[model error: {last}]", "tool_calls": [], "usage": {}}
+    # `attempts` is how many tries were actually *made*, which is not always the policy's number: the
+    # failure budget can stop a step short of it, and a report that claims tries it never made is
+    # exactly the kind of number the user cannot act on (see `_model_failure_note`).
+    out = {"content": f"[model error: {last}]", "tool_calls": [], "usage": {},
+           "attempts": made, "waited": round(time.time() - t0, 1)}
     if stalled: out["stalled"] = True
     return out
 
 def _completion_from(raw):
     """One non-streaming completion body, parsed into the shape `chat` returns. A body that is not a
     completion (an error page, a partial write) comes back as the same visible error string `chat`
-    would produce, so the caller sees one failure rather than a parse exception."""
+    would produce, so the caller sees one failure rather than a parse exception.
+
+    `reasoning` and `finish` ride along because both decide what the caller does next: a reasoning
+    model answers with its thinking in `reasoning_content` and an EMPTY `content` whenever it decides
+    to call a tool, so content alone cannot tell "the model said nothing" from "the model is working"
+    (see `_agent_loop`). `finish` is what says whether the answer was cut off at the ceiling."""
     try:
         raw = raw.split("data: [DONE]")[0].strip()
         obj = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-        m = obj["choices"][0]["message"]
-        return {"content": m.get("content") or "", "tool_calls": m.get("tool_calls") or [],
-                "usage": obj.get("usage") or {}}
+        ch = (obj.get("choices") or [{}])[0]
+        m = ch.get("message") or {}
+        return {"content": m.get("content") or "", "tool_calls": _tool_calls_of(m),
+                "reasoning": m.get("reasoning_content") or m.get("reasoning") or "",
+                "finish": ch.get("finish_reason") or "", "usage": obj.get("usage") or {}}
     except Exception:
         # Why it failed to parse is a Python internal ("substring not found") and tells the user
         # nothing; what the router actually said does — an error page, a gateway notice, a partial
         # write. So the excerpt is the report, and it is what the turn quotes in the room.
         head = " ".join((raw or "").split())[:160]
         return {"content": "[model error: the router answered with something that is not a completion"
-                           + (": " + head if head else "") + "]", "tool_calls": [], "usage": {}}
+                           + (": " + head if head else "") + "]", "tool_calls": [], "usage": {},
+                "reasoning": "", "finish": ""}
+def _tool_calls_of(message):
+    """The tool calls in a message, from either field they arrive in.
 
-def chat_stream(model, messages, tools=None, max_tokens=1600, attempts=None):
+    `tool_calls` is the current shape. `function_call` is the single-call field it replaced, and some
+    gateways still emit it — a call that arrives that way and is read as no call at all is a step the
+    bot appears to have skipped, so it is normalised here rather than missed."""
+    calls = list(message.get("tool_calls") or [])
+    legacy = message.get("function_call")
+    if legacy and legacy.get("name"):
+        calls.append({"id": "", "type": "function",
+                      "function": {"name": legacy.get("name"),
+                                   "arguments": legacy.get("arguments") or "{}"}})
+    return calls
+
+def chat_stream(model, messages, tools=None, max_tokens=None, attempts=None):
     """One streamed step, with the retry policy applied. `attempts` caps how many tries it may make —
     1 is what the wrap-up asks for; the default follows the settings policy.
 
@@ -3283,10 +3685,17 @@ def chat_stream(model, messages, tools=None, max_tokens=1600, attempts=None):
     no text to duplicate. An attempt that had already streamed a delta is never retried: the bot has
     spoken, and a second attempt would append a second answer to the first, so that stall is reported as
     stopping part-way (see `_chat_stream_once`)."""
-    tries = max(1, int(attempts or (MODEL_RETRIES + 1)))
+    tries = _retry_limit(attempts)
+    made = 0                           # attempts actually sent: the budget can stop the loop early
     t0 = time.time()
     for attempt in range(1, tries + 1):
-        if attempt > 1: time.sleep(MODEL_RETRY_BACKOFF * (attempt - 1))
+        # The same failure budget `chat` keeps: a stream that goes quiet spends the whole stall budget
+        # on each attempt, so this is what stops a dead router from being retried eleven times over
+        # (see MODEL_FAIL_SECONDS). Cheap failures spend nothing here and get the whole policy.
+        if attempt > 1:
+            if time.time() - t0 >= MODEL_FAIL_SECONDS: break
+            time.sleep(_retry_wait(attempt - 1))
+        made = attempt
         spoke = False; msg = None
         for kind, val in _chat_stream_once(model, messages, tools, max_tokens):
             if kind == "delta":
@@ -3299,8 +3708,14 @@ def chat_stream(model, messages, tools=None, max_tokens=1600, attempts=None):
                 # `done` rather than guessed at the call site, which cannot see either.
                 msg["attempts"] = attempt; msg["waited"] = round(time.time() - t0, 1); msg["spoke"] = spoke
             yield ("done", msg); return
+    # Only reached when the failure budget stopped the loop before its last try: the step is over with
+    # nothing to show, and saying so is the whole point of the budget.
+    yield ("done", {"content": "[model error: the router sent nothing new for %ds]"
+                               % MODEL_STALL_SECONDS,
+                    "tool_calls": [], "usage": {}, "stalled": True,
+                    "attempts": made, "waited": round(time.time() - t0, 1), "spoke": False})
 
-def _chat_stream_once(model, messages, tools=None, max_tokens=1600):
+def _chat_stream_once(model, messages, tools=None, max_tokens=None):
     """`chat`, read as it is written: yields ("delta", text) for each piece of the answer the moment
     the router produces it, then ("done", {content, tool_calls, usage}) once at the end.
 
@@ -3313,13 +3728,15 @@ def _chat_stream_once(model, messages, tools=None, max_tokens=1600):
     `stalled: True`, so the turn can say in the room why the step ended instead of leaving the user
     with a bot that stopped mid-sentence (see MODEL_STALL_SECONDS). Whether to try again after that is
     the caller's call — see `chat_stream`."""
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens,
-            "temperature": 0.3, "stream": True}
+    body = {"model": model, "messages": messages, "max_tokens": output_budget(model, max_tokens),
+            "temperature": 0.3, "stream": True, "stream_options": {"include_usage": True}}
     if tools: body["tools"] = tools; body["tool_choice"] = "auto"
     req = urllib.request.Request(ROUTER + "/chat/completions", data=json.dumps(body).encode(),
         headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json", "User-Agent": OUT_UA})
     text, calls, usage, seen = [], {}, {}, False
     plain = []                                 # a router that ignored `stream` sends one JSON body
+    thinking = []                              # a reasoning model's work, kept to tell "thinking" from "nothing"
+    finish = ""                                # `length` here means the answer was cut off at the ceiling
     # The clock that decides whether the model is still there. It moves only when the router says
     # something *new* — a delta, a tool-call fragment — never when it merely keeps the socket warm,
     # which is what a keepalive comment line does. See MODEL_STALL_SECONDS.
@@ -3359,10 +3776,17 @@ def _chat_stream_once(model, messages, tools=None, max_tokens=1600):
                     seen = True
                     if obj.get("usage"): usage = obj["usage"]
                     for ch in obj.get("choices") or []:
+                        if ch.get("finish_reason"): finish = ch["finish_reason"]
                         d = ch.get("delta") or {}
                         if d.get("content"):
                             text.append(d["content"]); last = time.time()
                             yield ("delta", d["content"])
+                        # A reasoning model streams its thinking here and leaves `content` empty. It
+                        # is not shown — it is not the bot's answer — but it *is* evidence the model
+                        # is alive and working, which is what keeps a working model from being
+                        # reported as a dead router (see `_nothing_came`).
+                        if d.get("reasoning_content") or d.get("reasoning"):
+                            thinking.append(d.get("reasoning_content") or d.get("reasoning")); last = time.time()
                         # Tool calls arrive in pieces too: the name in one chunk, the arguments spread
                         # over the next few, keyed by index so several parallel calls do not interleave.
                         for tc in d.get("tool_calls") or []:
@@ -3373,6 +3797,15 @@ def _chat_stream_once(model, messages, tools=None, max_tokens=1600):
                             fn = tc.get("function") or {}
                             if fn.get("name"): slot["function"]["name"] += fn["name"]
                             if fn.get("arguments"): slot["function"]["arguments"] += fn["arguments"]
+                        # The single-call field `tool_calls` replaced; some gateways still stream it,
+                        # and a call read as no call at all is a step the bot appears to have skipped.
+                        fc = d.get("function_call") or {}
+                        if fc.get("name"):
+                            last = time.time()
+                            slot = calls.setdefault(0, {"id": "", "type": "function",
+                                                        "function": {"name": "", "arguments": ""}})
+                            slot["function"]["name"] += fc["name"]
+                            if fc.get("arguments"): slot["function"]["arguments"] += fc["arguments"]
                 if done_stream or not chunk: break
                 if time.time() - last > MODEL_STALL_SECONDS: stalled = True; break
     except Exception:
@@ -3394,14 +3827,23 @@ def _chat_stream_once(model, messages, tools=None, max_tokens=1600):
         # A router that ignores `stream:true` answered with one JSON body. Parse that body here rather
         # than throwing it away and re-issuing the whole request through `chat` — that cost a second
         # full call per step, so every turn ran about twice as long on such a router.
-        yield ("done", _completion_from("".join(plain))); return
-    # A stream that opened but carried neither words nor a tool call is the same nothing as a failed
-    # one, so it takes the same route: the one-shot `chat`, which retries and, failing that, returns a
-    # visible error instead of an empty answer.
-    if not seen or (not text and not calls):
+        whole = _completion_from("".join(plain))
+        # ...but only when the body is actually an answer. A completion with nothing in it at all is
+        # the router having nothing to say, and returning it here ended the turn on a single request
+        # with no retry and no notice — the one failure mode where the user was told neither how many
+        # times it had been tried nor why it stopped. It falls through to the one-shot call instead,
+        # which retries it and, failing that, reports it.
+        if not _nothing_came(whole):
+            yield ("done", whole); return
+    # A stream that opened but carried no words, no tool call and no thinking is the same nothing as a
+    # failed one, so it takes the same route: the one-shot `chat`, which retries and, failing that,
+    # returns a visible error instead of an empty answer. A stream that carried *thinking* is not that
+    # nothing — the model is a reasoning model that answered without acting, and it is handed back so
+    # the turn can nudge it to act rather than calling the router dead.
+    if not seen or (not text and not calls and not thinking):
         yield ("done", chat(model, messages, tools=tools, max_tokens=max_tokens)); return
     yield ("done", {"content": "".join(text), "tool_calls": [calls[k] for k in sorted(calls)],
-                    "usage": usage})
+                    "usage": usage, "reasoning": "".join(thinking), "finish": finish})
 # ---------------------------------------------------------------- context window
 # A model errors out when one request exceeds its context window. Nothing here is a tokeniser —
 # it is a chars/4 estimate — but it is enough to keep a long run inside the window: the system
@@ -3586,12 +4028,18 @@ def media_models():
         items = json.load(urllib.request.urlopen(req, timeout=30)).get("data") or []
     except Exception:
         return {"image": [], "video": []}
-    img = [m["id"] for m in items if (m.get("capabilities") or {}).get("imageOutput")]
+    img = [m["id"] for m in items
+           if (m.get("capabilities") or {}).get("imageOutput") and m["id"] not in IMAGE_MODEL_DEAD]
     vid = [m["id"] for m in items if (m.get("capabilities") or {}).get("videoOutput")]
     return {"image": sorted(img), "video": sorted(vid)}
-def gen_image(prompt, model="", timeout=120):
-    """Draw a picture with an image-capable model. Returns (data_url, model_used) or ("", error)."""
-    msgs = [{"role": "user", "content": prompt}]
+def gen_image(prompt, model="", timeout=120, image=""):
+    """Draw a picture with an image-capable model. Returns (data_url, model_used) or ("", error).
+
+    `image` is an optional data URL to draw *from* (image-to-image): the same two routes that draw
+    from text draw from a photo as well."""
+    content = ([{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": image}}]
+               if image else prompt)
+    msgs = [{"role": "user", "content": content}]
     last = "(no image model configured)"
     for m in ([model] if model else []) + [x for x in IMAGE_MODELS if x != model]:
         try:
@@ -4731,12 +5179,16 @@ DEFAULT_MAX_STEPS = 80
 # nudge the user never sees — so a long job (find something, read several, act on the ones that fit)
 # finishes instead of being cut off at the cap. Bounded, so a runaway still lands.
 MAX_CONTINUATIONS = 2
-# The step cap bounds how many calls a turn makes; it does not bound how long it *runs*. A bot stuck
-# on a slow page or a long command can spend its whole budget in a handful of steps, and 240 calls at
-# 45s each is a turn that outlives the user's patience. So the turn also carries a wall-clock budget:
-# past it, the bot is told to land exactly as if it had run out of steps. Generous by default (a deep
-# research run is real work), and settable per machine in Settings → Models → Context.
-DEFAULT_TURN_SECONDS = 900
+# The step cap bounds how many calls a turn makes, and that is the bound the turn is held to. It used
+# to carry a wall-clock budget as well — 900s, after which the bot was told to land exactly as if it
+# had run out of steps — and that was the wrong thing to enforce. A clock fires on work that is
+# *slow*, and slow is what real work is: a page load, a click, a wait for a reply box to appear, a
+# model thinking through a long translation. A turn that was still doing exactly what it was asked to
+# do got cut off mid-flow for taking a long time, which is the one outcome the step budget exists to
+# avoid — and it landed on a report of work that was still going to finish. So there is no default
+# clock: the turn runs until its step budget is spent. `max_seconds` is still settable per machine in
+# Settings → AI model → Context for anyone who wants a hard cap as well, and 0 — the default — is none.
+DEFAULT_TURN_SECONDS = 0
 CONTINUE_NOTE = ("You have used all the steps for this round, but the job is not finished. Carry on "
                  "from exactly where you left off — do not repeat what you already did — and call "
                  "`finish` when it is done.")
@@ -4749,6 +5201,16 @@ TIME_UP = ("You have used all the time this turn is allowed. Stop calling tools.
 STOP_NOTE = ("The user asked you to stop. Call `finish` now with a short, concrete report of what you "
              "have done and found so far — say plainly what is still unfinished, and do not claim "
              "anything you did not get from a tool.")
+# A step can also come back with thinking but no words and no tool call: a reasoning model that spent
+# the whole answer budget on its thinking, so the words — or the call it was about to make — never got
+# emitted (`finish_reason` is then usually `length`). That is neither a dead router nor a model with
+# nothing to say, so it is not retried from scratch: a fresh attempt would spend the same budget the
+# same way. The model is asked to carry straight on instead, which is what ZCode does — up to three
+# times, so a model that only ever thinks still lands on a report rather than looping.
+OUTPUT_CONTINUE_LIMIT = 3
+OUTPUT_CONTINUE_NOTE = ("Your last answer was cut off before it said anything. Carry straight on from "
+                        "where it stopped — no apology, no recap of what you were doing — and put the "
+                        "work into words, or make the tool call you were about to make.")
 
 def max_steps(settings):
     """How many steps this turn may take: the saved number when there is one, else the default."""
@@ -4759,7 +5221,10 @@ def max_steps(settings):
     return n if n > 0 else DEFAULT_MAX_STEPS
 
 def max_seconds(settings):
-    """How long this turn may run, in seconds: the saved number when there is one, else the default."""
+    """How long this turn may run, in seconds — 0, the default, meaning no wall-clock bound at all.
+
+    The step budget is what bounds a turn; this is only for a machine that wants a hard cap as well.
+    See DEFAULT_TURN_SECONDS for why there is no default clock."""
     try:
         n = int((settings.get("context") or {}).get("max_seconds") or 0)
     except Exception:
@@ -4775,9 +5240,16 @@ def _wrap_up(model, messages, tools, said, bid, used=(), budget=0, why="steps", 
     `quick` skips that call and lands on what the bot already said or did. Stop uses it: a user who
     pressed Stop wants the turn over now, not one more model round-trip before it ends.
 
-    The call it does make is a *single* attempt, whatever the retry policy says. This is the landing
-    call: the turn is out of budget or the model is already known to be dead, so trying again would add
-    the policy's own ~6 minutes to a turn that has already given up.
+    The call it makes is a *single* attempt, whatever the retry policy says, and at most two of them.
+    This is the landing call: the turn is out of budget or the model is already known to be dead, so
+    the policy's own ~6 minutes of retrying is exactly what must not happen here. The second call is
+    for the landing that *worked* and still said nothing — see the loop below.
+
+    Its ceiling is the default one, not a thin one. `MAX_OUTPUT_TOKENS` is generous for the reason
+    spelled out there, and it applies here more than anywhere: this is the last call of a turn, and a
+    reasoning model that spends its whole ceiling thinking answers with an empty `content` and no
+    `finish` call at all. At the old 900 that was the common case on a long turn, which is how a turn
+    that had read, run and learned things landed on the bare list of tools it had used.
 
     `notes` are the times this app stopped the bot (see `_stopped_by_us`). A landing that says only
     "it ran run_shell" reads as a bot that wandered off; the refusal is the answer to "what
@@ -4791,22 +5263,32 @@ def _wrap_up(model, messages, tools, said, bid, used=(), budget=0, why="steps", 
         try:
             msgs = fit_messages(messages, budget)[0] if budget else messages
             note = {"time": TIME_UP, "stop": STOP_NOTE}.get(why, WRAP_UP)
-            msg = chat(model, msgs + [{"role": "user", "content": note}], tools=fin, max_tokens=900,
-                       attempts=1)
-            for tc in msg.get("tool_calls") or []:
-                try: args = json.loads(tc["function"]["arguments"] or "{}")
-                except Exception: args = {}
-                if (args.get("summary") or "").strip(): return args["summary"].strip()
-            body = (msg.get("content") or "").strip()
-            # A router that answers the wrap-up with an error string has reported nothing — fall
-            # through to what the bot said and did, rather than handing the error back as the report.
-            if body and not body.startswith("[model error"): return body
+            ask = msgs + [{"role": "user", "content": note}]
+            # Two calls at most, and each one a single attempt. The second is for the landing that
+            # came back as a *success* with nothing in it: a reasoning model that thought and then
+            # said nothing is not a failure to `chat` — `_nothing_came` counts thinking as an answer
+            # — so the retry policy inside it never fires and one wordless call would be the whole
+            # landing. Two `attempts=1` calls is what this costs, not the policy's six minutes, which
+            # is the reason it is a loop here and not `attempts=2`. A landing that came back as an
+            # error is a different thing and is not asked twice: the model is unreachable, and a
+            # second call would only buy another stall budget before the same nothing.
+            for _ in range(2):
+                msg = chat(model, ask, tools=fin, attempts=1)
+                for tc in msg.get("tool_calls") or []:
+                    try: args = json.loads(tc["function"]["arguments"] or "{}")
+                    except Exception: args = {}
+                    if (args.get("summary") or "").strip(): return args["summary"].strip()
+                body = (msg.get("content") or "").strip()
+                # A router that answers the wrap-up with an error string has reported nothing — fall
+                # through to what the bot said and did, rather than handing the error back as the report.
+                if body.startswith("[model error"): break
+                if body: return body
         except Exception:
             pass
     if said.strip(): return said.strip()
     # Even the report call failed, or the model had nothing to say. Say what it actually did rather
     # than nothing: the tools it ran are the record, and they are worth more than a shrug.
-    reason = {"empty": "the model stopped answering", "stalled": "the model stopped answering mid-step",
+    reason = {"empty": "the model answered with nothing", "stalled": "the model stopped answering mid-step",
               "time": "the turn ran out of time",
               "stop": "the user stopped the turn"}.get(why, "the turn ran out of steps")
     tail = ""
@@ -4943,6 +5425,7 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
     # after being refused three times leaves the room with nothing to read, and "the turn ran out of
     # steps" is not an account of what happened. See the `notice` events and `_wrap_up`.
     notices = []
+    nudges = 0                        # steps re-asked after an answer cut off before it said anything
     steps = max_steps(settings)
     budget_s = max_seconds(settings); t0 = time.time()
     # The turn may run for its step budget plus a bounded number of continuations. At each round
@@ -4959,18 +5442,19 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
         if i + 1 >= total: STEER_CLOSED.add(sid)
         if sid in STOP:                                  # the user pressed Stop: land the turn now
             stopped = True; break
-        # The budget bounds how long the turn may keep *starting* work, not how long any one step may
+        # A set clock bounds how long the turn may keep *starting* work, not how long any one step may
         # take. A step that has begun runs to its own end: the model call has a stall budget of its own
         # (no new content for MODEL_STALL_SECONDS, which a slow model that is still talking never
         # hits), and retries of its own on top of that — a step that says nothing three times over costs
-        # about six minutes, which is the worst case this budget was sized around (see
-        # DEFAULT_MODEL_RETRIES). `run_shell` is allowed the command's own timeout, a browser call its
-        # own, and a delegated sub-turn has a budget of its own — so the turn can overrun the clock by
-        # one of those, and by the wrap-up call it makes after this to land. That is the design rather
-        # than an oversight: cutting a step off in the middle would kill a command or a model mid-answer
-        # and lose the work the budget exists to bring home. What this check guarantees is that no *new*
-        # step starts past the clock.
-        if time.time() - t0 > budget_s:                  # out of wall-clock, whatever the step count
+        # about six minutes, which is the worst case this was sized around (see DEFAULT_MODEL_RETRIES).
+        # `run_shell` is allowed the command's own timeout, a browser call its own, and a delegated
+        # sub-turn has a budget of its own — so the turn can overrun the clock by one of those, and by
+        # the wrap-up call it makes after this to land. That is the design rather than an oversight:
+        # cutting a step off in the middle would kill a command or a model mid-answer and lose the work
+        # the budget exists to bring home. What this check guarantees is that no *new* step starts past
+        # the clock. There is no clock unless a machine set one — see DEFAULT_TURN_SECONDS — so this is
+        # normally skipped and the step budget above is the only thing that ends the turn.
+        if budget_s and time.time() - t0 > budget_s:
             timed_out = True; break
         if i and i % steps == 0:
             messages.append({"role": "user", "content": CONTINUE_NOTE})
@@ -5005,49 +5489,34 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
         # The endpoint answered, so any run of failures for it is over: the next stall is a fresh one
         # and not the fourth of a run (see note_stall/note_answer).
         if not err and not msg.get("stalled"): note_answer(model)
-        # The marker is this app's own words, so it is never streamed or kept as the bot's — but the
-        # reason inside it is the one thing the user needs, and it used to be thrown away with the
-        # marker: a 429, a wrong model name and a dead router all reached the room as the same
-        # "stopped answering". A stall has its own notice below, which says more, so this is the rest.
-        if err and not msg.get("stalled"):
-            note = "%s — the model call failed: %s" % (
-                bot["name"], content.split(":", 1)[-1].strip().rstrip("]")[:200])
+        # The marker is this app's own words, so it is never streamed or kept as the bot's — but what
+        # happened is the one thing the user needs, and it used to be thrown away with the marker: a
+        # 429, a wrong model name and a dead router all reached the room as the same "stopped
+        # answering". A step that spent every attempt gets the full report — how many tries, and how
+        # long — because that is what makes it actionable; a step that failed without being retried
+        # gets the bare reason. Both count toward the run that names the endpoint (see
+        # `_model_failure_note`), which is why this is one branch and not two.
+        if err or msg.get("stalled"):
+            reason = content.split(":", 1)[-1].strip().rstrip("]")[:200]
+            retried = msg.get("stalled") or int(msg.get("attempts") or 1) > 1
+            note = (_model_failure_note(bot, model, msg, reason) if retried
+                    else "%s — the model call failed: %s" % (bot["name"], reason))
             if note not in notices:
                 notices.append(note); yield {"type": "notice", "level": "warn", "text": note}
         if content and not err: said = content            # the last thing it actually put into words
         tcs = msg["tool_calls"]
         if content and not err and bot["id"] != "producer": yield {"type": "agent_text", "agent": bid, "text": content}
-        # The router went quiet mid-step (see MODEL_STALL_SECONDS). The bot did not fail and nothing it
-        # did is lost, but the room watched a bot stop talking, so it is told what happened and what to
-        # do about it — the same courtesy every other app-caused stop gets. It rides the `notices` list
-        # too, so it is repeated in the wrap-up even when the bot has something of its own to land on.
-        if msg.get("stalled"):
-            # Name the endpoint and the model, and say what was actually spent: how many tries, and how
-            # long that took. Those two numbers are what the user asked for — a stall report that says
-            # neither is a report they cannot act on. Then say whether this is now a habit: a *run* of
-            # failures is an outage, and a single one is a one-off with nothing to do but try again.
-            n = note_stall(model)
-            where = "%s on %s" % (model or "the model", _endpoint_label())
-            mins = max(1, round(MODEL_STALL_SECONDS / 60.0))
-            tries = int(msg.get("attempts") or 1)
-            waited = max(1, round(float(msg.get("waited") or 0) / 60.0))
-            if msg.get("spoke"):
-                note = ("%s's model stopped answering part-way through — %s went quiet for %d minute%s "
-                        "mid-answer, and that step was abandoned. Retrying would have appended a second "
-                        "answer to the first." % (bot["name"], where, mins, "" if mins == 1 else "s"))
-            else:
-                note = ("%s's model stopped answering — %s. Tried %d time%s, waiting up to %d minute%s "
-                        "each (about %d minute%s in total): every attempt went silent."
-                        % (bot["name"], where, tries, "" if tries == 1 else "s",
-                           mins, "" if mins == 1 else "s", waited, "" if waited == 1 else "s"))
-            if n > 1:
-                note += (" That is the %s turn in a row it has failed — it is the router, not the task: "
-                         "switch this bot to another model or endpoint." % _ordinal(n))
-            else:
-                note += " Nothing it had already done was lost: retry the task, or give this bot another model."
-            if note not in notices:
-                notices.append(note); yield {"type": "notice", "level": "warn", "text": note}
         if not tcs:
+            # Thinking but no words and no call: the answer was cut off before it said anything, so the
+            # model is asked to carry on rather than the step being written off as a failure. Retrying
+            # from scratch would spend the same budget the same way, and reporting it would tell the user
+            # the router was dead when it was working. Bounded by OUTPUT_CONTINUE_LIMIT, after which the
+            # turn falls through to the report below as it always did.
+            if (not err and not msg.get("stalled") and nudges < OUTPUT_CONTINUE_LIMIT
+                    and (msg.get("reasoning") or msg.get("finish") == "length")):
+                nudges += 1
+                messages.append({"role": "user", "content": OUTPUT_CONTINUE_NOTE})
+                continue
             if content and not err:
                 out["text"] = content
             else:
@@ -5096,7 +5565,11 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
                        "out": "(not run: the arguments arrived truncated)"}
                 # A call this app turned away is an app-caused stop like any other, so the room is told
                 # rather than left with a step row that quietly did nothing (see `_stopped_by_us`).
-                note = _stopped_by_us("(not run: the arguments arrived truncated)", bot["name"])
+                # The notice says what the app did about it, because "the arguments arrived truncated"
+                # on its own reads as the end of the turn — it is not: the bot is asked to make the
+                # call again, and that second attempt is the retry.
+                note = _stopped_by_us("(not run: the arguments arrived truncated — it was asked to make"
+                                      " the call again)", bot["name"])
                 if note and note not in notices:
                     notices.append(note); yield {"type": "notice", "level": "warn", "text": note}
                 messages.append({"role": "tool", "tool_call_id": tc.get("id"), "name": name,
@@ -5546,6 +6019,19 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
     # What the room heard, in the order it heard it, written to the room's record one save per member
     # rather than one per line — a turn says a lot, and every save rewrites the whole store.
     room_said = []
+    # ...and each thing said, once. A bot's words reach the room from two places: every step that puts
+    # something into words (the `agent_text` above), and the closing report at the end. A lead that
+    # restates its line on the way to a tool call and then again as its report said one thing, and the
+    # room must show it once — so a repeat of the *last* line that speaker said is dropped. Keyed on the
+    # last line rather than on `out["said"]` alone, because a model repeating itself across steps
+    # slipped past that comparison, and a bot whose steps emit no `agent_text` had its report dropped
+    # by it instead — the same words landing twice in one room, and nowhere at all in the other.
+    heard = {}
+    def room_says(who, text):
+        t = (text or "").strip()
+        if t and heard.get(who) != t:
+            heard[who] = t
+            room_said.append({"role": "assistant", "who": who, "content": text, "ts": time.time()})
     for m in targets:
         yield {"type": "agent", "id": m, "name": bot_by_id(bots, m)["name"], "state": "start"}
         engaged.append(bot_by_id(bots, m)["name"])
@@ -5582,7 +6068,7 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
             # did and not only what it ran.
             if t == "agent_text":
                 if (ev.get("text") or "").strip() and not ev.get("delta"):
-                    room_said.append({"role": "assistant", "who": who, "content": ev["text"], "ts": time.time()})
+                    room_says(who, ev["text"])
                 _work_note(work, chat_of(bid), ev, bid, bots)
             # A stop this app caused is the account of what happened, and it was only ever live here:
             # the card was drawn while the member ran and the redraw wiped it. Kept in the room's record
@@ -5597,10 +6083,9 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
         if not lead_text and out.get("text"): lead_text = out["text"]
         # ...and the room heard it already if those are the same words the bot just said: every line it
         # puts into words is in the room's record the moment it says it, so repeating the report here
-        # would write the closing line into the transcript twice.
-        if (out.get("text") or "").strip() and out["text"].strip() != (out.get("said") or "").strip():
-            room_said.append({"role": "assistant", "who": bot_by_id(bots, m)["name"],
-                              "content": out["text"], "ts": time.time()})
+        # would write the closing line into the transcript twice. When no line of its reached the room
+        # (a step that emitted no `agent_text`), the report is the only record of what it said and lands.
+        room_says(bot_by_id(bots, m)["name"], out.get("text"))
         if room_said:
             st = load(sid); st["messages"].extend(room_said); save(sid, st); del room_said[:]
         did.append((m, out))
@@ -6018,7 +6503,13 @@ class H(BaseHTTPRequestHandler):
         except Exception: return {}
     def _sid(self, body): return body.get("session") or body.get("bot") or "producer"
     def _bots_public(self, bots):
-        return [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow")} for b in bots]
+        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar")} for b in bots]
+        # A record written before these keys existed still answers with them, so the client never
+        # has to guess whether a missing key means "none" or "this bot is older than the feature".
+        for x in out:
+            x["outfit"] = x.get("outfit") or ""; x["accessory"] = x.get("accessory") or ""
+            x["avatar"] = x.get("avatar") or 0
+        return out
 
     def _fail(self, e):
         """Answer an uncaught handler failure in the same JSON shape as a deliberate one.
@@ -6092,6 +6583,7 @@ class H(BaseHTTPRequestHandler):
                 "router": ROUTER, "key_set": bool(KEY),
                 "models": CFG.get("models") or [DEFAULT_MODEL], "default_model": DEFAULT_MODEL,
                 "vision_model": CFG.get("vision_model", ""), "routines": load_routines(),
+                "team_template": TEAM_TEMPLATE,
                 "settings": pub, "channels": channels_public(chs),
                 "font_sizes": list(FONT_SIZES), "base_font_px": BASE_FONT_PX,
                 "skills": skills_public(),
@@ -6178,6 +6670,23 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(blob)))
             # An uploaded SVG is served from our own origin, so a direct visit must not be able to
             # run anything in it. It is inert inside <img>; this covers the other case.
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.end_headers(); self.wfile.write(blob); return
+        if u.path.startswith("/api/avatar/"):
+            # Same shape as the logo route: the bot is looked up by id first, so the URL never
+            # becomes a path and only a stored bot's own avatar can ever be served.
+            b = bot_by_id(load_bots(), u.path[len("/api/avatar/"):])
+            av = avatar_state(b) if b else {"path": ""}
+            if not av["path"]: return self.send_error(404)
+            try: blob = open(av["path"], "rb").read()
+            except OSError: return self.send_error(404)
+            ctype = LOGO_TYPE.get(os.path.splitext(av["path"])[1].lower(), "application/octet-stream")
+            self.send_response(200); self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            # Same reason as a logo: an uploaded SVG served from our own origin must not be able to
+            # run anything if it is visited directly.
             self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "private, max-age=300")
@@ -6312,6 +6821,13 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/team/import":
             text = (body.get("text") or "").strip()
             if not text: return self._json({"ok": False, "error": "paste a BotMRR playbook or a list of names first"})
+            # A paste built from the structure we hand out is held to that structure: a half-filled
+            # playbook is refused with every missing part named, rather than imported as a team of
+            # bots called "Teammate" that the user then has to repair one editor at a time.
+            problems = team_problems(text)
+            if problems:
+                return self._json({"ok": False, "problems": problems,
+                                   "error": "this playbook is not the structure we accept"})
             made, rooms = build_team(text)
             if not made: return self._json({"ok": False, "error": "could not find any agents in that text"})
             return self._json({"ok": True, "created": [b["name"] + " (" + b["title"] + ")" for b in made],
@@ -6319,18 +6835,14 @@ class H(BaseHTTPRequestHandler):
                                "bots": self._bots_public(load_bots()),
                                "channels": load_channels()})
         if u.path == "/api/bot":
-            bots = load_bots(); b = body.get("bot") or {}
-            bid = b.get("id") or re.sub(r"[^a-z0-9]+", "-", (b.get("name") or "bot").lower()).strip("-")
+            bots = load_bots(); b = dict(body.get("bot") or {})
+            bid = b.get("id") or _slug(b.get("name"), "bot")
             b["id"] = bid
             existing = bot_by_id(bots, bid)
             if existing: existing.update(b)
             else:
-                b.setdefault("title", "Teammate"); b.setdefault("role", ""); b.setdefault("color", "blue")
-                b.setdefault("model", DEFAULT_MODEL); b.setdefault("approval", "ask")
-                b.setdefault("memory", True); b.setdefault("voice", ""); b.setdefault("hidden", False)
-                b.setdefault("emoji", "🤖"); b.setdefault("face", ""); b.setdefault("pinned", False); b.setdefault("skills", []); b.setdefault("tools_allow", None)
-                b.setdefault("instructions", "You are " + b.get("name","a teammate") + ".")
-                bots.append(b)
+                b.setdefault("emoji", "🤖")      # a new bot gets a face even if the caller named none
+                bots.append(_norm_bots([b])[0])  # ...and every other field, from the one shared list
             save_bots(bots)
             return self._json({"ok": True, "bot": b, "bots": self._bots_public(bots)})
         if u.path == "/api/bot/delete":
@@ -6344,6 +6856,7 @@ class H(BaseHTTPRequestHandler):
                     c["lead"] = c["members"][0] if c["members"] else None
             save_channels(chs)
             drop_session(bid, "bot")   # a deleted bot leaves no orphan conversation behind
+            remove_avatar(bid)         # ...and no orphan avatar file either
             return self._json({"ok": True, "bots": self._bots_public(bots)})
         if u.path == "/api/bot/duplicate":
             bid = body.get("id"); bots = load_bots(); src = bot_by_id(bots, bid)
@@ -6370,15 +6883,34 @@ class H(BaseHTTPRequestHandler):
             ex = channel_by_id(chs, cid)
             if ex: ex.update(c)
             else:
-                c.setdefault("members",[b["id"] for b in load_bots()])
-                c.setdefault("mode","lead"); c.setdefault("lead", (c["members"] or ["producer"])[0])
-                c.setdefault("instructions",""); c.setdefault("folder",""); chs.append(c)
+                # A room created without a team starts with the whole roster, as it always has.
+                c.setdefault("members", [b["id"] for b in load_bots()])
+                # ...and `name`, `mode`, `lead` and the rest come from the one shared list, so a
+                # create can never again write a record the loader has to repair (or crash on).
+                chs.append(_norm_channels([c])[0])
             save_channels(chs)
             return self._json({"ok": True, "channels": chs})
         if u.path == "/api/channel/delete":
             cid = body.get("id"); chs = [c for c in load_channels() if c["id"] != cid]; save_channels(chs)
             drop_session(cid, "channel"); remove_logo(cid)     # a deleted company leaves no logo behind
             return self._json({"ok": True, "channels": chs})
+        if u.path == "/api/nav/order":
+            # A sidebar rearrangement. The order *is* the array in bots.json / channels.json, so it
+            # needs no field of its own and the phone reads the same order as the window.
+            ids = [str(i) for i in (body.get("ids") or [])]
+            kind = body.get("kind")
+            if kind == "members":
+                chs = load_channels(); c = channel_by_id(chs, body.get("id") or "")
+                if not c: return self._json({"ok": False, "error": "unknown room"})
+                c["members"] = reorder(c.get("members") or [], ids, key=lambda m: m)
+                save_channels(chs)
+                return self._json({"ok": True, "channels": channels_public(chs)})
+            if kind == "channels":
+                chs = reorder(load_channels(), ids); save_channels(chs)
+                return self._json({"ok": True, "channels": channels_public(chs)})
+            if kind != "bots": return self._json({"ok": False, "error": "nothing to reorder"})
+            bots = reorder(load_bots(), ids); save_bots(bots)
+            return self._json({"ok": True, "bots": self._bots_public(bots)})
         if u.path == "/api/logo":
             chs = load_channels(); c = channel_by_id(chs, body.get("id") or "")
             if not c: return self._json({"ok": False, "error": "unknown channel"})
@@ -6394,6 +6926,31 @@ class H(BaseHTTPRequestHandler):
             lg = logo_state(c)
             return self._json({"ok": True, "logo": lg["v"], "logo_src": lg["source"],
                                "logo_rel": lg["rel"], "removed": True})
+        if u.path == "/api/avatar":
+            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+            if not b: return self._json({"ok": False, "error": "unknown bot"})
+            r = save_avatar(b["id"], body.get("data"))
+            if r["ok"]:
+                av = avatar_state(b); b["avatar"] = av["v"]; save_bots(bots)
+                r.update({"avatar": av["v"], "avatar_src": av["source"]})
+            return self._json(r)
+        if u.path == "/api/avatar/remove":
+            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+            if not b: return self._json({"ok": False, "error": "unknown bot"})
+            remove_avatar(b["id"]); b["avatar"] = 0; save_bots(bots)
+            return self._json({"ok": True, "avatar": 0})
+        if u.path == "/api/avatar/transform":
+            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+            if not b: return self._json({"ok": False, "error": "unknown bot"})
+            # An image-to-image call is 30-60s of real work at the router, so the timeout is long on
+            # purpose: cutting it short would turn a slow picture into a failure.
+            data_url, used = gen_image(avatar_prompt(body.get("species"), body.get("color")),
+                                       image=body.get("data") or "", timeout=180)
+            if not data_url: return self._json({"ok": False, "error": used})
+            r = save_avatar(b["id"], data_url)
+            if not r["ok"]: return self._json(r)
+            av = avatar_state(b); b["avatar"] = av["v"]; save_bots(bots)
+            return self._json({"ok": True, "avatar": av["v"]})
         if u.path == "/api/models/detect":
             try:
                 ids = fetch_models(); save_models(ids)
@@ -6424,7 +6981,9 @@ class H(BaseHTTPRequestHandler):
             mid = (body.get("model") or "").strip()
             if not mid: return self._json({"ok": False, "error": "no model id"})
             CFG["image_model"] = mid; _save_json(CFG_PATH, CFG)
-            IMAGE_MODELS[:] = [mid]
+            # Same builder as startup, so picking a model that turns out not to route leaves the
+            # fallbacks in place instead of leaving the tool with nothing to try.
+            IMAGE_MODELS[:] = _image_models(mid)
             return self._json({"ok": True, "image_model": mid})
         if u.path == "/api/approval_mode":
             sid = self._sid(body); st = load(sid)

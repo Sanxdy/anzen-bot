@@ -157,7 +157,20 @@ function openWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true, nodeIntegration: false, sandbox: true,
+      // The link panel's frame is a real embedded browser (`<webview>`), which is what lets a page
+      // that refuses to be framed — X-Frame-Options, so most social and news sites — still render
+      // beside the chat. Electron leaves it off by default, so it has to be asked for.
+      webviewTag: true,
     },
+  });
+  /* A webview is remote content being attached to our own window, so it is trimmed to exactly what
+     the link panel needs: no preload of ours, no Node, and nothing but http(s) as a source. A page
+     the transcript linked to can therefore never reach this process or the app's own page. */
+  win.webContents.on('will-attach-webview', (e, prefs, params) => {
+    delete prefs.preload;
+    prefs.nodeIntegration = false;
+    prefs.contextIsolation = true;
+    if (!/^https?:/i.test(params.src || '')) e.preventDefault();
   });
   win.loadFile(file);            // the shell comes off the disk, not off a server
   win.webContents.once('did-finish-load', async () => {

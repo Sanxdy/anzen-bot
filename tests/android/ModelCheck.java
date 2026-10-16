@@ -41,6 +41,9 @@ public class ModelCheck {
         json();
         loading();
         turn();
+        steps();
+        notes();
+        words();
         System.out.println("\n" + pass + " passed, " + fail + " failed");
         if (fail > 0) System.exit(1);
     }
@@ -104,6 +107,22 @@ public class ModelCheck {
         ok("an unknown bot keeps its id", "ghost".equals(m.name("ghost")), m.name("ghost"));
         ok("an empty message leaves no blank bubble", m.entries().size() == 2);
         ok("a reopened chat is not mid-turn", !m.running());
+        // The index Edit and Retry truncate to is the message's place in the *saved* list, so the
+        // skipped empty message above must not shift it.
+        ok("your message knows its place in the history", m.entries().get(0).i == 0, m.entries().get(0).i);
+        ok("...and the reply knows its own", m.entries().get(1).i == 1, m.entries().get(1).i);
+
+        // A saved reply and a saved forward come back as what they are.
+        Model marks = model();
+        List<Object> withMarks = new ArrayList<>();
+        withMarks.add(Json.obj("{\"role\":\"user\",\"content\":\"what about the docs?\","
+            + "\"quote\":{\"who\":\"Producer\",\"text\":\"ship them Friday\"}}"));
+        withMarks.add(Json.obj("{\"role\":\"user\",\"content\":\"fyi\",\"fwd\":true}"));
+        marks.load(withMarks);
+        ok("a saved reply carries who it answers", "Producer".equals(marks.entries().get(0).qWho));
+        ok("...and what they said", "ship them Friday".equals(marks.entries().get(0).qText));
+        ok("a saved forward says it is one", marks.entries().get(1).fwd);
+        ok("an ordinary message is neither", !marks.entries().get(0).fwd && marks.entries().get(1).qWho.isEmpty());
     }
 
     // ---- a turn, as it streams ----------------------------------------------------------------
@@ -114,14 +133,15 @@ public class ModelCheck {
 
         m.apply("{\"type\":\"status\",\"state\":\"working\"}");
         ok("a turn that started is running", m.running());
+        ok("...and the bot's step is a card of its own", last(m).kind == Model.STEP, last(m).kind);
 
         int i = m.apply("{\"type\":\"plan\",\"agent\":\"producer\",\"text\":\"first I will look\"}");
         ok("a plan is a card", last(m).kind == Model.CARD && "plan".equals(last(m).sub));
         ok("...headed with whose plan it is", "Producer's plan".equals(last(m).title), last(m).title);
-        ok("...and returns its own index", i == 0, i);
+        ok("...and returns its own index", i == m.entries().indexOf(last(m)), i);
 
         m.apply("{\"type\":\"plan\",\"kind\":\"route\",\"text\":\"Writer should take this\"}");
-        ok("a hand-off is not titled like a plan", "Handing off".equals(last(m).title), last(m).title);
+        ok("a hand-off is titled as a hand-off", Model.ROUTE_LABEL.equals(last(m).title), last(m).title);
 
         m.apply("{\"type\":\"agent\",\"id\":\"writer\",\"name\":\"Writer\",\"state\":\"start\"}");
         ok("a teammate starting is a note", last(m).text.contains("Writer started"), last(m).text);
@@ -216,9 +236,28 @@ public class ModelCheck {
 
         // Your own message is on screen the moment you send it.
         Model own = model();
-        int idx = own.addUser("hello there");
+        int idx = own.addUser("hello there", "", "", false);
         ok("your message lands immediately", idx == 0 && own.entries().size() == 1);
         ok("...as your own", own.entries().get(0).kind == Model.USER && "hello there".equals(own.entries().get(0).text));
+        ok("...with no history index of its own yet", own.entries().get(0).i == -1, own.entries().get(0).i);
+
+        // A reply carries what it answers, and a forward says it is one.
+        Model quoted = model();
+        quoted.addUser("what about the docs?", "Producer", "ship them Friday", false);
+        Model.Entry q = quoted.entries().get(0);
+        ok("a reply carries who it answers", "Producer".equals(q.qWho) && "ship them Friday".equals(q.qText),
+           q.qWho + "/" + q.qText);
+        quoted.addUser("fyi", "", "", true);
+        ok("a forward says it is one", quoted.entries().get(1).fwd);
+
+        // A steer may itself be a reply, and the event carries the quote.
+        Model steered = model();
+        steered.apply("{\"type\":\"steer\",\"text\":\"and the tests?\","
+                    + "\"quote\":{\"who\":\"Producer\",\"text\":\"ship Friday\"}}");
+        Model.Entry st = last(steered);
+        ok("a steered reply keeps its quote",
+           st.kind == Model.USER && "Producer".equals(st.qWho) && "ship Friday".equals(st.qText),
+           st.qWho + "/" + st.qText);
 
         // The tool head lines the web app uses, so the two clients say the same thing.
         ok("a delegate names the role and the task",
@@ -229,6 +268,122 @@ public class ModelCheck {
            Model.head("mystery", Json.obj("{\"a\":1}")));
         ok("a long head line is cut to fit",
            Model.head("mystery", Json.obj("{\"a\":" + Json.quote(repeat('x', 400)) + "}")).length() <= 200);
+    }
+
+    // ---- the step card: what a bot is doing, and for how long ---------------------------------
+
+    static void steps() {
+        System.out.println("\nModel.apply — the step card");
+        Model m = model();
+        m.apply("{\"type\":\"status\",\"state\":\"thinking\",\"agent\":\"producer\"}");
+        Model.Entry s = last(m);
+        ok("a phase is a step card", s.kind == Model.STEP, s.kind);
+        ok("...naming the phase", "thinking".equals(s.sub), s.sub);
+        ok("...with its clock running", s.live(), s.since);
+        ok("...headed with the count and the phase", "Step 1 · Thinking…".equals(Model.stepTitle(s, false)),
+           Model.stepTitle(s, false));
+
+        m.apply("{\"type\":\"status\",\"state\":\"thinking\",\"agent\":\"producer\"}");
+        ok("the same phase said again is not a second step", m.entries().size() == 1 && s.steps == 1, s.steps);
+
+        m.apply("{\"type\":\"status\",\"state\":\"working\",\"agent\":\"producer\"}");
+        ok("a new phase counts up", s.steps == 2, s.steps);
+        ok("...and is the card's label", "Step 2 · Working…".equals(Model.stepTitle(s, false)),
+           Model.stepTitle(s, false));
+        ok("...and the log keeps every phase", s.text.equals("1. Thinking…\n2. Working…"), s.text);
+        ok("...on the same row, not a new one", m.entries().size() == 1, m.entries().size());
+
+        ok("past the deadline the label admits the wait",
+           "Step 2 · Still working…".equals(Model.stepTitle(s, true)), Model.stepTitle(s, true));
+
+        // Two bots in a room work at once, so each gets its own card rather than one that flips.
+        m.apply("{\"type\":\"status\",\"state\":\"working\",\"agent\":\"writer\"}");
+        ok("another bot's step is its own card", m.entries().size() == 2, m.entries().size());
+        ok("...named for that bot", "writer".equals(last(m).who), last(m).who);
+
+        m.apply("{\"type\":\"done\"}");
+        ok("the turn ending closes every step", s.done && last(m).done);
+        ok("...and stops their clocks", !s.live() && !last(m).live());
+        ok("...and the chat is no longer running", !m.running());
+    }
+
+    // ---- the notes this app writes about stopping a bot ---------------------------------------
+
+    static void notes() {
+        System.out.println("\nModel.apply — notices, and the context chip");
+        Model m = model();
+        int before = m.entries().size();
+        m.apply("{\"type\":\"notice\",\"level\":\"warn\",\"text\":\"Producer was denied that command.\"}");
+        ok("a notice is a row of its own", m.entries().size() == before + 1);
+        ok("...with what happened on it", last(m).text.contains("denied"), last(m).text);
+        ok("...and its level kept", "warn".equals(last(m).level), last(m).level);
+        ok("...so a turn that stopped says why", last(m).kind == Model.NOTICE);
+
+        m.apply("{\"type\":\"notice\",\"level\":\"warn\",\"text\":\"\"}");
+        ok("an empty notice leaves no blank row", m.entries().size() == before + 1, m.entries().size() - before);
+
+        ok("no measurement means an empty chip", m.ctxPct() == 0, m.ctxPct());
+        m.apply("{\"type\":\"ctx\",\"ctx\":{\"tokens\":8000,\"limit\":32000,\"rows\":[{\"label\":\"Messages\",\"tokens\":8000}]}}");
+        ok("the chip reads the turn's own measurement", m.ctxPct() == 25, m.ctxPct());
+        ok("...and keeps the breakdown behind it", m.ctx() != null && m.ctx().get("rows") != null);
+        m.apply("{\"type\":\"done\"}");
+        ok("...without becoming a row", m.entries().size() == before + 1, m.entries().size() - before);
+
+        // What /api/history says about the chat itself — the three chips, before a turn is run.
+        Model h = model();
+        h.meta("gpt-5", "ask", Json.obj("{\"tokens\":1000,\"limit\":4000}"));
+        ok("the chat's model is known on open", "gpt-5".equals(h.model()), h.model());
+        ok("...and its approval level", "ask".equals(h.approval()), h.approval());
+        ok("...and how full its window is", h.ctxPct() == 25, h.ctxPct());
+        h.clear();
+        ok("opening another chat forgets the last one's chips", h.model().isEmpty() && h.ctxPct() == 0);
+    }
+
+    // ---- the saved conversation, and the words -------------------------------------------------
+
+    static void words() {
+        System.out.println("\nModel.load — what a reopened chat keeps");
+        Model m = model();
+        List<Object> msgs = new ArrayList<>();
+        msgs.add(Json.obj("{\"role\":\"user\",\"content\":\"do the thing\",\"ts\":1700000000}"));
+        msgs.add(Json.obj("{\"role\":\"assistant\",\"who\":\"Producer\",\"content\":\"on it\",\"ts\":1700000060}"));
+        // The work a bot did is saved, so reopening shows the commands and what they printed.
+        msgs.add(Json.obj("{\"role\":\"tool\",\"agent\":\"producer\",\"name\":\"run_shell\","
+                        + "\"args\":{\"command\":\"ls -la\"},\"out\":\"total 0\",\"ts\":1700000120}"));
+        msgs.add(Json.obj("{\"role\":\"route\",\"who\":\"Room\",\"content\":\"Writer should take this\"}"));
+        // A stop this app caused is the account of what happened, and it is saved for the same reason.
+        msgs.add(Json.obj("{\"role\":\"notice\",\"content\":\"Producer was denied that command.\"}"));
+        m.load(msgs);
+        ok("the saved conversation comes back", m.entries().size() == 5, m.entries().size());
+        ok("a message keeps when it was said", m.entries().get(0).ts == 1700000000000L, m.entries().get(0).ts);
+        ok("the work a bot did is kept", m.entries().get(2).kind == Model.TOOL, m.entries().get(2).kind);
+        ok("...with its command line", "$ ls -la".equals(m.entries().get(2).title), m.entries().get(2).title);
+        ok("...and its output", "total 0".equals(m.entries().get(2).text), m.entries().get(2).text);
+        ok("...already finished, not left running", m.entries().get(2).done && !m.entries().get(2).live());
+        ok("a hand-off is kept as a hand-off", Model.ROUTE_LABEL.equals(m.entries().get(3).title));
+        ok("a stop note is kept as a note", m.entries().get(4).kind == Model.NOTICE);
+        ok("a reopened chat is not mid-turn", !m.running());
+
+        System.out.println("\nModel — the words the two clients share");
+        ok("a live turn says it is working", "working".equals(Model.stateLabel("working")), Model.stateLabel("working"));
+        ok("...not that it is at the desk", !Model.stateLabel("working").contains("desk"));
+        ok("a finished turn says done", "done".equals(Model.stateLabel("finished")), Model.stateLabel("finished"));
+        ok("a waiting turn says what it waits for",
+           "needs your approval".equals(Model.stateLabel("approval")), Model.stateLabel("approval"));
+        ok("an idle chat says idle", "idle".equals(Model.stateLabel("idle")), Model.stateLabel("idle"));
+        ok("idle is not a step", Model.stepLabel("idle") == null);
+        ok("a step is named in the desktop's words", "Working…".equals(Model.stepLabel("working")));
+        ok("a monogram takes the first letters", "PS".equals(Model.initials("Producer Smith")), Model.initials("Producer Smith"));
+        ok("...splitting a camel-case name", "ZW".equals(Model.initials("ZenWriter")), Model.initials("ZenWriter"));
+        ok("...and two letters of a short one", "PR".equals(Model.initials("Producer")), Model.initials("Producer"));
+        ok("no name still gets a monogram", "?".equals(Model.initials("")));
+        /* Locale-following on purpose: en-US stamps "10:57 PM" and a 24-hour locale "22:57", which is
+           what the desktop's own `toLocaleTimeString` does. So the check is the shape, not the digits. */
+        String stamped = Model.stamp(1700000000000L);
+        ok("a time is stamped", stamped.indexOf(':') > 0 && stamped.length() >= 5, stamped);
+        ok("nothing said has no stamp", Model.stamp(0).isEmpty());
+        ok("a chat that just moved says now", "now".equals(Model.ago(System.currentTimeMillis())), Model.ago(System.currentTimeMillis()));
+        ok("...and an old one in weeks", "2w".equals(Model.ago((System.currentTimeMillis() / 1000 - 1209600) * 1000)), Model.ago((System.currentTimeMillis() / 1000 - 1209600) * 1000));
     }
 
     static String repeat(char c, int n) {

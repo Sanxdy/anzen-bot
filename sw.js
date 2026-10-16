@@ -4,7 +4,7 @@
    Strategy: NETWORK-FIRST for the shell, cache only as an offline fallback.
    Cache-first here would serve a stale index.html/app.js forever after an
    update — the app would look unchanged until the user manually cleared it. */
-const CACHE = "anzen-v4";   // bump this whenever a file in SHELL changes: activate() drops every other
+const CACHE = "anzen-v6";   // bump this whenever a file in SHELL changes: activate() drops every other
                             // cache, and a stale shell list is what an offline launch would keep serving.
                             // (Online, the fetch handler below is network-first, so a new file is picked
                             // up on the next load either way — this is about the offline copy.)

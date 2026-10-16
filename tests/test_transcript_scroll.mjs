@@ -12,6 +12,12 @@
    bot's reply — so a message typed while reading back landed below the fold and stayed there. Scrolling
    away is now a timed pause that hands the follow back on its own, and sending re-pins outright.
 
+   A fourth is pinned with those: that pause used to hand the follow back by scrolling to the bottom
+   itself, so a reader who had stopped short of the bottom was pulled down a few seconds later with
+   nothing having been sent — and pulled down again on every further scroll, because each scroll re-arms
+   the timer. Reading that as the app polling is exactly what it was. The pause now re-arms the follow
+   and leaves the view alone; a message is the only thing that moves it.
+
    app.js is an ES module that boots the whole UI, so it cannot be imported here; the helpers, the
    landing branch at the end of `render`, and the `#msgs` scroll listener are read out of the source
    and run against stand-in nodes. If an extraction ever stops matching, these checks fail rather than
@@ -106,10 +112,22 @@ $._box = box({ top: 400, scroll: 1600, height: 400 });     // the reader is stil
 scrolled();
 ok("scrolling again restarts it rather than stacking timers", timers.length === 1, String(timers.length));
 fire();
-ok("when it fires the transcript catches up", $._box.scrollTop === 1600, String($._box.scrollTop));
-ok("...with the follow back on", T.pinned === true);
-ok("...and the pill cleared", pill.hidden === true);
+/* The other reported bug, and the one this block exists to pin: firing used to drag the transcript to
+   the bottom, so a reader parked short of it was pulled off what they were reading a few seconds later
+   with nothing having been sent — and pulled off again on every further scroll, which is what made it
+   read as the app polling. The follow is what comes back; the trip down is the next message's job. */
+ok("when it fires the reader is left exactly where they were", $._box.scrollTop === 400, String($._box.scrollTop));
+ok("...with the follow back on, so nothing had to be dragged to get it", T.pinned === true);
+ok("...and the pill still says there is newer output below", pill.hidden === false);
+ok("...and the next message is what moves them", (T.stick($._box), $._box.scrollTop === 1600), String($._box.scrollTop));
 ok("...and no timer left running", timers.length === 0);
+
+/* A timer that only re-arms must not be able to move the view however many times it is armed — the
+   reported symptom was it happening *each* time the reader was short of the bottom. */
+T.pinned = false; $._box = box({ top: 200, scroll: 1600, height: 400 });
+for (let i = 0; i < 3; i++) { scrolled(); fire(); }
+ok("a reader who keeps scrolling back is never pulled down by the clock",
+   $._box.scrollTop === 200, String($._box.scrollTop));
 
 T.pinned = false; T.holdFollow();
 $._box = box({ top: 400, scroll: 1600, height: 400 });

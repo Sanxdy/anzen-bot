@@ -29,6 +29,9 @@ final class Api {
     /** An event as it arrives: {@code json} is one {@code data:} payload, already unwrapped. */
     interface Event { void on(String json); }
 
+    /** A stream's connection, handed over the moment it is open, so the caller can close it. */
+    interface Open { void on(HttpURLConnection c); }
+
     /** A GET, returned as text. Throws with the status and body on anything but 2xx. */
     static String get(String base, String token, String path) throws IOException {
         return body(open("GET", base + path, token, false), null);
@@ -37,6 +40,31 @@ final class Api {
     /** A POST, returned as text. {@code json} is the request body, or null for none. */
     static String post(String base, String token, String path, String json) throws IOException {
         return body(open("POST", base + path, token, false), json);
+    }
+
+    /**
+     * A GET whose reply is bytes, not text — a room's logo.
+     *
+     * The logo lives behind the same token gate as everything else, so an {@code ImageView} pointed
+     * at the URL would be refused: the header is what the server reads, and a plain image load cannot
+     * carry one. Empty on any failure, which the caller draws as the monogram instead.
+     */
+    static byte[] getBytes(String base, String token, String path) {
+        HttpURLConnection c = null;
+        try {
+            c = open("GET", base + path, token, false);
+            if (c.getResponseCode() >= 400) return new byte[0];
+            ByteArrayOutputStream b = new ByteArrayOutputStream();
+            InputStream in = c.getInputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
+            return b.toByteArray();
+        } catch (IOException e) {
+            return new byte[0];
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     /**
@@ -50,6 +78,35 @@ final class Api {
         c.setReadTimeout(0);
         try {
             write(c, json);
+            BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("data:")) h.on(line.substring(5).trim());
+            }
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    /**
+     * A GET whose reply is an event stream: {@code h.on} runs for each {@code data:} line until the
+     * server closes or the socket goes quiet.
+     *
+     * Unlike a turn's own stream this one is expected to end: the watch is held open and re-opened
+     * when it drops, so it carries a read deadline. The server's {@code : keepalive} comment arrives
+     * every 15 s, well inside it, so a healthy stream never times out and a socket the wifi reaped
+     * always does — which is what turns a dead stream into a reconnect instead of a thread stuck in
+     * a read that will never return.
+     *
+     * {@code opened} is handed the live connection so the caller can close it. A reader parked in
+     * {@code readLine} cannot be told to stop — the keepalives keep it fed, so it never notices — and
+     * closing the socket from another thread is what makes that read throw and the loop end.
+     */
+    static void watch(String base, String token, String path, Event h, Open opened) throws IOException {
+        HttpURLConnection c = open("GET", base + path, token, true);
+        c.setReadTimeout(40000);
+        if (opened != null) opened.on(c);
+        try {
             BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
             String line;
             while ((line = r.readLine()) != null) {

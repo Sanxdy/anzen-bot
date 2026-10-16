@@ -77,6 +77,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 **Chat**
 * Markdown replies rendered properly, with raw HTML escaped.
 * Streamed turns you can **steer** or queue mid-flight, and a live context-window meter.
+* A sidebar you arrange yourself: fold the recent-chat list away, **drag** rooms, bots and a room's members into any order, and **pin** a room to the top. The order is saved on the server, so every device agrees.
 
 **Desktop and phone**
 * An Electron desktop app that runs with **no TCP port at all**, and a native Android client.

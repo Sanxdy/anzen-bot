@@ -136,11 +136,14 @@ def main():
           "--disable-blink-features=AutomationControlled" in opts["args"], str(opts))
     check("the launch names the chosen browser, and names none when there is none",
           ("channel" in opts) == bool(S.browser_channel()), str(opts))
-    # Asking for the sandbox off is what paints "unsupported command-line flag: --no-sandbox" across
-    # the sign-in window — a real warning about a real thing, for a flag a desktop never needed.
-    # It is only for root (containers), where Chromium refuses to start without it.
+    # Playwright switches the sandbox off unless asked to leave it on — `chromiumSandbox !== true`
+    # pushes `--no-sandbox` in the driver, on every platform — so the desktop that never wanted it had
+    # a real security boundary disabled and the "stability and security will suffer" banner across the
+    # sign-in window. A container running as root is the one case that needs the flag.
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        check("a normal desktop is not asked to run without the sandbox",
+        check("a normal desktop keeps Chrome's sandbox on, rather than leaving Playwright's default off",
+              opts.get("chromium_sandbox") is True, str(opts))
+        check("  ...and does not name --no-sandbox itself, since nothing here wants it",
               "--no-sandbox" not in opts["args"] and "--disable-dev-shm-usage" not in opts["args"],
               str(opts))
 
@@ -182,6 +185,13 @@ def main():
     wd = str(b.call("eval", expression="navigator.webdriver"))
     check("the account's browser does not announce itself as automated — the flag Google reads",
           wd.strip().lower() == "false", wd)
+    # ...and it does not announce itself as a *test build* either. `HeadlessChrome` in the user agent is
+    # what a bot check reads next, and it is a lie: this is a real Chrome launched without Playwright's
+    # automation switch. DuckDuckGo, Brave and Google all answered the throwaway with a bot check while
+    # it carried the token; none of them did once it was gone.
+    prof_ua = str(b.call("eval", expression="navigator.userAgent"))
+    check("a headless account browser does not announce HeadlessChrome either",
+          "HeadlessChrome" not in prof_ua and "Chrome/" in prof_ua, prof_ua)
     check("the profile folder was made on disk", os.path.isdir(S.own_profile_dir("X Promo")))
     check("the account shows as open while its browser is up", "X Promo" in b.open_profiles())
     # ...and a different account is a different browser, so it never sees the first one's cookies.
@@ -217,6 +227,22 @@ def main():
               "HeadlessChrome" not in ua and "Chrome/" in ua, ua)
         check("  ...and it does not announce itself as automated either",
               str(b3.call("eval", expression="navigator.webdriver")).strip().lower() == "false")
+
+    # ---- and neither does the throwaway, which is the browser the search engines see ----
+    # This is the one that matters most for a bot check: an unrouted site is a public page, so it is read
+    # here rather than in any account — and searching is exactly that. Unrouted on purpose, by taking
+    # 127.0.0.1 away from every account, because that is what makes this browser the one for the site.
+    set_browser(accounts=[{"name": "X Promo", "sites": "x.com, twitter.com"},
+                          {"name": "FB Page", "sites": "facebook.com, localhost"}],
+                mode="profiles", profile="default", headless=True)
+    b3.call("open", url=site)
+    anon_ua = str(b3.call("eval", expression="navigator.userAgent"))
+    check("the throwaway browser does not announce itself as headless either",
+          "HeadlessChrome" not in anon_ua and "Chrome/" in anon_ua, anon_ua)
+    set_browser(accounts=[{"name": "X Promo", "sites": "x.com, twitter.com, 127.0.0.1"},
+                          {"name": "FB Page", "sites": "facebook.com, localhost"},
+                          {"name": "Not Signed In Yet", "sites": ""}],
+                mode="profiles", profile="default", headless=True)   # put the routing back
 
     # ---- a restart must really close the old browsers, or the headless switch does nothing ----
     folder = S.own_profile_dir("X Promo")

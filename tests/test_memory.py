@@ -3,7 +3,7 @@
 
 No router needed — server.chat is stubbed.  Usage:  python3 tests/test_memory.py
 """
-import os, sys, tempfile
+import os, sys, tempfile, base64
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as S
 
@@ -12,6 +12,8 @@ S.MEMDIR = tmp
 S.SESS_PATH = os.path.join(tmp, "sessions.json")   # keep run_agent's sessions out of the real data dir
 S.BOTS_PATH = os.path.join(tmp, "bots.json")       # keep build_team's bots out of the real data dir
 S.CH_PATH = os.path.join(tmp, "channels.json")
+S.AVATAR_DIR = os.path.join(tmp, "avatars")        # an uploaded avatar must not land in the real one
+S.LOGO_DIR = os.path.join(tmp, "logos")
 # run_agent now works in a per-bot folder and logs the turn, so both need a home inside tmp
 S.SANDBOX = os.path.join(tmp, "sandbox"); os.makedirs(S.SANDBOX)
 S.LOGDIR = os.path.join(tmp, "logs"); os.makedirs(S.LOGDIR)
@@ -166,6 +168,157 @@ ok("imported bots default to the configured model", all(b["model"] == S.DEFAULT_
 ok("imported bots persist", [b["id"] for b in S.load_bots() if b["id"] in ("lea", "alex")] == ["lea", "alex"])
 ok("the imported room persists", any(c["id"] == "demo-room" for c in S.load_channels()))
 ok("an id collision gets a suffix", S.build_team(FIXTURE)[0][0]["id"] == "lea-2")
+
+# --- team import: the structure we hand out is the structure we accept ---
+# The copy button hands out TEAM_TEMPLATE and the endpoint holds a paste to it, so the one thing that
+# must never drift is that pair. A template we would ourselves refuse is the bug this catches.
+ok("the fixture is a clean playbook", S.team_problems(FIXTURE) == [])
+ok("the template we hand out is accepted by our own validator", S.team_problems(S.TEAM_TEMPLATE) == [])
+_t = S.parse_team(S.TEAM_TEMPLATE)
+ok("...and it is a real playbook, not a stub", len(_t["agents"]) == 2 and len(_t["rooms"]) == 1)
+ok("...and it names a chief", _t["chief"] == "lead")
+# The real BotMRR shape (botmrr.io/bots/engineering, trimmed) has to pass: this is what users paste.
+REAL = """---
+botmrr: 1
+id: engineering
+release: 1.0.0
+name: Ship Software Safely
+tagline: Turn a product change into a scoped plan.
+category: Engineering
+author:
+  name: OpenMausBot
+  url: https://openmausbot.com
+agents:
+  - key: ada
+    name: Ada
+    title: Tech Lead
+    description: Own technical direction and turn product intent into a plan.
+    appearance:
+      color: purple
+      mascotExpression: focused
+    playbooks:
+      - architecture-decision
+  - key: lin
+    name: Lin
+    title: Backend Engineer
+    description: Own services, data models, APIs, migrations and reliability.
+    appearance:
+      color: green
+chiefOfStaff: ada
+rooms:
+  - key: engineering-room
+    name: Engineering Room
+    members:
+      - ada
+      - lin
+    bulletin: Start with the user-visible outcome.
+    defaultResponder:
+      kind: agent
+      agent: ada
+routines: []
+playbooks:
+  - key: architecture-decision
+    name: Architecture Decision
+    summary: Record a focused technical decision.
+---
+"""
+ok("a real botmrr.io playbook passes unchanged", S.team_problems(REAL) == [])
+
+def _probs(text): return "\n".join(S.team_problems(text))
+def _playbook(**over):
+    """The template with one line replaced, so each check is about exactly one missing part."""
+    t = S.TEAM_TEMPLATE
+    for old, new in over.items(): t = t.replace(old, new)
+    return t
+
+ok("a paste with no agents is told so",
+   "no `agents:`" in _probs(_playbook(**{"agents:\n": ""})))
+ok("a paste with no rooms is told so", "no `rooms:`" in _probs(_playbook(**{"rooms:\n": ""})))
+ok("an agent missing its title is named",
+   "agent 2 (Dima) has no `title`" in _probs(_playbook(**{"    title: Engineer\n": ""})))
+ok("an agent missing its description is named",
+   "has no `description`" in _probs(_playbook(**{"    description: What this bot owns, and how it should work. Two or three sentences.\n    appearance:\n      color: purple\n": ""})))
+ok("an agent that opens with name instead of key is still seen, and reported",
+   "agent 1 (Lea) has no `key`" in _probs(_playbook(**{"  - key: lead\n": "  - name: Lea\n"})))
+ok("two agents sharing a key is named", "share the key `lead`" in _probs(_playbook(**{"  - key: dev\n": "  - key: lead\n"})))
+ok("a room member that is not an agent is named",
+   "lists member `ghost`, but no agent has that key" in _probs(_playbook(**{"      - dev\n": "      - ghost\n"})))
+ok("a lead that is not an agent is named",
+   "names lead `ghost`, but no agent has that key" in _probs(_playbook(**{"      agent: lead\n": "      agent: ghost\n"})))
+ok("a room with no members is named", "has no `members`" in _probs(_playbook(**{"    members:\n      - lead\n      - dev\n": ""})))
+ok("a room with no lead at all is named",
+   "no `defaultResponder:` `agent:`" in _probs(_playbook(**{
+       "chiefOfStaff: lead\n": "",
+       "    defaultResponder:\n      kind: agent\n      agent: lead\n": ""})))
+ok("a chiefOfStaff that is not an agent is named",
+   "`chiefOfStaff` names `ghost`" in _probs(_playbook(**{"chiefOfStaff: lead": "chiefOfStaff: ghost"})))
+ok("a plain list is not treated as a broken playbook", S.team_problems("Lea: Producer\nAlex: UI\nDima: Dev") == [])
+_bare = _probs(_playbook(**{"agents:\n": "", "rooms:\n": ""}))
+ok("an empty playbook names every part it is missing, not just the first",
+   "no `agents:`" in _bare and "no `rooms:`" in _bare and "`chiefOfStaff` names `lead`" in _bare)
+
+# --- team import: chiefOfStaff leads when the room names no responder ---
+NOLEAD = REAL.replace("    defaultResponder:\n      kind: agent\n      agent: ada\n", "")
+ok("a room that names only a chiefOfStaff is still complete", S.team_problems(NOLEAD) == [])
+_made, _rooms = S.build_team(NOLEAD)
+ok("...and chiefOfStaff becomes the room's lead", _rooms[0]["lead"] == "ada")
+
+# --- image models: a config left on a dead route must still leave something to draw with ---
+ok("a dead configured image route still leaves a live model to try",
+   S._image_models("inf/cb/gemini-3.1-flash-image")[:1] == S.IMAGE_MODEL_FALLBACKS[:1])
+ok("a live configured image route is tried before the fallbacks",
+   S._image_models("inf/gemini-2.5-flash-image")[0] == "inf/gemini-2.5-flash-image")
+ok("a configured route that is not a fallback is kept too",
+   S._image_models("some-other-image-model")[0] == "some-other-image-model")
+ok("the live image list carries a live model", bool(set(S.IMAGE_MODELS) & set(S.IMAGE_MODEL_FALLBACKS)))
+ok("the live image list carries no dead model", not set(S.IMAGE_MODELS) & S.IMAGE_MODEL_DEAD)
+ok("the settings picker cannot offer a dead image route", 'm["id"] not in IMAGE_MODEL_DEAD' in src)
+
+# --- avatars: the logo decode/validate/store path, reused, plus the bot keys behind it ---
+def _data(mime, blob): return "data:%s;base64,%s" % (mime, base64.b64encode(blob).decode())
+PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+GIF = b"GIF89a" + b"y" * 32
+
+ok("_save_image refuses what is not a data URL", not S._save_image(S.AVATAR_DIR, "t1", "hello")["ok"])
+ok("_save_image refuses a MIME we do not serve", not S._save_image(S.AVATAR_DIR, "t1", _data("image/tiff", PNG))["ok"])
+ok("_save_image refuses a data URL with no payload", not S._save_image(S.AVATAR_DIR, "t1", "data:image/png;base64,")["ok"])
+ok("...and the empty-blob guard is still there for a payload that decodes to nothing", "that file is empty" in src)
+ok("_save_image refuses bytes that are not the type they claim",
+   not S._save_image(S.AVATAR_DIR, "t1", _data("image/png", GIF))["ok"])
+ok("_save_image refuses a blob over the 2 MB cap",
+   not S._save_image(S.AVATAR_DIR, "t1", _data("image/png", PNG + b"\x00" * S.MAX_LOGO_BYTES))["ok"])
+ok("_save_image stores nothing when it refuses", not os.path.isdir(S.AVATAR_DIR))
+
+ok("save_avatar stores a picture and reports it as an upload",
+   S.save_avatar("av1", _data("image/png", PNG))["ok"])
+_av = S.avatar_state({"id": "av1"})
+ok("...and the bot's avatar reads back as an upload with a version",
+   _av["source"] == "upload" and _av["v"] > 0)
+ok("remove_avatar takes the bot back to its drawn face",
+   S.remove_avatar("av1") and S.avatar_state({"id": "av1"})["source"] == "")
+ok("...with the version back to none", S.avatar_state({"id": "av1"})["v"] == 0)
+
+S.save_avatar("av2", _data("image/png", PNG)); S.save_avatar("av2", _data("image/gif", GIF))
+ok("a second upload in another format replaces the first, so exactly one file decides",
+   sorted(f for f in os.listdir(S.AVATAR_DIR) if f.startswith("av2.")) == ["av2.gif"])
+ok("an id that is not a slug names no avatar file", not S.save_avatar("../../etc", _data("image/png", PNG))["ok"])
+
+# The channel editor depends on these exact strings, so the refactor that shares the code with
+# avatars must not have reworded a single one of them.
+ok("save_logo still refuses an unknown channel", S.save_logo("", "x")["error"] == "unknown channel")
+ok("save_logo still refuses a non-image", S.save_logo("lg1", "hello")["error"] == "that is not an image file")
+ok("save_logo still lists the formats it takes",
+   S.save_logo("lg1", _data("image/tiff", PNG))["error"] == "use a png, jpg, webp, gif or svg")
+ok("save_logo still refuses bytes that are not the type they claim",
+   S.save_logo("lg1", _data("image/png", GIF))["error"] == "that file is not really a png")
+ok("save_logo still returns exactly {ok: True} on success", S.save_logo("lg1", _data("image/png", PNG)) == {"ok": True})
+
+# --- a bot record written before outfit/accessory/avatar existed still answers with them ---
+_pub = S.H._bots_public(None, [{"id": "old", "name": "Old"}])[0]
+ok("a bot from before the avatar keys still reports an outfit", _pub["outfit"] == "")
+ok("...an accessory", _pub["accessory"] == "")
+ok("...and no avatar version", _pub["avatar"] == 0)
+ok("a bot with an outfit keeps it", S.H._bots_public(None, [{"id": "n", "outfit": "hoodie"}])[0]["outfit"] == "hoodie")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

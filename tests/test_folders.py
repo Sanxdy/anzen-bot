@@ -1171,6 +1171,38 @@ list(S.run_agent("webshop", "loopy", "go", "", out6, S.load_bots(),
                  {"context": {"max_steps": 3}}, 0))
 ok("a turn obeys the cap its settings name, continuations and all",
    steps3["n"] == 3 * (1 + S.MAX_CONTINUATIONS), steps3["n"])
+
+# --- there is no clock unless a machine sets one ---
+# The turn used to carry a 900s wall-clock budget and land mid-flow when it expired. That fires on work
+# that is merely *slow*, and slow is what real work is — a page load, a click, a wait for a reply box to
+# appear — so a job that was still doing exactly what it was asked to do got cut off for taking a long
+# time. The step budget is the bound now. A stub slower than the clock proves both halves: with nothing
+# set the turn runs its whole budget, and with a cap set it lands on a report instead of running on.
+def _slow_loop(store):
+    def stream(model, messages, tools=None, max_tokens=1600):
+        store["n"] += 1
+        time.sleep(0.4)
+        yield ("done", {"content": "", "usage": {}, "tool_calls": [{"id": "s%d" % store["n"], "function": {
+            "name": "run_shell", "arguments": json.dumps({"command": "echo hi"})}}]})
+    return stream
+S.chat = lambda *a, **k: _finish_msg("landed")
+free = {"n": 0}; S.chat_stream = _slow_loop(free)
+out_free = {}
+list(S.run_agent("webshop", "loopy", "go", "", out_free, S.load_bots(),
+                 {"context": {"max_steps": 2, "max_seconds": 0}}, 0))
+ok("with no clock set, a slow turn runs its whole step budget",
+   free["n"] == 2 * (1 + S.MAX_CONTINUATIONS), free["n"])
+ok("...and it is the step budget that ended it, not a clock",
+   out_free.get("stop") == "max_steps", out_free.get("stop"))
+capped = {"n": 0}; S.chat_stream = _slow_loop(capped)
+out_capped = {}
+list(S.run_agent("webshop", "loopy", "go", "", out_capped, S.load_bots(),
+                 {"context": {"max_steps": 2, "max_seconds": 1}}, 0))
+ok("a machine that sets a clock still gets one, and it lands the turn",
+   out_capped.get("stop") == "time", out_capped.get("stop"))
+ok("...stopped early rather than at the step cap, and still landed a report",
+   capped["n"] < 2 * (1 + S.MAX_CONTINUATIONS) and out_capped.get("text") == "landed",
+   "%s steps, %r" % (capped["n"], out_capped.get("text")))
 S.chat, S.chat_stream = _prev_chat, _prev_stream
 
 # ...and when the report call itself fails, the turn still says what the bot actually did
@@ -1202,8 +1234,8 @@ out7 = {}
 list(S.run_agent("webshop", "loopy", "check the relay", "", out7, S.load_bots(), {}, 0))
 ok("an empty model answer does not leave the turn blank",
    (out7.get("text") or "").strip() != "", repr(out7.get("text")))
-ok("...it says the model stopped answering", "model stopped answering" in (out7.get("text") or ""),
-   out7.get("text"))
+ok("...it says the model answered with nothing, not that it went silent",
+   "model answered with nothing" in (out7.get("text") or ""), out7.get("text"))
 ok("...and the turn is marked so the log can say why", out7.get("stop") == "empty", out7.get("stop"))
 ok("...and the work log records the stop reason, not just the report",
    "the model returned nothing" in open(S.log_path("loopy"), encoding="utf-8").read(),
@@ -1212,8 +1244,12 @@ S.chat, S.chat_stream = _prev_chat, _prev_stream
 
 # --- the real client retries an empty completion before it gives up ---
 # `_prev_chat` is whatever stub the loop tests above left in place, so the genuine client is the one
-# captured before any stub existed.
+# captured before any stub existed. The policy is pinned here rather than left at the shipped default:
+# what this checks is that a retry *happens*, and the default is eleven tries on a jittered backoff
+# capped at a minute — a real wait, which the suite would then spend minutes actually waiting out.
 _real_chat, _real_post = _prev_chat_t, S._post
+_keep_policy = (S.MODEL_RETRIES, S.MODEL_RETRY_BACKOFF, S.MODEL_RETRY_BACKOFF_MAX)
+S.MODEL_RETRIES, S.MODEL_RETRY_BACKOFF, S.MODEL_RETRY_BACKOFF_MAX = 1, 0.01, 0.02
 _tries = {"n": 0}
 def _post_empty_then_ok(path, body, timeout=240):
     _tries["n"] += 1
@@ -1227,7 +1263,10 @@ _emptied = _real_chat("m", [{"role": "user", "content": "hi"}])
 ok("an empty completion that never recovers becomes a visible error, not a blank",
    _emptied["content"].startswith("[model error") and "empty response" in _emptied["content"],
    _emptied["content"])
+ok("...and the error says how many tries it made before giving up",
+   int(_emptied.get("attempts") or 0) == 2, _emptied.get("attempts"))
 S._post = _real_post
+(S.MODEL_RETRIES, S.MODEL_RETRY_BACKOFF, S.MODEL_RETRY_BACKOFF_MAX) = _keep_policy
 
 # --- a bot that can talk can usually see: an unset vision model must not blind browser_see ---
 _seen = []

@@ -2,13 +2,17 @@
    Port of Coucou's BotEngine.swift: continuous tweens/springs, NOT frame swaps.
    One MochiBot per <canvas>; a single rAF loop ticks every bot.
 
-   Three layers, so a bot is a character and not a coloured blob:
+   Five layers, so a bot is a character and not a coloured blob:
      SPECIES  — the body shape, ears/antenna, eye style and idle motion. Each bot gets
                 its own, derived from its id, so a team of bots looks like a team.
-     EMOTION  — mouths, brows, blush and eye shape, blended smoothly. States set a
+     EMOTION  — mouths, brows and eye shape, blended smoothly. States set a
                 default feeling; an idle bot wanders through its own.
+     OUTFIT   — what it wears on its body: scarf, tie, apron, mantle. One per bot.
+     WEAR     — what it wears on its head or face: glasses, hat, headset, crown.
      CURSOR   — every bot's eyes follow the pointer, from wherever it sits on screen.
-   Plus the "scene" layer of props per state (desk, thought bubble, magnifier). */
+   Plus the "scene" layer of props per state (desk, thought bubble, magnifier).
+   An uploaded avatar (`opts.image`) replaces the body's fill with a picture, keyed against
+   its own background so the bot keeps its silhouette instead of becoming a pasted-in photo. */
 
 const MC = { INK: "#1A1412" };
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -55,23 +59,51 @@ const EYE = {
   bulge:  { w: 0.25, h: 0.25, y: -0.62, sp: 0.40 },
 };
 
+/* ---------------- what the bot wears ----------------
+   Two axes, so a team reads as a team and still tells its members apart. OUTFITS is on the body and
+   is clipped to the silhouette (a scarf that spilled past the edge would look like a floating bar);
+   ACCESSORIES is on the head and face and is not, because a hat brim and a pair of ear cups are
+   *meant* to break the outline — that is most of what makes them readable. Both are drawn inside the
+   body's transform so they ride the tilt, the roll and the accessory spring along with the ears.
+   Colours are fixed per garment rather than taken from the bot, so a scarf stays a scarf whatever
+   the body is: a scarf in the body's own colour is invisible on half the team. */
+export const OUTFITS = {
+  scarf:  { label: "Scarf",   ink: "#E4572E", edge: "#B8401F" },
+  tie:    { label: "Tie",     ink: "#2B2B33", edge: "#4A4A57" },
+  collar: { label: "Collar",  ink: "#F5F6F8", edge: "#D3D7DE" },
+  apron:  { label: "Apron",   ink: "#EDE7DA", edge: "#C9BFA9" },
+  mantle: { label: "Mantle",  ink: "#3B3B47", edge: "#5A5A6B" },
+  bowtie: { label: "Bow tie", ink: "#C2410C", edge: "#8F2F09" },
+};
+export const ACCESSORIES = {
+  glasses: { label: "Glasses" },
+  shades:  { label: "Sunglasses" },
+  hat:     { label: "Hat" },
+  beanie:  { label: "Beanie" },
+  headset: { label: "Headset" },
+  bow:     { label: "Bow" },
+  flower:  { label: "Flower" },
+  crown:   { label: "Crown" },
+};
+const GOLD = "#EAB308";
+
 /* ---------------- emotions: the face a bot is wearing ---------------- */
 /* smile -1..1 · open 0..1 (mouth aperture) · brow -1..1 (up is positive) ·
-   blush 0..1 · eye 0..1.4 (eye height) · wave 0..1 (mouth squiggle) */
+   eye 0..1.4 (eye height) · wave 0..1 (mouth squiggle) */
 export const EMOTIONS = {
-  calm:     { label: "calm",     smile:  0.35, open: 0.00, brow:  0.00, blush: 0.05, eye: 1.00, wave: 0 },
-  happy:    { label: "happy",    smile:  0.95, open: 0.32, brow:  0.10, blush: 0.40, eye: 0.62, wave: 0 },
-  curious:  { label: "curious",  smile:  0.20, open: 0.55, brow:  0.35, blush: 0.05, eye: 1.18, wave: 0 },
-  excited:  { label: "excited",  smile:  1.00, open: 0.45, brow:  0.55, blush: 0.35, eye: 1.30, wave: 0 },
-  focused:  { label: "focused",  smile:  0.05, open: 0.00, brow: -0.45, blush: 0.00, eye: 0.86, wave: 0 },
-  worried:  { label: "worried",  smile: -0.45, open: 0.00, brow:  0.75, blush: 0.10, eye: 0.92, wave: 0 },
-  proud:    { label: "proud",    smile:  0.80, open: 0.10, brow: -0.10, blush: 0.30, eye: 0.62, wave: 0 },
-  sleepy:   { label: "sleepy",   smile:  0.10, open: 0.25, brow:  0.10, blush: 0.10, eye: 0.00, wave: 0 },
-  confused: { label: "confused", smile: -0.10, open: 0.00, brow:  0.45, blush: 0.05, eye: 1.05, wave: 1 },
-  bored:    { label: "bored",    smile: -0.20, open: 0.00, brow:  0.15, blush: 0.00, eye: 0.75, wave: 0 },
-  angry:    { label: "angry",    smile: -0.70, open: 0.20, brow: -0.95, blush: 0.15, eye: 0.78, wave: 0 },
+  calm:     { label: "calm",     smile:  0.35, open: 0.00, brow:  0.00, eye: 1.00, wave: 0 },
+  happy:    { label: "happy",    smile:  0.95, open: 0.32, brow:  0.10, eye: 0.62, wave: 0 },
+  curious:  { label: "curious",  smile:  0.20, open: 0.55, brow:  0.35, eye: 1.18, wave: 0 },
+  excited:  { label: "excited",  smile:  1.00, open: 0.45, brow:  0.55, eye: 1.30, wave: 0 },
+  focused:  { label: "focused",  smile:  0.05, open: 0.00, brow: -0.45, eye: 0.86, wave: 0 },
+  worried:  { label: "worried",  smile: -0.45, open: 0.00, brow:  0.75, eye: 0.92, wave: 0 },
+  proud:    { label: "proud",    smile:  0.80, open: 0.10, brow: -0.10, eye: 0.62, wave: 0 },
+  sleepy:   { label: "sleepy",   smile:  0.10, open: 0.25, brow:  0.10, eye: 0.00, wave: 0 },
+  confused: { label: "confused", smile: -0.10, open: 0.00, brow:  0.45, eye: 1.05, wave: 1 },
+  bored:    { label: "bored",    smile: -0.20, open: 0.00, brow:  0.15, eye: 0.75, wave: 0 },
+  angry:    { label: "angry",    smile: -0.70, open: 0.20, brow: -0.95, eye: 0.78, wave: 0 },
 };
-const EMO_KEYS = ["smile", "open", "brow", "blush", "eye", "wave"];
+const EMO_KEYS = ["smile", "open", "brow", "eye", "wave"];
 /* What a bot idly feels when nothing is happening. Picked at random, held a few seconds. */
 const IDLE_MOODS = ["calm", "calm", "curious", "happy", "bored", "sleepy"];
 
@@ -197,6 +229,9 @@ export class MochiBot {
     this.bodyBottom = opts.bodyBottom || opts.flat || "#C4C5CA";
     this.species = SPECIES[opts.species] ? opts.species : speciesFor(opts.seed);
     this.sp = SPECIES[this.species];
+    this.outfit = OUTFITS[opts.outfit] ? opts.outfit : "";
+    this.accessory = ACCESSORIES[opts.accessory] ? opts.accessory : "";
+    this.image = opts.image || "";                   // an uploaded avatar: the body's fill
     this.cv.width = this.size * this.dpr; this.cv.height = this.size * this.dpr;
     this.R = this.size * 0.326;                      // body radius; the unit every offset is quoted in
     this.yaw = 0; this.pitch = 0; this.tilt = 0; this.roll = 0; this.open = 1;
@@ -301,13 +336,19 @@ export class MochiBot {
       default: if (prev !== "idle" || s !== "idle") this.blink();
     }
   }
-  /* Re-skin a live bot: same canvas, same motion mid-flight, a different species and colour.
-     Pass no colours to fall back to the plain Mochi body. */
-  skin(species, colors) {
+  /* Re-skin a live bot: same canvas, same motion mid-flight, a different species, colour and
+     wardrobe. Pass no colours to fall back to the plain Mochi body; pass no `look` to keep what
+     it is wearing. */
+  skin(species, colors, look) {
     if (SPECIES[species]) { this.species = species; this.sp = SPECIES[species]; }
     this.flat = (colors && colors.flat) || null;
     this.bodyTop = (colors && colors.bodyTop) || (colors && colors.flat) || "#EDEDEF";
     this.bodyBottom = (colors && colors.bodyBottom) || (colors && colors.flat) || "#C4C5CA";
+    if (look) {
+      this.outfit = OUTFITS[look.outfit] ? look.outfit : "";
+      this.accessory = ACCESSORIES[look.accessory] ? look.accessory : "";
+      this.image = look.image || "";
+    }
   }
   /* The feeling on top of the state. Idle bots drift through their own moods. */
   setEmotion(e) {
@@ -478,10 +519,20 @@ export class MochiBot {
       hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
       this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
     }
-    const ba = clamp((0.28 + 0.5 * this.tint) * 0.7 + this.emo.blush * 0.8, 0, 0.9);
-    if (ba > 0.02) for (const sd of [-1, 1]) {
-      ctx.save(); ctx.globalAlpha = ba; ctx.fillStyle = "#FF8FB1";
-      ctx.beginPath(); ctx.ellipse(sd * rx * 0.55 + this.yaw * rx * 0.35, ry * 0.2, rx * 0.30, ry * 0.20, 0, 0, 7); ctx.fill(); ctx.restore();
+    /* An uploaded avatar is the body: a square of picture centred on the silhouette and clipped to
+       it. Drawn after the fill so the colour shows through whatever was keyed out of the picture,
+       and before the scan so the state still lights it up like any other bot. The record exists from
+       the first frame, but its canvas only once the picture has decoded — until then the body is
+       just the bot's colour, which is a better first frame than a hole. */
+    const tex = textureFor(this.image);
+    if (tex && tex.cv) {
+      ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
+      /* Over-sized on purpose: the model is asked for a centred subject on a plain background, and a
+         subject that fills its own frame would have nothing left to clip. This crops the margin
+         rather than shrinking the bot to fit the picture. */
+      const t = rx * 2 * 1.45;
+      ctx.drawImage(tex.cv, -t / 2, -t / 2, t, t);
+      ctx.restore();
     }
     if (this.cfg.scan) {
       ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
@@ -490,8 +541,10 @@ export class MochiBot {
       lg.addColorStop(0, "rgba(255,255,255,0)"); lg.addColorStop(0.5, "rgba(255,255,255,0.5)"); lg.addColorStop(1, "rgba(255,255,255,0)");
       ctx.fillStyle = lg; ctx.fillRect(sx - 10, -ry, 20, ry * 2); ctx.restore();
     }
+    this._outfit(ctx, R, rx, ry);
     this._eyes(ctx, R, rx, ry);
     this._mouth(ctx, R, rx, ry);
+    this._accessory(ctx, R, rx, ry);
     ctx.restore();
 
     this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry);
@@ -661,6 +714,164 @@ export class MochiBot {
         ctx.quadraticCurveTo(0, my + e.smile * R * 0.34, mw / 2, my - lift);
       }
       ctx.stroke();
+    }
+    ctx.restore();
+  }
+  /* ---------- what it is wearing ---------- */
+  /* Both garments live in the bottom band of the silhouette: this engine's body *is* the head, so
+     there is no neck to hang a scarf on — the mouth sits at 0.56ry and the cloth has to start under
+     it. Everything is drawn before the face, so an open mouth still lands on top of a scarf.
+     They are sized to be *seen* at 46px, which is the size that matters: a garment drawn at the
+     silhouette's own scale is a two-pixel sliver once the sidebar shrinks it. */
+  _outfit(ctx, R, rx, ry) {
+    const o = OUTFITS[this.outfit];
+    if (!o) return;
+    ctx.save();
+    ctx.translate(this._physDx * R * 0.10, -this._physDy * R * 0.09);
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    const lw = Math.max(R * 0.045, 0.9);
+    /* The mantle is the one garment meant to break the outline — a cape that stopped at the body's
+       edge would be a bib. Everything else is clipped to the silhouette. */
+    const clipped = this.outfit !== "mantle";
+    if (clipped) { ctx.save(); this._shape(ctx, rx, ry); ctx.clip(); }
+    if (this.outfit === "scarf") {
+      ctx.fillStyle = o.ink;
+      ctx.beginPath(); rr(ctx, -rx * 0.86, ry * 0.60, rx * 1.72, R * 0.36, R * 0.17); ctx.fill();
+      ctx.fillStyle = o.edge;
+      ctx.beginPath(); ctx.moveTo(rx * 0.26, ry * 0.76);
+      ctx.quadraticCurveTo(rx * 0.62, ry * 0.88, rx * 0.48, ry * 1.04);
+      ctx.lineTo(rx * 0.08, ry * 0.98);
+      ctx.quadraticCurveTo(rx * 0.30, ry * 0.88, rx * 0.06, ry * 0.80);
+      ctx.closePath(); ctx.fill();
+    } else if (this.outfit === "tie") {
+      /* The knot starts *below* the mouth (ry*0.56), not on it: ink on a dark tie is invisible, so a
+         knot over the mouth reads as a bot with no face rather than as a bot in a tie. */
+      ctx.fillStyle = o.edge;
+      ctx.beginPath(); rr(ctx, -R * 0.15, ry * 0.70, R * 0.30, R * 0.22, R * 0.06); ctx.fill();
+      ctx.fillStyle = o.ink;
+      ctx.beginPath(); ctx.moveTo(-R * 0.14, ry * 0.86); ctx.lineTo(R * 0.14, ry * 0.86);
+      ctx.lineTo(R * 0.24, ry * 1.06); ctx.lineTo(0, ry * 1.22); ctx.lineTo(-R * 0.24, ry * 1.06);
+      ctx.closePath(); ctx.fill();
+    } else if (this.outfit === "collar") {
+      ctx.fillStyle = o.ink; ctx.strokeStyle = o.edge; ctx.lineWidth = lw;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(sd * rx * 0.52, ry * 0.52);
+        ctx.lineTo(sd * rx * 0.04, ry * 0.70); ctx.lineTo(sd * rx * 0.56, ry * 1.04);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+    } else if (this.outfit === "apron") {
+      ctx.fillStyle = o.ink;
+      ctx.beginPath(); rr(ctx, -rx * 0.70, ry * 0.58, rx * 1.40, ry * 0.54, R * 0.13); ctx.fill();
+      ctx.strokeStyle = o.edge; ctx.lineWidth = lw;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(sd * rx * 0.56, ry * 0.60); ctx.lineTo(sd * rx * 0.34, ry * 0.42); ctx.stroke();
+      }
+      ctx.beginPath(); rr(ctx, -rx * 0.28, ry * 0.74, rx * 0.56, R * 0.30, R * 0.07); ctx.stroke();
+    } else if (this.outfit === "mantle") {
+      /* The shoulder line dips in the middle, which is the one place the mouth is. */
+      ctx.fillStyle = o.ink;
+      ctx.beginPath(); ctx.moveTo(-rx * 0.98, ry * 0.58);
+      ctx.quadraticCurveTo(0, ry * 0.84, rx * 0.98, ry * 0.58);
+      ctx.lineTo(rx * 1.42, ry * 1.04);
+      ctx.quadraticCurveTo(0, ry * 1.30, -rx * 1.42, ry * 1.04);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = o.edge; ctx.lineWidth = lw; ctx.stroke();
+    } else if (this.outfit === "bowtie") {
+      const by = ry * 0.72, w = rx * 0.38, h = R * 0.25;
+      ctx.fillStyle = o.ink;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(sd * w * 0.16, by);
+        ctx.lineTo(sd * w, by - h); ctx.lineTo(sd * w, by + h);
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.fillStyle = o.edge;
+      ctx.beginPath(); rr(ctx, -w * 0.20, by - h * 0.62, w * 0.40, h * 1.24, R * 0.05); ctx.fill();
+    }
+    if (clipped) ctx.restore();
+    ctx.restore();
+  }
+  /* ---------- what it wears on its head ---------- */
+  /* Anchored to the eye row rather than to a fixed y, because the four eye styles do not sit at the
+     same height: a pair of glasses on a frog (bulge eyes at -0.62ry) has to go where its eyes are,
+     not where a pill-eyed mochi's are. */
+  _accessory(ctx, R, rx, ry) {
+    const k = this.accessory;
+    if (!ACCESSORIES[k]) return;
+    const ey = (EYE[this.sp.eyes] || EYE.pill).y * ry;
+    const lw = Math.max(R * 0.055, 0.9), INK = "#2B2B33";
+    ctx.save();
+    ctx.translate(this._physDx * R * 0.13, -this._physDy * R * 0.11);
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    if (k === "glasses" || k === "shades") {
+      const w = rx * 0.34, r = R * 0.30;
+      if (k === "glasses") {
+        ctx.strokeStyle = INK; ctx.lineWidth = lw;
+        for (const sd of [-1, 1]) { ctx.beginPath(); ctx.arc(sd * w, ey, r, 0, 7); ctx.stroke(); }
+        ctx.beginPath(); ctx.moveTo(-w + r, ey); ctx.lineTo(w - r, ey); ctx.stroke();
+        for (const sd of [-1, 1]) {
+          ctx.beginPath(); ctx.moveTo(sd * (w + r * 0.86), ey); ctx.lineTo(sd * rx * 0.96, ey - R * 0.07); ctx.stroke();
+        }
+      } else {
+        ctx.fillStyle = "#15161C";
+        ctx.beginPath(); rr(ctx, -rx * 0.88, ey - R * 0.21, rx * 1.76, R * 0.42, R * 0.16); ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.30)"; ctx.lineWidth = lw * 0.8;
+        ctx.beginPath(); ctx.moveTo(-rx * 0.72, ey + R * 0.10); ctx.lineTo(-rx * 0.30, ey - R * 0.10); ctx.stroke();
+      }
+    } else if (k === "hat") {
+      const by = ey - R * 0.60;
+      ctx.fillStyle = INK;
+      ctx.beginPath(); ctx.ellipse(0, by, rx * 1.08, R * 0.15, 0, 0, 7); ctx.fill();
+      ctx.beginPath(); rr(ctx, -rx * 0.54, by - R * 0.52, rx * 1.08, R * 0.54, R * 0.10); ctx.fill();
+      ctx.fillStyle = "#C2410C";
+      ctx.beginPath(); rr(ctx, -rx * 0.54, by - R * 0.10, rx * 1.08, R * 0.13, R * 0.04); ctx.fill();
+    } else if (k === "beanie") {
+      const by = ey - R * 0.48;
+      ctx.fillStyle = "#2E7D6B";
+      ctx.beginPath(); ctx.moveTo(-rx * 0.88, by);
+      ctx.quadraticCurveTo(0, by - R * 1.18, rx * 0.88, by);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#256457";
+      ctx.beginPath(); rr(ctx, -rx * 0.94, by - R * 0.10, rx * 1.88, R * 0.26, R * 0.10); ctx.fill();
+      ctx.fillStyle = "#F5F6F8";
+      ctx.beginPath(); ctx.arc(0, by - R * 0.66, R * 0.16, 0, 7); ctx.fill();
+    } else if (k === "headset") {
+      ctx.strokeStyle = this.cfg.glow; ctx.lineWidth = lw * 1.6;
+      ctx.beginPath(); ctx.arc(0, ey - R * 0.08, rx * 0.94, Math.PI * 1.14, Math.PI * 1.86); ctx.stroke();
+      ctx.fillStyle = this.cfg.glow;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); rr(ctx, sd * rx * 0.94 - R * 0.15, ey - R * 0.17, R * 0.30, R * 0.40, R * 0.11); ctx.fill();
+      }
+    } else if (k === "bow") {
+      const bx = rx * 0.66, by = ey - R * 0.50, s = R * 0.20;
+      ctx.fillStyle = "#EC4899";
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(bx, by);
+        ctx.lineTo(bx + sd * s * 1.5, by - s); ctx.lineTo(bx + sd * s * 1.5, by + s);
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.fillStyle = "#BE185D";
+      ctx.beginPath(); ctx.arc(bx, by, s * 0.48, 0, 7); ctx.fill();
+    } else if (k === "flower") {
+      const fx = -rx * 0.68, fy = ey - R * 0.56, s = R * 0.13;
+      ctx.fillStyle = "#FDF2F8";
+      for (let i = 0; i < 5; i++) {
+        const a = i * Math.PI * 2 / 5 - Math.PI / 2;
+        ctx.beginPath();
+        ctx.ellipse(fx + Math.cos(a) * s, fy + Math.sin(a) * s, s * 0.82, s * 0.60, a, 0, 7);
+        ctx.fill();
+      }
+      ctx.fillStyle = GOLD;
+      ctx.beginPath(); ctx.arc(fx, fy, s * 0.55, 0, 7); ctx.fill();
+    } else if (k === "crown") {
+      const by = ey - R * 0.70, w = rx * 0.62;
+      ctx.fillStyle = GOLD;
+      ctx.beginPath(); ctx.moveTo(-w, by + R * 0.28);
+      ctx.lineTo(-w, by); ctx.lineTo(-w * 0.52, by + R * 0.17);
+      ctx.lineTo(0, by - R * 0.15); ctx.lineTo(w * 0.52, by + R * 0.17);
+      ctx.lineTo(w, by); ctx.lineTo(w, by + R * 0.28);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#F59E0B";
+      ctx.beginPath(); rr(ctx, -w, by + R * 0.18, w * 2, R * 0.15, R * 0.04); ctx.fill();
     }
     ctx.restore();
   }
@@ -858,6 +1069,51 @@ export function softLimit(v, lo, hi, knee) {
 function hexA(hex, a) {
   const n = parseInt(hex.slice(1), 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+/* ---------------- uploaded avatars: a picture where the body's colour would be ----------------
+   Decoded once per URL and keyed against its own background, because the image model is asked for a
+   plain white backdrop and a white rectangle inside the silhouette reads as a pasted-in photo rather
+   than as the bot. The key is only applied when the four corners agree with each other — on a busy
+   background a corner average is a colour that appears nowhere, and keying on it would punch holes
+   through the subject. Holes that are punched show the body colour underneath, which is why the fill
+   is painted first. */
+const TEX = new Map();
+const TEX_PX = 256;
+export function textureFor(url) {
+  if (!url) return null;
+  if (TEX.has(url)) return TEX.get(url);
+  const rec = { cv: null };
+  TEX.set(url, rec);
+  if (typeof document === "undefined") return rec;   // no canvas (a test, or a headless pass)
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const cv = document.createElement("canvas"); cv.width = cv.height = TEX_PX;
+      const c = cv.getContext("2d", { willReadFrequently: true });
+      const s = Math.max(TEX_PX / img.width, TEX_PX / img.height);
+      const w = img.width * s, h = img.height * s;
+      c.drawImage(img, (TEX_PX - w) / 2, (TEX_PX - h) / 2, w, h);
+      const d = c.getImageData(0, 0, TEX_PX, TEX_PX), p = d.data, M = TEX_PX - 1;
+      const corners = [[0, 0], [M, 0], [0, M], [M, M]].map(([x, y]) => {
+        const i = (y * TEX_PX + x) * 4; return [p[i], p[i + 1], p[i + 2]];
+      });
+      const agree = [0, 1, 2].every(k => {
+        const v = corners.map(c2 => c2[k]);
+        return Math.max(...v) - Math.min(...v) < 40;
+      });
+      if (agree) {
+        const bg = [0, 1, 2].map(k => corners.reduce((a, c2) => a + c2[k], 0) / 4);
+        for (let i = 0; i < p.length; i += 4) {
+          if (Math.max(Math.abs(p[i] - bg[0]), Math.abs(p[i + 1] - bg[1]), Math.abs(p[i + 2] - bg[2])) < 30) p[i + 3] = 0;
+        }
+        c.putImageData(d, 0, 0);
+      }
+      rec.cv = cv;
+    } catch (e) { /* a canvas we cannot read back: keep the picture exactly as it came */ }
+  };
+  img.src = url;
+  return rec;
 }
 
 /* ---- one global loop drives every bot (single rAF, smooth) ---- */
