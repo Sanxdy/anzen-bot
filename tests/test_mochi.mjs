@@ -362,6 +362,7 @@ console.log("\n-- colour grading --");
         if (k in t) return t[k];
         if (k === "createLinearGradient") return () => { const g = { addColorStop() {}, grad: "lin" }; return g; };
         if (k === "createRadialGradient") return () => { const g = { addColorStop() {}, grad: "rad" }; return g; };
+        if (k === "drawImage") return () => log.push("img");
         return () => {};
       },
       set(t, k, v) { t[k] = v; if (k === "fillStyle" || k === "strokeStyle") log.push(typeof v === "object" && v ? v.grad : v); return true; },
@@ -453,9 +454,30 @@ console.log("\n-- colour grading --");
      ringY("frog") < ringY("mochi") - 5, ringY("frog") + " vs " + ringY("mochi"));
   ok("every species can wear an outfit and an accessory and still show its face",
      Object.keys(SPECIES).every(sp => wears({ species: sp, outfit: "scarf", accessory: "beanie" }).includes("#1A1412")));
-  /* ---- an uploaded avatar becomes the body ---- */
-  ok("no avatar URL means no texture", textureFor("") === null);
-  ok("an avatar URL is remembered on the bot", mk({ image: "/api/avatar/x?v=1" }).image === "/api/avatar/x?v=1");
+  /* ---- an introduced picture is the bot's face ----
+     The user introduces an image, the image model redraws it as a face, and it is drawn where the
+     eyes and mouth would be — not as the body with the drawn face on top, which is two faces. The
+     picture has to decode before there is a canvas to draw, so a minimal document/Image pair stands
+     in for the browser's; without one `textureFor` would stay on its "no canvas" path. */
+  ok("no picture means no texture", textureFor("") === null);
+  ok("a picture URL is remembered on the bot", mk({ image: "/api/avatar/x?v=1" }).image === "/api/avatar/x?v=1");
+  const realDoc = globalThis.document, realImg = globalThis.Image;
+  globalThis.Image = class { set src(u) { this.onload && this.onload(); } get width() { return 4; } get height() { return 4; } };
+  globalThis.document = { createElement: () => ({ width: 0, height: 0, getContext: () => ({
+    drawImage() {}, putImageData() {},
+    getImageData: () => ({ data: new Uint8ClampedArray(256 * 256 * 4).fill(255) }),
+  }) }) };
+  const pic = "/api/avatar/face-test?v=1";
+  ok("a picture decodes into a texture", !!(textureFor(pic) || {}).cv);
+  const INK = "#1A1412";                               // the eyes and mouth are drawn in exactly this
+  const withPic = wears({ image: pic, outfit: "scarf", accessory: "crown" });
+  ok("a picture is painted on the head", withPic.includes("img"), JSON.stringify(withPic.slice(0, 10)));
+  ok("the drawn eyes and mouth are not under a picture (one face, not two)",
+     !withPic.includes(INK), JSON.stringify(withPic.filter(v => v === INK).slice(0, 4)));
+  ok("the body, outfit and accessory are still drawn around a picture",
+     withPic.some(inkish), JSON.stringify(withPic.filter(v => v).slice(0, 8)));
+  ok("without a picture the bot still draws its own face", wears({}).includes(INK));
+  globalThis.document = realDoc; globalThis.Image = realImg;
   ok("skin() re-dresses a live bot",
      (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u" });
        return b.outfit === "tie" && b.accessory === "crown" && b.image === "u"; })());

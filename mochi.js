@@ -11,8 +11,9 @@
      WEAR     — what it wears on its head or face: glasses, hat, headset, crown.
      CURSOR   — every bot's eyes follow the pointer, from wherever it sits on screen.
    Plus the "scene" layer of props per state (desk, thought bubble, magnifier).
-   An uploaded avatar (`opts.image`) replaces the body's fill with a picture, keyed against
-   its own background so the bot keeps its silhouette instead of becoming a pasted-in photo. */
+   An introduced picture (`opts.image`) is the bot's *face*: it is drawn where the eyes and mouth
+   would be, and those are not drawn under it. Keyed against its own background, so it lands on the
+   bot rather than as a pasted-in square. Body, outfit, accessory and colour are drawn around it. */
 
 const MC = { INK: "#1A1412" };
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -231,7 +232,7 @@ export class MochiBot {
     this.sp = SPECIES[this.species];
     this.outfit = OUTFITS[opts.outfit] ? opts.outfit : "";
     this.accessory = ACCESSORIES[opts.accessory] ? opts.accessory : "";
-    this.image = opts.image || "";                   // an uploaded avatar: the body's fill
+    this.image = opts.image || "";                   // an introduced picture: the bot's face
     this.cv.width = this.size * this.dpr; this.cv.height = this.size * this.dpr;
     this.R = this.size * 0.326;                      // body radius; the unit every offset is quoted in
     this.yaw = 0; this.pitch = 0; this.tilt = 0; this.roll = 0; this.open = 1;
@@ -519,21 +520,6 @@ export class MochiBot {
       hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
       this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
     }
-    /* An uploaded avatar is the body: a square of picture centred on the silhouette and clipped to
-       it. Drawn after the fill so the colour shows through whatever was keyed out of the picture,
-       and before the scan so the state still lights it up like any other bot. The record exists from
-       the first frame, but its canvas only once the picture has decoded — until then the body is
-       just the bot's colour, which is a better first frame than a hole. */
-    const tex = textureFor(this.image);
-    if (tex && tex.cv) {
-      ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
-      /* Over-sized on purpose: the model is asked for a centred subject on a plain background, and a
-         subject that fills its own frame would have nothing left to clip. This crops the margin
-         rather than shrinking the bot to fit the picture. */
-      const t = rx * 2 * 1.45;
-      ctx.drawImage(tex.cv, -t / 2, -t / 2, t, t);
-      ctx.restore();
-    }
     if (this.cfg.scan) {
       ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
       const sx = this.scanX * rx;
@@ -542,8 +528,13 @@ export class MochiBot {
       ctx.fillStyle = lg; ctx.fillRect(sx - 10, -ry, 20, ry * 2); ctx.restore();
     }
     this._outfit(ctx, R, rx, ry);
-    this._eyes(ctx, R, rx, ry);
-    this._mouth(ctx, R, rx, ry);
+    /* An introduced picture is the face, and the drawn eyes and mouth are *not* under it: the model
+       is asked for a face, so a drawn eye on top of its own would be two eyes. Until the picture has
+       decoded there is no canvas to draw, and the bot keeps its own face for that first frame rather
+       than showing a hole — which is also what a bot with no picture at all does. */
+    const tex = textureFor(this.image);
+    if (tex && tex.cv) this._facePic(ctx, tex.cv, R, rx, ry);
+    else { this._eyes(ctx, R, rx, ry); this._mouth(ctx, R, rx, ry); }
     this._accessory(ctx, R, rx, ry);
     ctx.restore();
 
@@ -619,6 +610,27 @@ export class MochiBot {
     const eyeMinY = -ry * 0.66, eyeMaxY = mouthTop - R * 0.09 - half;
     return { mouthY, mouthTop, eyeMinY, eyeMaxY,
              knee: Math.max(R * 0.12, (eyeMaxY - eyeMinY) * 0.14) };
+  }
+  /* Where the face goes: the box the eyes and mouth occupy, which is what an introduced picture
+     replaces. Read off `_faceGeom`, so it follows the species' own eye row and the current mood the
+     same way the drawn face does. Square, because the picture is, and inset from the silhouette so
+     the bot's colour still frames it. */
+  _faceBox(R, rx, ry) {
+    const G = this._faceGeom(R, rx, ry);
+    const top = G.eyeMinY - R * 0.16, h = (G.mouthY + R * 0.30) - top;
+    const w = Math.min(rx * 1.34, h * 1.10);
+    return { x: -w / 2, y: top, w, h };
+  }
+  /* The introduced picture, drawn as the face. It looks around and blinks with the bot — the same
+     yaw, pitch and `open` the drawn eyes use — so a still picture reads as alive rather than as a
+     sticker. The blink is a squash about the box's centre: the one thing a picture of a face can do
+     that reads as an eye closing. Clipped to the silhouette, like the face it stands in for. */
+  _facePic(ctx, cv, R, rx, ry) {
+    const B = this._faceBox(R, rx, ry);
+    const sq = 0.88 + 0.12 * clamp(this.open, 0, 1), h = B.h * sq;
+    ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
+    ctx.drawImage(cv, B.x + this.yaw * B.w * 0.05, B.y + (B.h - h) / 2 + this.pitch * B.h * 0.04, B.w, h);
+    ctx.restore();
   }
   /* Where an eye actually lands, after the cylinder projection and the band limit. Both the
      renderer and the tests go through here, so the guarantee lives in one place. */
@@ -1071,13 +1083,13 @@ function hexA(hex, a) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
-/* ---------------- uploaded avatars: a picture where the body's colour would be ----------------
+/* ---------------- an introduced picture: the bot's face ----------------
    Decoded once per URL and keyed against its own background, because the image model is asked for a
-   plain white backdrop and a white rectangle inside the silhouette reads as a pasted-in photo rather
-   than as the bot. The key is only applied when the four corners agree with each other — on a busy
+   plain white backdrop and a white rectangle inside the head reads as a pasted-in photo rather than
+   as the bot's face. The key is only applied when the four corners agree with each other — on a busy
    background a corner average is a colour that appears nowhere, and keying on it would punch holes
-   through the subject. Holes that are punched show the body colour underneath, which is why the fill
-   is painted first. */
+   through the subject. Holes that are punched show the bot's own colour underneath, which is why the
+   body is filled before the picture is drawn. */
 const TEX = new Map();
 const TEX_PX = 256;
 export function textureFor(url) {
@@ -1109,7 +1121,20 @@ export function textureFor(url) {
         }
         c.putImageData(d, 0, 0);
       }
-      rec.cv = cv;
+      /* The subject, not the square: once the backdrop is keyed out, what is left sits in its own
+         margin, and drawing the whole square leaves the head small in the middle of it. */
+      let x0 = TEX_PX, y0 = TEX_PX, x1 = -1, y1 = -1;
+      for (let y = 0; y < TEX_PX; y++) for (let x = 0; x < TEX_PX; x++) {
+        if (p[(y * TEX_PX + x) * 4 + 3] > 12) {
+          if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+      }
+      if (x1 > x0 && y1 > y0) {
+        const tw = x1 - x0 + 1, th = y1 - y0 + 1, tight = document.createElement("canvas");
+        tight.width = tw; tight.height = th;
+        tight.getContext("2d").drawImage(cv, x0, y0, tw, th, 0, 0, tw, th);
+        rec.cv = tight;
+      } else rec.cv = cv;
     } catch (e) { /* a canvas we cannot read back: keep the picture exactly as it came */ }
   };
   img.src = url;

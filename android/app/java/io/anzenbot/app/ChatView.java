@@ -105,8 +105,9 @@ final class ChatView extends FrameLayout {
         boolean hidden, pinned;
         /** The uploaded avatar's version. Same shape as a room's logo: it keys the bitmap cache, so a
             new upload re-fetches and a stable one never does, and zero means the row draws the
-            monogram. On the desktop the avatar is the body under a drawn face; this phone has no face
-            engine, so the picture becomes the whole of the bot's tile. */
+            monogram. On the desktop the picture is the bot's face, drawn on the head where the drawn
+            eyes and mouth would be; this phone has no face engine, so the picture becomes the whole
+            of the bot's tile. */
         int avatar;
         /** The record the server sent, so the editor writes the fields it read rather than a shape
             rebuilt here — the endpoint merges what it is given into the bot it already has. */
@@ -886,8 +887,8 @@ final class ChatView extends FrameLayout {
     }
 
     /** A bot's face: its avatar when it has one, else the monogram — the room's own rule, one kind
-        over. On the desktop the avatar is the body under a drawn face; this phone has no face engine,
-        so the picture is the whole of the bot's tile. See `avatarUrl`, app.js:158. */
+        over. On the desktop the picture is the face on the bot's head; this phone has no face engine,
+        so the picture is the whole of the bot's tile. See `avatarUrl`, app.js:163. */
     private View tileOrAvatar(String id, int fs, int radius) {
         Bot b = bots.get(id);
         if (b == null) return tile(id, "blue", "", fs, radius);
@@ -1408,10 +1409,10 @@ final class ChatView extends FrameLayout {
         col.addView(memory, mlp);
         final EditText instructions = field(col, "Standing instructions", Json.str(r.get("instructions")), true);
 
-        // The picture. The desktop draws a whole face from a species and a body shape, and can turn a
-        // photo into one (`/api/avatar/transform`) — both need the face engine, which this phone has
-        // none of, so it offers the picture itself and says where the rest lives. The cache is warm
-        // because the drawer drew this very row a moment ago.
+        // The picture. The desktop draws a bot from a species, and can turn a photo into its face
+        // (`/api/avatar/transform`) — both need the face engine, which this phone has none of, so it
+        // offers the picture itself and says where the rest lives. The cache is warm because the
+        // drawer drew this very row a moment ago.
         final int version = (int) Json.num(r.get("avatar"));
         LinearLayout faceRow = new LinearLayout(getContext());
         faceRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1441,11 +1442,11 @@ final class ChatView extends FrameLayout {
             });
             faceRow.addView(rm, spaced(8));
         }
-        caption(col, "Picture", faceRow);
+        caption(col, "Face picture", faceRow);
         col.addView(faceRow);
         TextView faceHint = text(version > 0
-                ? "A picture is the whole of this bot's face here. Transform it into a drawn body on a computer."
-                : "A picture becomes this bot's face here. Draw or transform a proper one on a computer.",
+                ? "This picture is the bot's face here. On a computer, introduce one and the image model redraws it as a cute face."
+                : "A picture becomes this bot's face here. On a computer, introduce one and the image model redraws it.",
             Pal.DIM2, 12);
         faceHint.setPadding(dp(2), dp(7), dp(2), 0);
         col.addView(faceHint);

@@ -156,10 +156,10 @@ const avatar = (name, color, cls, emoji, logo) => logo
    Coucou paints a small bot as a flat fill of its colour — no gradient, no white wash — and that
    is what makes its team read as saturated rather than pastel, so we do the same. */
 function sideFace(color) { return { flat: AV[color] || AV.blue }; }
-/* What a bot is wearing and whether it has an avatar: the three things that are not its colour or
+/* What a bot is wearing, and the picture it has for a face: the things that are not its colour or
    its species. Kept in one place so every face the bot appears as — the sidebar row, the editor's
    preview, the dock, the computer panel — is dressed the same, the way `faceOf` keeps them all the
-   same species. `avatar` is a version number, not a URL, so a new upload busts the cache. */
+   same species. `avatar` is a version number, not a URL, so a new picture busts the cache. */
 const avatarUrl = b => b && b.avatar ? `/api/avatar/${encodeURIComponent(b.id)}?v=${b.avatar}` : "";
 const lookOf = b => ({ outfit: (b && b.outfit) || "", accessory: (b && b.accessory) || "", image: avatarUrl(b) });
 /* The dock is the one big face, so it keeps Coucou's full grading — a soft body lit from the top —
@@ -2940,33 +2940,32 @@ function logoField(p, c) {
   draw();
 }
 
-/* The bot's avatar: an uploaded picture that becomes the body, or a mascot body the image model
-   draws from a photo of your own. Either way it is stored under the bot's id, so — like a channel
-   logo — the bot has to exist before one can be added. The face is still drawn on top by the
-   engine, which is why the Transform prompt asks the model for a body and no face. */
+/* The bot's face picture. One control, because it is one thing: introduce an image, the image model
+   redraws it as this bot's face, and that face is drawn on the head where the engine's eyes and
+   mouth would be. There is no separate "upload it as-is" path — a raw photo would not be a face, and
+   two controls for one idea is what made this confusing to use. Stored under the bot's id, so — like
+   a channel logo — the bot has to exist before it can have one. */
 function avatarField(p, b, redraw) {
   const prev = el("div", "lgprev"), said = el("div", "lgsaid"), wrap = el("div", "logofld");
-  const msg = el("div", "hint"), row = el("div", "row"), row2 = el("div", "row");
+  const msg = el("div", "hint"), row = el("div", "row");
   const file = el("input"); file.type = "file"; file.style.display = "none";
   file.accept = "image/png,image/jpeg,image/webp";
-  const up = el("button", "btn ghost sm", "Upload a picture"); up.type = "button";
-  const tr = el("button", "btn ghost sm", "Transform a photo"); tr.type = "button";
+  const add = el("button", "btn ghost sm", "Introduce an image"); add.type = "button";
   const rm = el("button", "btn ghost sm", "Remove"); rm.type = "button";
-  let bad = "", photo = "";   // `photo` is the data URL the Transform button sends
+  let bad = "";
   const draw = () => {
     const url = avatarUrl(b);
     prev.innerHTML = url ? `<div class="mc img"><img src="${url}" alt=""></div>` : "";
     const has = !!b.id;
-    up.disabled = tr.disabled = rm.disabled = !has;
+    add.disabled = rm.disabled = !has;
     rm.style.display = b.avatar ? "" : "none";
-    tr.textContent = photo ? "Transform this photo" : "Transform a photo";
     msg.style.color = bad ? "#ff6b6b" : "";
-    msg.textContent = bad || (!has ? "Save the bot, then give it an avatar."
-      : b.avatar ? "Your avatar replaces the body; the face is still drawn on top."
-      : "No avatar — the bot's own colour and shape are the body.");
+    msg.textContent = bad || (!has ? "Save the bot, then introduce an image."
+      : b.avatar ? "This picture is the bot's face. Its body, outfit, accessory and colour are drawn around it."
+      : "No picture — the bot draws its own face.");
   };
   const send = async (url, body, busy) => {
-    up.disabled = tr.disabled = rm.disabled = true; bad = ""; msg.textContent = busy;
+    add.disabled = rm.disabled = true; bad = ""; msg.textContent = busy;
     try {
       const r = await jpost(url, body);
       if (!r.ok) throw new Error(r.error || "that did not work");
@@ -2976,39 +2975,24 @@ function avatarField(p, b, redraw) {
     } catch (e) { bad = String(e.message || e); }
     draw();
   };
-  up.onclick = () => file.click();
-  file.onchange = () => {
-    const f = file.files[0]; file.value = ""; if (!f) return;
-    bad = f.size > 2e6 ? "That image is larger than 2 MB — try a smaller one." : "";
-    if (bad) return draw();
-    const rd = new FileReader();
-    rd.onload = () => send("/api/avatar", { id: b.id, data: rd.result }, "Uploading…");
-    rd.onerror = () => { bad = "Could not read that file."; draw(); };
-    rd.readAsDataURL(f);
-  };
+  add.onclick = () => file.click();
   /* The transform runs image-to-image at the router, so it is 30-60s of real work. The button says
      so while it waits rather than looking hung, and the species and colour already picked are sent
-     along so the drawn body matches the face that will land on it. */
-  tr.onclick = () => {
-    if (photo) return send("/api/avatar/transform",
-      { id: b.id, data: photo, species: b.face || speciesFor(b.id || b.name), color: b.color },
-      "Drawing your bot… this takes up to a minute.");
-    file2.click();
-  };
-  const file2 = el("input"); file2.type = "file"; file2.style.display = "none";
-  file2.accept = "image/png,image/jpeg,image/webp";
-  file2.onchange = () => {
-    const f = file2.files[0]; file2.value = ""; if (!f) return;
-    if (f.size > 6e6) { bad = "That photo is larger than 6 MB — try a smaller one."; return draw(); }
+     along so the face it draws sits on the bot it is being drawn for. */
+  file.onchange = () => {
+    const f = file.files[0]; file.value = ""; if (!f) return;
+    if (f.size > 6e6) { bad = "That image is larger than 6 MB — try a smaller one."; return draw(); }
     const rd = new FileReader();
-    rd.onload = () => { photo = rd.result; bad = ""; draw(); };
+    rd.onload = () => send("/api/avatar/transform",
+      { id: b.id, data: rd.result, species: b.face || speciesFor(b.id || b.name), color: b.color },
+      "Redrawing your image as this bot's face… this takes up to a minute.");
     rd.onerror = () => { bad = "Could not read that file."; draw(); };
     rd.readAsDataURL(f);
   };
   rm.onclick = () => send("/api/avatar/remove", { id: b.id }, "Removing…");
-  row.append(up, rm); row2.append(tr); said.append(row, row2, msg); wrap.append(prev, said, file, file2);
-  fld(p, "AVATAR", wrap,
-      "A picture used as the bot's body, clipped to its shape. Transform draws one from your own photo — the face, its mood and its colour are still the engine's, so it keeps animating.");
+  row.append(add, rm); said.append(row, msg); wrap.append(prev, said, file);
+  fld(p, "FACE PICTURE", wrap,
+      "Introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth — those stay off, so you never get two of them. It keeps blinking, looking around and showing its mood, and the body, outfit, accessory and colour below are drawn around it.");
   draw();
 }
 
@@ -3923,9 +3907,9 @@ function tabHelp(p) {
   para(s, "Bots → Edit is where a bot is defined. The editor has five parts:");
   list(s, [
     "<b>Identity</b> — name, optional emoji, title, a one-line role, and the colour that paints its avatar.",
-    "<b>Look</b> — the face: each bot gets its own shape, ears and idle motion, and the preview shows exactly how it will sit in the sidebar.",
+    "<b>Look</b> — the face shape: each bot gets its own shape, ears and idle motion, and the preview shows exactly how it will sit in the sidebar.",
     "<b>Outfit and accessory</b> — what it wears: a scarf, a tie, a hat, glasses. The outfit is clipped to its body; the accessory is anchored to its own eye row, so both sit right on every shape.",
-    "<b>Avatar</b> — a picture used as the bot's body instead of its colour. Upload one, or hit Transform to have the image model draw a mascot body from your own photo. The face is still drawn on top, so it keeps blinking, looking around and showing what it is doing.",
+    "<b>Face picture</b> — introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth. It keeps blinking, looking around and showing its mood, and the body, outfit, accessory and colour are drawn around it.",
     "<b>Brain</b> — the model, the approval level, a switch for memory, and the standing instructions (the bot's system prompt).",
     "<b>Skills</b> — tick the skills this bot should lean on.",
     "<b>Tools</b> — all current tools, or a custom selection.",

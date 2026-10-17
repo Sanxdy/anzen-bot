@@ -1087,10 +1087,11 @@ def remove_logo(cid):
     return _remove_image(LOGO_DIR, cid) if cid else False
 
 # ---------------------------------------------------------------- bot avatars
-# A bot's face is drawn by the client from its species and colour. An uploaded avatar replaces it
-# with a picture -- either one the user picked, or a mascot body the image model drew from a photo
-# (POST /api/avatar/transform). Upload-only: unlike a channel there is no repo to search, and the
-# file is stored under the bot's id, so the same 2 MB cap and the same magic-byte checks as a logo.
+# A bot's face picture: the user introduces an image, the image model redraws it as the bot's face
+# (POST /api/avatar/transform), and the client draws it where the eyes and mouth would be. Stored
+# under the bot's id, so -- like a channel logo -- the bot has to exist before it can have one.
+# Upload-only: unlike a channel there is no repo to search, and the same 2 MB cap and the same
+# magic-byte checks as a logo.
 AVATAR_DIR = os.path.join(DATA, "avatars")
 def avatar_state(b):
     """A bot's avatar: the stored file and a version that changes whenever it does, or nothing."""
@@ -1113,12 +1114,15 @@ def remove_avatar(bid):
     return _remove_image(AVATAR_DIR, bid) if bid else False
 
 def avatar_prompt(species, color):
-    """What the image model is asked for when turning a photo into an avatar: the mascot *body*
-    only. The client draws the face on top afterwards, so eyes and mouth have to be explicitly
-    excluded -- anything the model paints there would end up underneath ours."""
-    return ("Draw a cute flat-vector mascot BODY inspired by the photo: keep its colours, hair and "
-            "distinctive features. NO eyes, NO mouth, NO text. Subject centred, plain flat white "
-            "background, sticker style, square. Species: %s. Colour: %s."
+    """What the image model is asked for when turning a photo into a bot's face: the *face* only,
+    filling the frame. The bot's body, outfit and accessory are drawn by the engine around it, so a
+    body would land underneath them — and a background or an icon frame would land on the head as a
+    pasted-in square, which is why the frame is ruled out as firmly as the body."""
+    return ("Redraw the subject of the photo as a cute flat-vector mascot FACE, filling the whole "
+            "square edge to edge: keep its colours, hair, eyes and distinctive features, drawn as a "
+            "friendly cartoon character's face. FACE ONLY — no body, no arms, no hands, no text. NO "
+            "background, no frame, no border, no rounded-square icon, no drop shadow: the head itself "
+            "reaches all four edges. Species: %s. Colour: %s."
             % (str(species or "as in the photo")[:60], str(color or "as in the photo")[:40]))
 
 # ---------------------------------------------------------------- team import

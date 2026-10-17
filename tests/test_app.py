@@ -51,9 +51,9 @@ def png1x1():
             + chunk(b"IEND", b""))
 
 def png_blob(n=256, bg=(255, 255, 255), fg=(230, 126, 34)):
-    """A plain background with a centred subject — the shape the image model returns for an avatar.
+    """A plain background with a centred subject — the shape the image model returns for a face.
     A flat single-colour image is the wrong fixture: the engine keys out whatever colour all four
-    corners agree on, so a uniform picture would be erased entirely instead of becoming a body."""
+    corners agree on, so a uniform picture would be erased entirely instead of becoming a face."""
     import zlib, struct
     cx = cy = n / 2.0; rad = n * 0.30
     rows = b"".join(b"\x00" + b"".join(bytes(fg if (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad else bg)
@@ -2231,17 +2231,18 @@ def main():
               pg.eval_on_selector("#dockMochi", "e=>e.dataset.species") == "mochi",
               pg.eval_on_selector("#dockMochi", "e=>e.dataset.species"))
 
-        # ---- 16b. a bot's look: outfit, accessory and an uploaded avatar ----
-        # The three wardrobe axes live in the Look group and are drawn by mochi.js, so these checks
-        # are about the *editor* wiring: the pickers exist and repaint the preview, the choice is
-        # saved on the bot, and an uploaded picture becomes the body the sidebar draws. The engine
-        # itself (every garment on every species) is covered by tests/test_mochi.mjs.
+        # ---- 16b. a bot's look: outfit, accessory and a face picture ----
+        # The wardrobe axes live in the Look group and are drawn by mochi.js, so these checks are
+        # about the *editor* wiring: the pickers exist and repaint the preview, the choice is saved on
+        # the bot, and a picture introduced once becomes the face the sidebar draws. The engine itself
+        # (every garment on every species, and the picture standing in for the drawn eyes and mouth)
+        # is covered by tests/test_mochi.mjs.
         pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
         pg.eval_on_selector_all("#setTabs .mtab", f"els=>els[{tabs.index('Bots')}].click()"); pg.wait_for_timeout(300)
         pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(400)   # New bot
         looktxt = pg.eval_on_selector("#setPanel", "e=>e.innerText")
-        check("the bot editor offers a look: outfit, accessory and avatar",
-              all(k in looktxt for k in ["OUTFIT", "ACCESSORY", "AVATAR"]))
+        check("the bot editor offers a look: outfit, accessory and a face picture",
+              all(k in looktxt for k in ["OUTFIT", "ACCESSORY", "FACE PICTURE"]))
         segs = pg.evaluate("""()=>{const g=[...document.querySelectorAll('#setPanel .fgroup')]
             .find(e=>e.querySelector('h4') && e.querySelector('h4').textContent==='Look');
             return g ? [...g.querySelectorAll('.seg')].map(s=>[...s.children].map(c=>c.textContent.trim())) : [];}""")
@@ -2262,26 +2263,53 @@ def main():
         pg.wait_for_timeout(350)
         check("picking an accessory repaints it again",
               pg.evaluate(prev_png) not in (bare, dressed))
+        # One control, and it does the whole job: introduce an image → the image model redraws it as
+        # this bot's face. There is no second "upload it as-is" button — two controls for one idea is
+        # the confusion this replaces — so the count is the check.
+        face_fld = pg.locator("#setPanel .fld", has_text="FACE PICTURE")
+        ctrls = face_fld.locator("button:visible").all_inner_texts()
+        check("the face picture is one control, not two", ctrls == ["Introduce an image"], str(ctrls))
+        check("the old two-button split is gone",
+              not pg.evaluate("()=>[...document.querySelectorAll('#setPanel button')]"
+                              ".some(b=>/Upload a picture|Transform a photo|Transform this photo/.test(b.textContent))"))
+        # What that control sends. The transform is 30-60s of real work at the router, so the call is
+        # answered here rather than waited out — the payload is what is being checked: the picture,
+        # and the species and colour the face is being drawn for.
+        pg.evaluate("""()=>{window.__av=null; const pf=window.fetch.bind(window);
+          window.fetch=(u,o)=>{const s=String(u);
+            if(!/[/]api[/]avatar[/]transform/.test(s)) return pf(u,o);
+            try{ window.__av=JSON.parse(o.body); }catch(e){ window.__av={}; }
+            return Promise.resolve(new Response(JSON.stringify({ok:true,avatar:0}),
+              {status:200,headers:{'Content-Type':'application/json'}}));};}""")
+        face_fld.locator("input[type=file]").set_input_files(
+            files=[{"name": "face.png", "mimeType": "image/png", "buffer": png_blob(64)}])
+        pg.wait_for_timeout(900)
+        payload = pg.evaluate("()=>window.__av") or {}
+        check("introducing an image sends it to the transform, for this bot's species and colour",
+              str(payload.get("data", "")).startswith("data:image/png;base64,")
+              and payload.get("species") and payload.get("color"), str(payload)[:160])
         pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(1000)   # Save bot
         lookbot = next((b for b in pg.evaluate("async()=>(await (await fetch('/api/config')).json()).bots")
                         if b["name"] == "E2E Look"), {})
         check("the outfit and accessory are saved on the bot",
               lookbot.get("outfit") == "scarf" and lookbot.get("accessory") == "crown", str(lookbot)[:120])
-        # A picture becomes the body. The fixture is a plain background with a centred subject —
-        # a flat single-colour image would be keyed out entirely, which is the point of the keying.
+        # ...and a picture in place is served and drawn. Stored through POST /api/avatar, which is the
+        # phone's own path to the same slot (the desktop's is the transform above). The fixture is a
+        # plain background with a centred subject — a flat single-colour image would be keyed out
+        # entirely, which is the point of the keying.
         av = pg.evaluate("""async(id)=>{
             const png = %s;
             const r = await fetch('/api/avatar',{method:'POST',headers:{'Content-Type':'application/json'},
               body: JSON.stringify({id, data: 'data:image/png;base64,'+png})});
             return (await r.json()).avatar || 0; }""" % json.dumps(__import__("base64").b64encode(png_blob()).decode()), lookbot.get("id"))
-        check("a picture is accepted as the bot's avatar", bool(av), str(av))
-        check("the avatar is served back as an image",
+        check("a picture is accepted as the bot's face", bool(av), str(av))
+        check("the picture is served back as an image",
               pg.evaluate("async(id)=>{const r=await fetch('/api/avatar/'+id);return [r.status, r.headers.get('content-type')]}", lookbot.get("id")) == [200, "image/png"])
         pg.reload(wait_until="load"); pg.wait_for_timeout(1200)
         drawn_av = pg.evaluate("""()=>{const li=[...document.querySelectorAll('#chans .sub .subbot, #bots .subbot')]
             .find(x=>x.innerText.includes('E2E Look'));const cv=li&&li.querySelector('canvas.sidebot');
             return cv?cv.toDataURL():'';}""")
-        check("the sidebar draws the avatar as the body", bool(drawn_av), str(len(drawn_av)))
+        check("the sidebar draws the picture on the bot", bool(drawn_av), str(len(drawn_av)))
         check("no JS error from the look editor", not js_errs(), str(js_errs()[:3]) + " | " + str(badresp[:3]))
 
         # ---- 17. a bot's markdown reply is rendered, not shown raw ----
