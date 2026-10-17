@@ -5064,6 +5064,7 @@ final class ChatView extends FrameLayout {
     /** A paragraph: a single newline in the source is a line break, which is what `\n` already is. */
     private View para(String text) {
         TextView t = new TextView(getContext());
+        t.setTextColor(Pal.TXT);   // prose takes the desktop's `--txt`; unset, it inherits the OEM theme
         t.setText(spans(text));
         t.setTextSize(Pal.fs(15));
         // The link spans only answer a tap under this method, and it takes the long-press selection
@@ -5085,6 +5086,7 @@ final class ChatView extends FrameLayout {
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.addView(text(b.kind == Md.OL ? (n + i) + ". " : "• ", Pal.TXT, 15));
             TextView t = new TextView(getContext());
+            t.setTextColor(Pal.TXT);   // as `para`: the item's prose, not the OEM theme's default
             t.setText(spans(items[i]));
             t.setTextSize(Pal.fs(15));
             airy(t, 15, 1.62f);
