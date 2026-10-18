@@ -320,5 +320,25 @@ ok("...an accessory", _pub["accessory"] == "")
 ok("...and no avatar version", _pub["avatar"] == 0)
 ok("a bot with an outfit keeps it", S.H._bots_public(None, [{"id": "n", "outfit": "hoodie"}])[0]["outfit"] == "hoodie")
 
+# --- Bot faces: the photo decides the animal, and a chosen face beats an older picture ---
+# The prompt used to name the bot's engine species ("Species: owl"), and the model obeyed it over
+# the photo: a cat came back as an owl. The species is still passed in (the caller has it) but it
+# must not reach the prompt.
+_p = S.face_prompt("owl", "purple", 0, 3)
+ok("the face prompt does not name the bot's species", "owl" not in _p and "Species:" not in _p)
+ok("the face prompt keeps the animal in the photo", "SAME ANIMAL" in _p and "never change its species" in _p)
+ok("the bot's colour is only an accent, not a recolour", "Only a collar" in _p and "purple" in _p)
+ok("...and a run with no colour says nothing about one", "Only a collar" not in S.face_prompt("", "", 0, 1))
+
+S.save_avatar("fb1", _data("image/png", PNG))
+_b = {"id": "fb1", "genface": "", "avatar": 7}
+S.set_genface(_b, "f-1-1.png")
+ok("a face from the set lands on the bot", _b["genface"] == "f-1-1.png")
+ok("...and it drops an older per-bot picture that would have outranked it", _b["avatar"] == 0)
+ok("...including the stored file, so nothing is left behind",
+   not os.path.isfile(os.path.join(S.AVATAR_DIR, "fb1.png")))
+S.set_genface(_b, "")
+ok("clearing a face puts the bot back on its drawn bot", _b["genface"] == "")
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

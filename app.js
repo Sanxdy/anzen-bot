@@ -79,6 +79,7 @@ const ICON = {
   voice:'<rect x="9" y="2.8" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3.2"/>',
   sound:'<path d="M4 9.4h3.3L12 5.4v13.2L7.3 14.6H4z"/><path d="M15.4 9.2a4.1 4.1 0 0 1 0 5.6"/><path d="M18.1 6.6a7.7 7.7 0 0 1 0 10.8"/>',
   appearance:'<path d="M12 3a9 9 0 1 0 0 18c1.4 0 2-.9 2-1.9 0-1.6 1-2.1 2.4-2.1H18a3 3 0 0 0 3-3A9 9 0 0 0 12 3z"/><circle cx="7.6" cy="11.5" r="1.1"/><circle cx="12" cy="7.6" r="1.1"/><circle cx="16.4" cy="11.5" r="1.1"/>',
+  faces:'<circle cx="12" cy="12" r="8.6"/><circle cx="9.2" cy="10" r="1.1"/><circle cx="14.8" cy="10" r="1.1"/><path d="M8.8 14.2a4.2 4.2 0 0 0 6.4 0"/>',
   globe:'<circle cx="12" cy="12" r="8.6"/><path d="M3.4 12h17.2"/><path d="M12 3.4c3 3.5 3 13.7 0 17.2c-3-3.5-3-13.7 0-17.2z"/>',
   plus:'<path d="M12 5.5v13M5.5 12h13"/>',
   caret:'<path d="M9 5.5 15.5 12 9 18.5"/>',
@@ -161,7 +162,12 @@ function sideFace(color) { return { flat: AV[color] || AV.blue }; }
    preview, the dock, the computer panel — is dressed the same, the way `faceOf` keeps them all the
    same species. `avatar` is a version number, not a URL, so a new picture busts the cache. */
 const avatarUrl = b => b && b.avatar ? `/api/avatar/${encodeURIComponent(b.id)}?v=${b.avatar}` : "";
-const lookOf = b => ({ outfit: (b && b.outfit) || "", accessory: (b && b.accessory) || "", image: avatarUrl(b) });
+/* A face from the Bot faces section: one file the image model drew for this bot, body and all. The
+   name is unique per batch, so the URL is its own cache key. A bot's own introduced picture is an
+   override and wins — the engine draws it as the face of a drawn body instead. */
+const genfaceUrl = b => b && b.genface ? `/api/face/${encodeURIComponent(b.genface)}` : "";
+const lookOf = b => ({ outfit: (b && b.outfit) || "", accessory: (b && b.accessory) || "",
+  image: avatarUrl(b), whole: avatarUrl(b) ? "" : genfaceUrl(b) });
 /* The dock is the one big face, so it keeps Coucou's full grading — a soft body lit from the top —
    and that is also what carries the state: a flat fill has nowhere to put the working / searching
    tint, so a flat dock would stop telling you what the bot is doing. Only the colour changes here. */
@@ -739,6 +745,12 @@ async function dragEnd() {
 /* The wall-clock time a message landed, for the transcript's stamp. Minute precision — a chat is read
    for when things happened, not to the second. */
 const stampAt = ms => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+/* How long a turn took, for its stamp line. Seconds are only worth a decimal while they are few —
+   past a minute the reader wants the order of magnitude, but the seconds still ride along: the whole
+   point of this figure is telling a slow turn from a fast one, and "1m" for 61s and 119s hides it. */
+const tookAt = s => s == null || !isFinite(s) || s < 0 ? "" :
+  s < 10 ? s.toFixed(1) + "s" : s < 60 ? Math.round(s) + "s" :
+  Math.floor(s / 60) + "m " + Math.round(s % 60) + "s";
 function ago(ts) {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - (ts || 0)));
   if (!ts) return "";
@@ -829,6 +841,35 @@ async function endWatched(sid) {
   loadChats();
   drainQueue(sid);                       // anything typed here while that turn ran goes now that it has
 }
+/* ---------------- coming back to a page that was away ----------------
+   A tab in the background — or a phone whose screen went off — stops running timers, so the watch
+   stream reconnects but re-reads nothing it missed, and `/api/config` was never re-read at all: a bot
+   renamed on the other device kept its old name here until a reload. Both clients are this one page,
+   so this is one handler, and the desktop gets it too — a window minimised while the phone worked. */
+async function wake() {
+  await reloadConfig();               // the roster, the rooms, the theme — and the chat list with them
+  if (S.active) await reloadTranscript();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
+window.addEventListener("pageshow", e => { if (e.persisted) wake(); });
+window.anzenWake = wake;             // the Android wrapper asks outright: a WebView it paused is not
+                                     // always a hidden document, so the event above may never fire
+/* The Android back button, which a WebView has no other way to answer. Dismiss the topmost surface in
+   the same order Escape does and say whether anything was open — false is "nothing here is yours, so
+   close the app". Reusing the Escape handlers rather than a second list of surfaces keeps the two from
+   drifting apart; every one of them runs synchronously. The signature is compared before and after
+   because one Escape closes one surface: with Settings open under a picker, both are still "something
+   open" but only the picker is gone. */
+window.anzenBack = () => {
+  const open = () => ["#scrim", "#ctx", "#comp", "#files", "#link", "#mmPop", "#apPop"]
+      .map(s => { const n = $(s); return n && n.classList.contains("on") ? "1" : "0"; }).join("")
+    + (document.querySelector(".modal.pick") ? "p" : "")
+    + (document.querySelector(".ctxwrap.open") ? "c" : "")
+    + ($("#side").classList.contains("open") ? "d" : "");
+  const before = open();
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  return before !== open();
+};
 function renderChats() {
   const box = $("#chats"); if (!box) return;
   const q = (S.chatQuery || "").trim().toLowerCase();
@@ -1112,7 +1153,7 @@ function render(messages, pending) {
        and none of the reasons. `sys` is the app talking too (a compression note). Both are drawn here
        exactly as drawTurnEvent draws the live card, so a saved note and a live one cannot differ. */
     else if (m.role === "notice" || m.role === "sys") addCard("sys", "", m.content, sink);
-    else addMsg(m.role, m.content, m.who, sink, { quote: m.quote, fwd: m.fwd, i, ts: m.ts }, S.active);
+    else addMsg(m.role, m.content, m.who, sink, { quote: m.quote, fwd: m.fwd, i, ts: m.ts, took: m.took }, S.active);
   });
   if (pending) addApproval(pending.cmd, pending.agent);
   /* A turn that is still running here has already drawn cards into this chat. Put them back in
@@ -1182,15 +1223,20 @@ function addMsg(role, text, who, to, meta, sid) {
   /* When it landed. A message redrawn from the transcript carries the server's own stamp; one drawn
      as it is sent is stamped now, which is the same moment to within the round-trip. */
   const when = stampAt(meta && meta.ts ? meta.ts * 1000 : Date.now());
-  /* A user message carries no `who` — it is yours — so it wears the name you set, defaulting to
-     "Client". Naming it also gives the header line real content: an empty header collapsed to zero
-     height, which left the timestamp sitting right on the first line of text. */
+  /* A message you typed carries no `who`, so it wears the name you set, defaulting to "Client". One
+     a routine sent carries `who` ("Routine") and must not read as yours. Naming it also gives the
+     header line real content: an empty header collapsed to zero height, which left the timestamp
+     sitting right on the first line of text. */
   const label = who || (role === "user" ? userName() : "");
   /* Yours is not a bot's name, so it never takes a hue — even if you named yourself after one. The
      guard is the role, not the string: a person and a bot can share a name. */
   const hue = role === "user" ? null : hueOf(label, sid || S.active);
-  if (label) d.appendChild(el("div", "who", hueSpan(label, "wn", hue) + `<span class="mts">${when}</span>`));
-  else d.appendChild(el("div", "who", `<span class="mts">${when}</span>`));
+  /* Only the server's closing message carries a duration; a user-typed one never does. It sits after
+     `.mts`, which owns `margin-left:auto`, so it lands at the far right of the header. */
+  const took = meta && typeof meta.took === "number" ? tookAt(meta.took) : "";
+  const dur = took ? `<span class="mtook" title="Took ${took}">${took}</span>` : "";
+  if (label) d.appendChild(el("div", "who", hueSpan(label, "wn", hue) + `<span class="mts">${when}</span>` + dur));
+  else d.appendChild(el("div", "who", `<span class="mts">${when}</span>` + dur));
   /* A bot writes markdown, so its reply is rendered. A person types plain text, which is shown
      exactly as typed — a shell command with an asterisk must not come back italic. Only a URL in it
      is dressed up, because a URL you cannot click is the one thing plain text gets wrong. */
@@ -2554,7 +2600,7 @@ function closeLink(restoreFocus = true) {
 }
 
 /* ---------------- settings ---------------- */
-/* The rail, grouped so fourteen sections stay scannable — a group is a heading you read, not a thing
+/* The rail, grouped so fifteen sections stay scannable — a group is a heading you read, not a thing
    you click. The order is the order you meet them: what the app runs on, what is in it, how it
    behaves. This is why there is no "Engines" any more: one tab held the AI endpoint, the browser and
    the phone, and nothing in the word said which of the three a given control belonged to. The AI side
@@ -2565,6 +2611,7 @@ const TABS = [
   ["browser", "Browser", "monitor", "Set up"],
   ["phone", "Phone", "phone", "Set up"],
   ["bots", "Bots", "bots", "Your workspace"],
+  ["faces", "Bot faces", "faces", "Your workspace"],
   ["channels", "Rooms", "channels", "Your workspace"],
   ["apps", "Connected apps", "apps", "Your workspace"],
   ["skills", "Skills", "skills", "Your workspace"],
@@ -2653,7 +2700,7 @@ function renderPanel() {
   const p = $("#setPanel"); p.innerHTML = "";
   if (S.facePrev) { detach(S.facePrev); S.facePrev = null; }   // the face preview dies with the panel
   p.setAttribute("aria-labelledby", "tab-" + curTab);
-  ({ general: tabGeneral, channels: tabChannels, bots: tabBots, models: tabModels, browser: tabBrowser,
+  ({ general: tabGeneral, channels: tabChannels, bots: tabBots, faces: tabFaces, models: tabModels, browser: tabBrowser,
      phone: tabPhone, approvals: tabApprovals, memory: tabMemory, skills: tabSkills, plugins: tabPlugins,
      apps: tabApps, voice: tabVoice, appearance: tabAppearance, help: tabHelp }[curTab] || tabGeneral)(p);
 }
@@ -2962,6 +3009,7 @@ function avatarField(p, b, redraw) {
     msg.style.color = bad ? "#ff6b6b" : "";
     msg.textContent = bad || (!has ? "Save the bot, then introduce an image."
       : b.avatar ? "This picture is the bot's face. Its body, outfit, accessory and colour are drawn around it."
+      : b.genface ? "No picture — this bot shows its face from Bot faces. A picture here overrides that."
       : "No picture — the bot draws its own face.");
   };
   const send = async (url, body, busy) => {
@@ -2992,7 +3040,7 @@ function avatarField(p, b, redraw) {
   rm.onclick = () => send("/api/avatar/remove", { id: b.id }, "Removing…");
   row.append(add, rm); said.append(row, msg); wrap.append(prev, said, file);
   fld(p, "FACE PICTURE", wrap,
-      "Introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth — those stay off, so you never get two of them. It keeps blinking, looking around and showing its mood, and the body, outfit, accessory and colour below are drawn around it.");
+      "An override for this one bot. Introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth, which stay off so you never get two of them. It keeps blinking and looking around, and the body, outfit and accessory below are drawn around it. Bot faces, in the settings rail, draws a whole character for every bot instead.");
   draw();
 }
 
@@ -3026,6 +3074,76 @@ function editChannel(c) {
   fld(repoG, "REPO FOLDER", fwrap, "one repo per room, e.g. ~/code/my-app. Blank = a shared folder");
   repoG.appendChild(el("div", "hint", "Bots in this room run their shell and file tools inside this folder only, so repos never mix. Leave blank to use a shared folder."));
   p.appendChild(repoG);
+  /* The room's browser accounts. Same rows as Settings → Browser, but they belong to this room: a bot
+     working here routes through these, so nobody has to type an account name into the chat. An empty
+     list falls back to the machine-wide accounts, so a room that never set one behaves as before. */
+  const brG = el("div", "fgroup"); brG.appendChild(el("h4", "", "Browser"));
+  c.browser = c.browser || [];
+  const blist = el("div");
+  const bsay = el("div", "hint");
+  const bstate = {};                  // account name -> the profile row the server reports
+  let bTimer = null;
+  const bPaint = pf => !pf || !pf.exists ? "Not signed in yet"
+    : pf.signed_in === true ? "Signed in"
+    : pf.up ? "Window open — log in there, then close it" : "Sign in again";
+  const bRead = async () => {
+    if (!c.id) return;                // a room that is not saved yet has no stored list to read
+    try {
+      const o = await (await fetch("/api/browser/own?room=" + encodeURIComponent(c.id))).json();
+      for (const pf of o.profiles || [])
+        for (const n of (pf.names || [pf.name])) bstate[n] = pf;
+    } catch (e) {}
+  };
+  const bRows = [];                   // {name, info, btn}, so the poll repaints text and never a row
+  const bDraw = async () => {
+    clearTimeout(bTimer);
+    await bRead();
+    blist.innerHTML = ""; bRows.length = 0;
+    c.browser.forEach((a, i) => {
+      const row = el("div");
+      row.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap";
+      const nm = el("input"); nm.value = a.name; nm.placeholder = "Account name";
+      nm.style.cssText = "width:140px";
+      const sites = el("input"); sites.value = a.sites;
+      sites.placeholder = "Sites — e.g. x.com"; sites.style.cssText = "flex:1;min-width:180px";
+      const si = el("button", "btn ghost sm", "Sign in");
+      /* The same multiplication sign the other rows carry, not a dingbat glyph. */
+      const rm = el("button", "btn ghost sm", "\u00D7");
+      rm.title = "Remove this row. Its saved logins stay on disk under the old name.";
+      const info = el("span", "desc"); info.style.cssText = "flex:1 1 100%;margin:-2px 0 4px";
+      nm.onchange = () => a.name = nm.value.trim();
+      sites.onchange = () => a.sites = sites.value.trim();
+      si.onclick = async () => {
+        si.textContent = "Opening…"; si.disabled = true;
+        const res = await jpost("/api/browser/own/open", { name: a.name || "default", sites: a.sites });
+        si.disabled = false; si.textContent = "Sign in";
+        bsay.textContent = res.ok ? (res.out || "opened") : ("Could not open — " + (res.err || "unknown"));
+        bDraw();
+      };
+      rm.onclick = () => { c.browser.splice(i, 1); bDraw(); };
+      row.append(nm, sites, si, rm, info); blist.appendChild(row);
+      info.textContent = bPaint(bstate[a.name]);
+      bRows.push({ name: a.name, info, btn: si });
+    });
+    if (!c.browser.length) blist.appendChild(el("div", "hint", "No accounts — this room uses the machine-wide ones."));
+    if (blist.isConnected && Object.values(bstate).some(x => x.up)) bTimer = setTimeout(bRefresh, 3000);
+  };
+  /* A sign-in happens in the other window, so nothing here would notice it. While a window is open,
+     keep the states fresh — the row turns to Signed in on its own. Text only, so it cannot steal
+     focus from someone typing a name or a site. */
+  const bRefresh = async () => {
+    clearTimeout(bTimer);
+    await bRead();
+    for (const r of bRows) r.info.textContent = bPaint(bstate[r.name]);
+    if (blist.isConnected && Object.values(bstate).some(x => x.up)) bTimer = setTimeout(bRefresh, 3000);
+  };
+  const badd = el("button", "btn ghost sm", "Add account");
+  badd.onclick = () => { c.browser.push({ name: "", sites: "" }); bDraw(); };
+  fld(brG, "ACCOUNTS", blist, "a name and the sites it covers; press Sign in once, log in, then close the window");
+  brG.append(badd, bsay);
+  brG.appendChild(el("div", "hint", "Bots in this room open these sites in the account that covers them, already logged in — so you never have to name an account in the chat. Leave the list empty to use the machine-wide accounts in Settings → Browser."));
+  p.appendChild(brG);
+  bDraw();
   logoField(p, c);   // after the folder, so the logo it finds in that repo is already known
   const err = el("div", "hint"); err.style.color = "#ff6b6b";
   p.appendChild(err);
@@ -3068,6 +3186,130 @@ function tabBots(p) {
   const add = el("button", "btn pri sm", `${svg("plus")} New bot`); add.onclick = () => { curEdit = "__new__"; renderPanel(); };
   const imp = el("button", "btn ghost sm", `${svg("bots")} Import a team`); imp.onclick = () => { curEdit = "__import__"; renderPanel(); };
   row.append(add, imp); p.appendChild(row);
+}
+/* --- Bot faces --- */
+/* One image in, one whole mascot per bot out. It is a section of its own rather than a per-bot
+   control because the point is a set: one source drawn N ways, so a team still reads as a team.
+   The drawing is the whole character — head and body — and the engine draws the outfit and
+   accessory on top. A bot's own FACE PICTURE in its editor overrides its face here. */
+function tabFaces(p) {
+  h3(p, "Bot faces", "Introduce one image and the image model draws a whole mascot for every bot from it — head and body together, one different character each.");
+  const st = { source: "", files: [], bots: [], job: {} };
+  const card = el("div", "card");
+  card.innerHTML = `<div class="ct"><span class="ico">${svg("faces")}</span><div><b>One image, a team of characters</b>
+    <div class="sub">Every drawing is the same animal as your photo — the model never changes its species — and the outfit and accessory you picked for each bot are drawn on top. A bot can swap to another face from the same set. A bot's own FACE PICTURE still wins; picking a face here drops it.</div></div></div>`;
+  const src = el("div", "lgprev");
+  const msg = el("div", "hint");
+  const row = el("div", "row");
+  const file = el("input"); file.type = "file"; file.style.display = "none";
+  file.accept = "image/png,image/jpeg,image/webp";
+  const pick = el("button", "btn ghost sm", "Introduce one image"); pick.type = "button";
+  const gen = el("button", "btn pri sm", "Draw a face for each bot"); gen.type = "button";
+  const clr = el("button", "btn ghost sm", "Clear the set"); clr.type = "button";
+  row.append(pick, gen, clr);
+  card.append(src, row, msg, file);
+  p.appendChild(card);
+  const grid = el("div", "bento"); p.appendChild(grid);
+
+  const say = () => {
+    const j = st.job || {};
+    gen.disabled = !st.source || !st.bots.length || !!j.running;
+    clr.style.display = st.files.length ? "" : "none";
+    msg.style.color = j.error ? "#ff6b6b" : "";
+    msg.textContent = j.error ? j.error
+      : j.running ? `Drawing ${j.done} of ${j.total}… this takes a few minutes; you can leave this open.`
+      : st.files.length ? `${st.files.length} face${st.files.length === 1 ? "" : "s"} in the set. Each bot takes a different one; any bot can be swapped below.`
+      : st.source ? "Now draw a face for each bot."
+      : "No image yet — introduce one to start.";
+  };
+  const drawSource = () => {
+    src.innerHTML = st.source ? `<div class="mc img"><img src="/api/face/${encodeURIComponent(st.source)}" alt=""></div>` : "";
+  };
+  const drawTiles = () => {
+    grid.innerHTML = "";
+    for (const f of st.bots) {
+      const b = S.bots.find(x => x.id === f.id) || f;
+      const d = el("div", "card tcard");
+      const url = f.genface ? `/api/face/${encodeURIComponent(f.genface)}` : "";
+      /* A picture of its own wins over the set, in the client and in the engine — so a card that
+         showed "Drawn for it" while the sidebar wore a photo would be lying about the bot. Say
+         which one is on screen, and offer the one click that hands the bot back to the set. */
+      const own = !!f.avatar;
+      d.innerHTML = `<div class="ct">${url && !own ? `<div class="mc img"><img src="${url}" alt=""></div>` : avatar(f.name, b.color, "", b.emoji)}
+        <div class="min"><b>${esc(f.name)}</b><div class="sub">${own ? "Your own picture is showing instead" : url ? "Drawn for it" : "Its own drawn bot"}</div></div></div>`;
+      const body = el("div", "tc-body");
+      const sel = el("select");
+      sel.appendChild(new Option("Its own drawn bot", ""));
+      st.files.forEach((name, i) => {
+        const o = new Option("Face " + (i + 1), name);
+        if (name === f.genface) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.disabled = !st.files.length;
+      const use = async file => {
+        const r = await jpost("/api/faces/assign", { id: f.id, file });
+        if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not change that face"; return; }
+        f.genface = r.genface || ""; f.avatar = 0;     // assigning a face drops the picture
+        await reloadConfig(); drawTiles(); say();
+      };
+      sel.onchange = () => use(sel.value);
+      if (own) {
+        const btn = el("button", "btn ghost sm", "Use this face");
+        btn.type = "button"; btn.onclick = () => use(sel.value || st.files[0] || "");
+        body.appendChild(btn);
+      }
+      body.appendChild(sel); d.appendChild(body); grid.appendChild(d);
+    }
+  };
+  /* The drawings land one bot at a time, so the gallery is refreshed on every poll: the bots that
+     are done show their face while the rest are still being drawn. The panel is rebuilt once at the
+     end, which is also when the sidebar rows and the dock pick the new faces up. */
+  const poll = async () => {
+    const f = await get("/api/faces"); if (!f) return;
+    st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
+    drawTiles(); say();
+    if (st.job.running) return void setTimeout(poll, 2000);
+    await reloadConfig();
+    if (curTab === "faces") renderPanel();
+  };
+  const load = async () => {
+    const f = await get("/api/faces"); if (!f) return;
+    st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
+    drawSource(); drawTiles(); say();
+    if (st.job.running) setTimeout(poll, 2000);
+  };
+  pick.onclick = () => file.click();
+  file.onchange = () => {
+    const f = file.files[0]; file.value = ""; if (!f) return;
+    if (f.size > 6e6) { msg.style.color = "#ff6b6b"; msg.textContent = "That image is larger than 6 MB — try a smaller one."; return; }
+    const rd = new FileReader();
+    rd.onload = async () => {
+      msg.style.color = ""; msg.textContent = "Saving the image…";
+      const r = await jpost("/api/faces/source", { data: rd.result });
+      if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not save that image"; return; }
+      st.source = r.source; drawSource(); say();
+    };
+    rd.onerror = () => { msg.style.color = "#ff6b6b"; msg.textContent = "Could not read that file."; };
+    rd.readAsDataURL(f);
+  };
+  gen.onclick = async () => {
+    gen.disabled = true; msg.style.color = ""; msg.textContent = "Starting…";
+    /* The species comes from `faceOf`, the same derivation the engine draws with, so the model is
+       asked for the shape the bot would have had anyway. */
+    const targets = S.bots.map(b => ({ id: b.id, species: faceOf(b), color: b.color }));
+    const r = await jpost("/api/faces/generate", { targets });
+    if (!r.ok) { gen.disabled = false; msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not start"; return; }
+    st.job = r.job || { running: true }; say(); setTimeout(poll, 2000);
+  };
+  clr.onclick = async () => {
+    if (!confirm("Clear every bot's drawn face and start over? The image you introduced stays.")) return;
+    const r = await jpost("/api/faces/clear", {});
+    if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not clear the set"; return; }
+    await reloadConfig();
+    st.files = []; st.job = {}; st.bots.forEach(b => b.genface = "");
+    drawTiles(); say();
+  };
+  load();
 }
 function importPanel(p) {
   h3(p, "Import a team", "Paste a team from BotMRR (botmrr.io), or just names and positions, and the bots are built for you.");
@@ -3571,10 +3813,12 @@ function tabBrowser(p) {
       const { st, owner } = statesOf(o);
       const taken = new Map();     // folder id -> the first row that claimed it, so a second can say so
       baccrows.innerHTML = ""; rows = [];
-      const h = el("div", "desc", "Accounts — one browser each, with its own saved logins. Name it, list the " +
-        "sites the bots should use it for, then press Sign in: log in once in the window that opens, then " +
-        "close the window — closing is what saves the login, and the row turns to Signed in. A site you do " +
-        "not list is read anonymously, so your logins are never handed to a site that is not yours.");
+      const h = el("div", "desc", "Default accounts — one browser each, with its own saved logins. These are used " +
+        "by a chat with one bot, and by any room that has not set its own accounts; a room's own accounts are set " +
+        "in the room's editor. Name it, list the sites the bots should use it for, then press Sign in: log in " +
+        "once in the window that opens, then close the window — closing is what saves the login, and the row " +
+        "turns to Signed in. A site you do not list is read anonymously, so your logins are never handed to a " +
+        "site that is not yours.");
       h.style.cssText = "margin-bottom:8px;max-width:640px";
       baccrows.appendChild(h);
       if (!accounts.length) {
@@ -3909,13 +4153,19 @@ function tabHelp(p) {
     "<b>Identity</b> — name, optional emoji, title, a one-line role, and the colour that paints its avatar.",
     "<b>Look</b> — the face shape: each bot gets its own shape, ears and idle motion, and the preview shows exactly how it will sit in the sidebar.",
     "<b>Outfit and accessory</b> — what it wears: a scarf, a tie, a hat, glasses. The outfit is clipped to its body; the accessory is anchored to its own eye row, so both sit right on every shape.",
-    "<b>Face picture</b> — introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth. It keeps blinking, looking around and showing its mood, and the body, outfit, accessory and colour are drawn around it.",
+    "<b>Face picture</b> — an override for this one bot: introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth. It keeps blinking, looking around and showing its mood, and the body, outfit, accessory and colour are drawn around it.",
     "<b>Brain</b> — the model, the approval level, a switch for memory, and the standing instructions (the bot's system prompt).",
     "<b>Skills</b> — tick the skills this bot should lean on.",
     "<b>Tools</b> — all current tools, or a custom selection.",
   ]);
   para(s, "The Bots list shows one card per bot with its title, model, approval and memory, so a team of twenty is scanned rather than read. <b>New bot</b> adds one; <b>Import a team</b> builds a whole roster from a BotMRR playbook, or just a pasted list of names and positions.");
   para(s, "Right-click a bot in the sidebar (or use its ⋯) for pin, hide, duplicate, clear chat and delete. Pin floats it to the top; hide takes it out of the sidebar without deleting it. A room's own menu carries pin too — and no hide, since hiding a room would take its bots' chats with it; Delete is the honest way to do that.");
+
+  /* ---- bot faces ---- */
+  s = sec("faces", "Bot faces");
+  para(s, "One image in, a whole team of characters out. <b>Introduce one image</b> and <b>Draw a face for each bot</b>, and the image model draws a complete mascot for every bot — head and body together, one different character each, in that bot's own species and colour. It takes a few minutes, and the bots fill in one at a time.");
+  para(s, "The drawing is the whole bot, so the outfit and accessory you picked in its editor are drawn on top of it. A bot can take any face from the same set from the list under its picture, or go back to its own drawn bot. <b>Clear the set</b> drops every bot's face and keeps the image you introduced.");
+  para(s, "This is the team-wide way. A bot's own <b>Face picture</b> in its editor overrides its face here, for that one bot.");
 
   /* ---- channels ---- */
   s = sec("channels", "Rooms");

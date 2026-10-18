@@ -375,10 +375,18 @@ LANG = ("Answer in the language of the user's most recent message. English is th
         "filenames and identifiers are ALWAYS in English.")
 TOOL_DOC = ("\n\nYou have real tools (function calling). Use them to actually DO the work, then call "
             "`finish` with a short, concrete report of what you did and the real output. Never claim a "
-            "result you did not get from a tool. Work in verifiable steps — but one step carries more "
-            "than one action: chain related commands into a single call, and ask for several things at "
-            "once, instead of spending a step on each probe. A turn has a step limit, and how far you "
-            "get is decided by how much each step does."
+            "result you did not get from a tool. If the message only needs an answer you already know, "
+            "just answer it — no tool call and no `finish` are needed. Work in verifiable steps, but do "
+            "not spend a step on each probe: `list_files` shows a whole folder and `read_file` reads a "
+            "file, in one call each."
+            # This used to tell a bot to "chain related commands into a single call" — and the shell
+            # gate then read that chain as risky and raised an approval card. Nobody answers a card on
+            # a greeting, so the turn sat for the whole 30s deadline, was denied, and spent two more
+            # model calls explaining it: `pwd && ls -la && cat *.md` on "hi" was a 42s turn. The two
+            # halves now say the same thing.
+            "\n\n`run_shell` runs exactly ONE plain read-only command. Chaining (`&&`, `|`, `;`, `>`, "
+            "globs) is not read-only, so below Full access it raises an approval card and the turn "
+            "waits on it — the slowest thing that can happen to a simple question."
             "\n\nFor anything on a web page, use the browser tools — never drive a browser through "
             "`run_shell`. No `curl` for a page, no hand-written CDP/websocket script, no saved helper "
             "script: those cost a step each and read less than the page really holds. `browser_open` "
@@ -495,9 +503,11 @@ def _norm_bots(b):
         _fill(x, "instructions", "You are " + x["name"] + ".")
         _fill(x, "emoji", BOT_EMOJI.get(x["id"], ""))
         _fill(x, "face", "")   # blank = the client derives a species from the id
-        # The look the avatar editor edits: an outfit and an accessory the client draws, and the
-        # version of an uploaded avatar (0 = none, so the drawn face shows).
+        # The look the avatar editor edits: an outfit and an accessory the client draws, the
+        # version of an uploaded avatar (0 = none, so the drawn face shows), and the generated
+        # whole-bot picture from the Bot faces section ("" = none, so the drawn bot shows).
         _fill(x, "outfit", ""); _fill(x, "accessory", ""); _fill(x, "avatar", 0)
+        _fill(x, "genface", "")
         # A record with no model, or one the current router does not serve, would 404 on every turn —
         # and `_agent_loop` reads `bot["model"]` unguarded, so a missing one is a TypeError mid-turn.
         _fill(x, "model", DEFAULT_MODEL)
@@ -535,7 +545,21 @@ def _norm_channels(c):
         # The colour of the room's letter avatar. Both clients default it, so this is only what the
         # row is drawn with before the user picks one — but it is a field they read, so it is filled.
         _fill(x, "color", "")
+        # The browser accounts this room's bots use, as rows of {name, sites}. Empty means "the
+        # machine-wide list", so a room that never set one keeps behaving exactly as it always did.
+        x["browser"] = _norm_accounts(x.get("browser"))
     return c
+
+def _norm_accounts(a):
+    """Account rows reduced to the two strings a route is made of, and nothing else. The rows are
+    user text that names a profile folder, so a client that echoes one back must not be able to
+    store anything under a name the routing then reads."""
+    out = []
+    for x in a if isinstance(a, list) else []:
+        if not isinstance(x, dict): continue
+        n = (x.get("name") or "").strip()
+        if n: out.append({"name": n, "sites": (x.get("sites") or "").strip()})
+    return out
 
 def load_channels():
     c = _load_json(CH_PATH, None)
@@ -1037,11 +1061,12 @@ def channels_public(chs):
                     "logo": lg["v"], "logo_src": lg["source"], "logo_rel": lg["rel"]})
     return out
 
-def _save_image(dirpath, key, data_url, what="logo"):
+def _save_image(dirpath, key, data_url, what="logo", cap=None):
     """Decode an uploaded data URL and store it as `<dirpath>/<key>.<ext>`, replacing any older
     extension for that key, so exactly one file decides what a row shows. The MIME type came from
     the browser and is only a hint: the bytes have to really be that format, or a renamed file
-    becomes markup served from our own origin."""
+    becomes markup served from our own origin. `cap` is for pictures the image model draws, which are
+    larger than the 2 MB a logo or an avatar is held to."""
     m = re.match(r"^data:(image/[a-z+.-]+);base64,(.+)$", data_url or "", re.S)
     if not m: return {"ok": False, "error": "that is not an image file"}
     mime, b64 = m.group(1).lower(), m.group(2)
@@ -1050,7 +1075,7 @@ def _save_image(dirpath, key, data_url, what="logo"):
     try: blob = base64.b64decode(b64, validate=True)
     except Exception: return {"ok": False, "error": "the image data is corrupt"}
     if not blob: return {"ok": False, "error": "that file is empty"}
-    if len(blob) > MAX_LOGO_BYTES: return {"ok": False, "error": "the image is larger than 2 MB"}
+    if len(blob) > (cap or MAX_LOGO_BYTES): return {"ok": False, "error": "the image is larger than %d MB" % ((cap or MAX_LOGO_BYTES) // (1 << 20))}
     if not _logo_bytes_ok(blob, ext): return {"ok": False, "error": "that file is not really a " + ext.lstrip(".")}
     try:
         os.makedirs(dirpath, exist_ok=True)
@@ -1062,7 +1087,7 @@ def _save_image(dirpath, key, data_url, what="logo"):
         os.replace(tmp, os.path.join(dirpath, key + ext))
     except OSError as e:
         return {"ok": False, "error": "could not save the %s: %s" % (what, e)}
-    return {"ok": True}
+    return {"ok": True, "file": key + ext}
 
 def _remove_image(dirpath, key):
     """Delete every extension a key could have been stored under. True if anything was there."""
@@ -1079,7 +1104,8 @@ def save_logo(cid, data_url):
     so exactly one file decides what the row shows."""
     cid = _logo_id(cid)
     if not cid: return {"ok": False, "error": "unknown channel"}
-    return _save_image(LOGO_DIR, cid, data_url)
+    r = _save_image(LOGO_DIR, cid, data_url)
+    return {"ok": True} if r.get("ok") else r   # a logo's caller wants ok, not the file name
 
 def remove_logo(cid):
     """Drop the uploaded logo. The repo's own logo (if any) takes over again."""
@@ -1106,7 +1132,8 @@ def save_avatar(bid, data_url):
     the same check decides whether it can name a file inside data/avatars."""
     bid = _logo_id(bid)
     if not bid: return {"ok": False, "error": "unknown bot"}
-    return _save_image(AVATAR_DIR, bid, data_url, "avatar")
+    r = _save_image(AVATAR_DIR, bid, data_url, "avatar")
+    return {"ok": True} if r.get("ok") else r
 
 def remove_avatar(bid):
     """Drop the uploaded avatar; the client draws the bot's face again."""
@@ -1124,6 +1151,114 @@ def avatar_prompt(species, color):
             "background, no frame, no border, no rounded-square icon, no drop shadow: the head itself "
             "reaches all four edges. Species: %s. Colour: %s."
             % (str(species or "as in the photo")[:60], str(color or "as in the photo")[:40]))
+
+# ---------------------------------------------------------------- bot faces
+# One source image, and the image model draws a whole mascot for each bot from it — head and body
+# together, one distinct character per bot. This is the section's picture, not a per-bot upload: a
+# batch is drawn once and every bot takes a different one from it. The engine draws the outfit and
+# accessory on top, so the model is asked for a clothing-free body.
+# A bot record only carries the filename of the drawing it took, so swapping a bot's face for
+# another from the same set is one field, not a new image.
+FACES_DIR = os.path.join(DATA, "faces")
+FACES_BATCH_PATH = os.path.join(FACES_DIR, "batch.json")
+FACE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".webp": "image/webp", ".gif": "image/gif"}
+# One batch at a time: the router is slow, and two runs at once would assign bots from both.
+FACE_JOB = {"running": False, "done": 0, "total": 0, "error": "", "id": ""}
+
+def faces_batch():
+    """The current set: its source picture and the drawings that really exist on disk."""
+    st = _load_json(FACES_BATCH_PATH, {}) or {}
+    files = [f for f in (st.get("files") or []) if os.path.isfile(os.path.join(FACES_DIR, f))]
+    src = st.get("source") or ""
+    if src and not os.path.isfile(os.path.join(FACES_DIR, src)): src = ""
+    return {"id": st.get("id") or "", "at": st.get("at") or 0, "source": src, "files": files}
+
+def faces_public(bots):
+    b = faces_batch()
+    return {"id": b["id"], "at": b["at"], "source": b["source"], "files": b["files"],
+            "job": dict(FACE_JOB),
+            "bots": [{"id": x["id"], "name": x.get("name") or x["id"], "genface": x.get("genface") or "",
+                      "avatar": x.get("avatar") or 0}
+                     for x in bots]}
+
+def face_prompt(species, color, i, n):
+    """A whole mascot: head and body in one drawing, on a plain backdrop the client keys out.
+
+    The animal comes from the photo and nothing else. Naming the bot's engine species here drew a
+    cat as an owl — the model obeyed "Species: owl" over the picture it was given. The bot's colour
+    is only an accent, for the same reason: recolouring the subject is what made one photo come
+    back as several different animals. Clothing and accessories are ruled out because the engine
+    draws the bot's own on top, and the backdrop is pure white because that is what the key removes.
+    A white subject is allowed now — the key is edge-connected, so it takes the backdrop and not the
+    cat sitting on it."""
+    accent = str(color or "").strip()[:40]
+    return ("Redraw the subject of the photo as a cute flat-vector mascot character: the WHOLE bot, "
+            "head and body together, standing upright, centred and filling the square. Keep the "
+            "SAME ANIMAL as the photo — never change its species — and keep its own fur or feather "
+            "colours, markings, ears, eyes and face. This is character %d of %d, so give it its own "
+            "pose or a small prop; the animal itself stays the one in the photo.%s Background: one "
+            "flat pure white (#FFFFFF), nothing else — no scenery, no frame, no border, no text, no "
+            "shadow. Simple body with no clothing, no hat, no glasses and no accessories: those are "
+            "drawn on afterwards."
+            % (i + 1, n, (" Only a collar or another small detail may use %s." % accent) if accent else ""))
+
+def set_genface(b, f):
+    """Give a bot a face from the set. It also drops an older per-bot picture: picking a face here
+    is the newer, deliberate choice, and a picture left over from the bot editor would otherwise
+    keep winning in the client — the section would look like it did nothing."""
+    b["genface"] = f or ""
+    if b["genface"] and b.get("avatar"):
+        remove_avatar(b["id"]); b["avatar"] = 0
+
+def _faces_prune(keep=()):
+    """Drop drawings no bot can reach any more. `keep` is the set that just landed."""
+    if not os.path.isdir(FACES_DIR): return
+    for f in os.listdir(FACES_DIR):
+        if f.startswith("f-") and f not in keep:
+            try: os.remove(os.path.join(FACES_DIR, f))
+            except OSError: pass
+
+def _face_worker(batch_id, source_name, source, targets):
+    """Draw one mascot per bot, saving and assigning each as it lands: a run that dies halfway still
+    leaves the bots it finished with their faces instead of nothing at all."""
+    made, err = [], ""
+    try:
+        for i, (bid, species, color) in enumerate(targets):
+            try:
+                data_url, used = gen_image(face_prompt(species, color, i, len(targets)),
+                                           image=source, timeout=180)
+            except Exception as e:
+                data_url, used = "", str(e)
+            if not data_url:
+                err = used or "the image model drew nothing"
+            else:
+                r = _save_image(FACES_DIR, "f-%s-%d" % (batch_id, i + 1), data_url, "face", cap=8 << 20)
+                if not r.get("ok"):
+                    err = r.get("error") or err
+                else:
+                    made.append(r["file"])
+                    bots = load_bots()
+                    b = bot_by_id(bots, bid)
+                    if b: set_genface(b, r["file"]); save_bots(bots)
+                    _save_json(FACES_BATCH_PATH, {"id": batch_id, "at": int(time.time()),
+                                                  "source": source_name, "files": made})
+            FACE_JOB["done"] = i + 1
+        # A run that drew nothing must not delete the set that is already there: the bots would be
+        # left pointing at files this prune had just removed.
+        if made: _faces_prune(made)
+    except Exception as e:
+        err = str(e)[:200]
+    finally:
+        if made:
+            # A bot whose face was pruned away goes back to its own drawn bot instead of pointing at
+            # a file that is not there any more.
+            bots = load_bots()
+            for b in bots:
+                if b.get("genface") and b["genface"] not in made: b["genface"] = ""
+            save_bots(bots)
+        FACE_JOB["error"] = "" if made else (err or "the image model drew nothing")
+        FACE_JOB["running"] = False
 
 # ---------------------------------------------------------------- team import
 # BotMRR (botmrr.io) hands you a Markdown playbook: YAML frontmatter with an `agents:`
@@ -2392,12 +2527,14 @@ class Browser:
         self.start()
         return {"ok": self.ok, "mode": self.mode, "attached": self.attached, "err": self.err}
     def _routes(self): return _route_pairs()
-    def _route(self, url):
+    def _route(self, url, routes=None):
         """The profile a site belongs to, or None for a site nobody routed. The exact host wins, then
-        each parent domain in turn, so one `x.com=<profile>` line also covers `mobile.x.com`."""
+        each parent domain in turn, so one `x.com=<profile>` line also covers `mobile.x.com`.
+        `routes` is the room's own table when the caller has one; the machine-wide list is the
+        fallback, and the call comes from the turn's thread with the room already resolved."""
         h = _host_key(url)
         if not h: return None
-        r = self._routes(); parts = h.split(".")
+        r = routes if routes is not None else self._routes(); parts = h.split(".")
         for i in range(len(parts) - 1):
             cand = ".".join(parts[i:])
             if cand in r: return r[cand]
@@ -2812,7 +2949,7 @@ class Browser:
             me["hb"] = None; me["hctx"] = None; me["hpage"] = None
             self.err = "headless: %s" % e
             return None
-    def open(self, url):
+    def open(self, url, routes=None):
         # Every browser URL a bot or the panel asks for comes through here, so this is where the
         # secret store is kept out of reach (see browser_url_guard) rather than at each tool call.
         why = browser_url_guard(url)
@@ -2838,7 +2975,7 @@ class Browser:
             # A routed site opens in the account that owns it; anything else is a public page and
             # gets the throwaway browser, because opening a logged-in profile for it would hand it
             # cookies it has no business seeing.
-            name = self._route(url)
+            name = self._route(url, routes)
             if name:
                 try:
                     ctx = self._ensure_ctx(name)
@@ -2854,7 +2991,9 @@ class Browser:
                 self.page = page; anon = True
                 note = ("read anonymously in a throwaway browser: no account covers %s, so a page that "
                         "needs a login shows its login wall here. If this site should be signed in, tell "
-                        "the user to add it to an account's sites in Settings → Browser." % (_host(url) or url))
+                        "the user to add it to an account's sites in %s." %
+                        (_host(url) or url, "this room's Browser section" if routes is not None
+                         else "Settings → Browser"))
         self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
         self._settle()
         snap = self._snap()
@@ -3061,6 +3200,14 @@ def _route_pairs(b=None):
             if h: out[h] = name
     return out
 
+def _room_routes(ch):
+    """The routing table a room's own accounts make, or None when the room defines none — in which
+    case the machine-wide list still answers, so a room that never set one behaves as it always has.
+    A room with accounts routes only through them: the whole point is that a bot in that room uses
+    the account the room names, without being told which one to use."""
+    acc = (ch or {}).get("browser") or []
+    return _route_pairs({"accounts": acc}) if acc else None
+
 def profile_id(name):
     """The folder basename a profile name reduces to — a profile's *identity*, since the folder is
     what holds the cookies. The name is user text, so it is made safe first: a name of `../..` must
@@ -3265,7 +3412,7 @@ def signed_in(hosts, rows):
             if any(nm in names and _host_matches(hk, h) for hk, nm in rows): return True
     return False if judgeable else None
 
-def browser_own_profiles():
+def browser_own_profiles(accounts=None):
     """The accounts our own browser keeps, as one entry per *folder* — because the folder is the
     identity. Two account names that reduce to the same folder (the same name typed twice, or one
     differing only in case, which macOS resolves to the same folder) are one profile, and every name
@@ -3274,10 +3421,14 @@ def browser_own_profiles():
     read "Signed in" the moment it was added. `signed_in` is the honest part: it is True only when a
     cookie the site sets on sign-in is really there, None when the site is not one we know how to
     judge, and False when we looked and found nothing — never merely "the folder exists", which says
-    only that a window was once opened."""
+    only that a window was once opened.
+
+    `accounts` is a room's own list when the caller has one. The profiles are still the same folders
+    on disk — an account is its folder, wherever it was named — so a room's rows read the logins the
+    same way the machine-wide list does. Other rooms' folders are not listed: a room shows its own."""
     b = load_settings().get("browser") or {}
     base = os.path.join(DATA, "browser_profiles")
-    routes = _route_pairs(b)
+    routes = _route_pairs({"accounts": accounts} if accounts is not None else b)
     try: on_disk = [x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x))]
     except OSError: on_disk = []
     # A folder answers to any case on macOS, so a name spelled differently still means the folder
@@ -3292,11 +3443,12 @@ def browser_own_profiles():
     ids = {}                                  # folder id -> every account name landing in it, in order
     def slot(n):
         return ids.setdefault(canon(n), [])
-    for a in (b.get("accounts") or []):
+    for a in (accounts if accounts is not None else (b.get("accounts") or [])):
         if not isinstance(a, dict): continue
         n = (a.get("name") or "").strip()
         if n and n not in slot(n): slot(n).append(n)
-    for x in on_disk: ids.setdefault(x, [])
+    if accounts is None:
+        for x in on_disk: ids.setdefault(x, [])
     out = []
     up = BROWSER.open_profiles()
     for i in sorted(ids):
@@ -3318,21 +3470,28 @@ def browser_own_profiles():
             "channel": (b.get("channel") or "auto"), "channel_in_use": browser_channel(),
             "channels": installed_channels(), "profiles": out}
 
-def browser_brief():
+def browser_brief(ch=None):
     """What a bot cannot find out for itself: which sites open already signed in. The accounts are the
     user's setup and live only in Settings, so without this a bot asked to manage Threads and Facebook
     has no way to know an account covers them — it tries to log in by hand, or reads a login wall as
     "impossible" and stops. Every site not named here opens in a blank throwaway browser, which is the
-    honest answer for a search or a public page."""
+    honest answer for a search or a public page.
+
+    `ch` is the room the turn runs in. A room with its own accounts is described by those and nothing
+    else, because those are the only ones its bots can route through — naming the machine-wide list
+    there would tell a bot about an account it cannot use."""
     b = load_settings().get("browser") or {}
     mode = (b.get("mode") or "own").lower()
     if mode in ("cdp", "zenpilot"):
         return ("\n\nBrowsing: a site you are signed into in Zen Pilot opens in its profile, already "
                 "logged in; any other site opens anonymously in a blank throwaway browser.")
-    rows = browser_own_profiles()["profiles"] if mode == "profiles" else []
+    room = (ch or {}).get("browser") or []
+    rows = browser_own_profiles(room if room else None)["profiles"] if mode == "profiles" else []
     named = [(p["name"], p["hosts"], p["signed_in"]) for p in rows if p["hosts"]]
     if not named:
-        return ("\n\nBrowsing: no account is set up, so every site opens in a blank throwaway browser "
+        return ("\n\nBrowsing: " + ("this room's accounts name no sites yet" if room
+                                    else "no account is set up") +
+                ", so every site opens in a blank throwaway browser "
                 "with no cookies. That is the right way to search the web or read a public page; a "
                 "page that needs a login will show its login wall, and no account covers it."
                 + BROWSER_OWN_LINE)
@@ -3349,7 +3508,8 @@ def browser_brief():
         if shown and used + len(ent) > BROWSER_BRIEF_CHARS:
             shown.append("and %d more" % (len(named) - len(shown))); break
         shown.append(ent); used += len(ent)
-    return ("\n\nBrowsing: the user has set up accounts — " + "; ".join(shown) +
+    return ("\n\nBrowsing: " + ("this room is set up with accounts — " if room
+                                else "the user has set up accounts — ") + "; ".join(shown) +
             ". `browser_open` one of those sites and it opens in that account's own browser, already "
             "logged in: never try to log in or type a password yourself. Any other site opens in a "
             "blank throwaway browser with no cookies — that is the right way to search the web or read "
@@ -5051,7 +5211,8 @@ def exec_tool(bid, name, args):
         # `_owner` rides with the job rather than being written from here, so the browser thread stays
         # the only writer of the attribute it is compared against.
         def bcall(fn, **kw): return BROWSER.call(fn, _owner=bid, **kw)
-        if name == "browser_open":   return bcall("open", url=args.get("url", "")), []
+        if name == "browser_open":   return bcall("open", url=args.get("url", ""),
+                                                  routes=getattr(_WORK, "routes", None)), []
         if name == "browser_save":
             sel = args.get("selector") or "img"
             ms = max(5, min(int(args.get("wait_seconds") or 60), 600)) * 1000
@@ -5345,9 +5506,13 @@ def run_agent(sid, bid, task, context, out, bots, settings, depth=0):
     """
     prev = getattr(_WORK, "dir", None)
     _WORK.dir = bot_field_dir(bid)
+    t0 = time.time()
     try:
         yield from _agent_loop(sid, bid, task, context, out, bots, settings, depth)
     finally:
+        # Every exit path — finish, stall, error, wrap-up, exception — is one turn, and this is the
+        # only clock that spans all of them: the loop's own `t0` drives the step budget, not this.
+        out["took"] = round(time.time() - t0, 1)
         log_turn(sid, bid, task, out, depth)     # still this bot's field, so the log names it
         _WORK.dir = prev
 
@@ -5409,7 +5574,7 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
     wd = work_dir()
     chunks.append(("System prompt", ("\n\nYour working directory is " + wd + ". Every shell command and file tool runs there — "
                "do not guess other paths." if wd != SANDBOX else
-               "\n\nYour working directory is the shared sandbox: " + SANDBOX + ".") + TOOL_DOC + browser_brief() + "\n\n" + LANG))
+               "\n\nYour working directory is the shared sandbox: " + SANDBOX + ".") + TOOL_DOC + browser_brief(ch_now) + "\n\n" + LANG))
     if planning: chunks.append(("System prompt", PLAN_BRIEF))
     sk = [s for s in all_skills() if s["id"] in (bot.get("skills") or [])]
     if sk:
@@ -5541,8 +5706,12 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
             # from scratch would spend the same budget the same way, and reporting it would tell the user
             # the router was dead when it was working. Bounded by OUTPUT_CONTINUE_LIMIT, after which the
             # turn falls through to the report below as it always did.
+            # `and not content` is the whole point: a reasoning model sets `reasoning` on EVERY answer,
+            # so without it a finished answer was nudged as though it had said nothing — three extra
+            # model calls per turn, each re-answering from scratch, and the user waited for the last
+            # one. "thanks, that's all" cost four calls and 14s where it needed one and 2.5s.
             if (not err and not msg.get("stalled") and nudges < OUTPUT_CONTINUE_LIMIT
-                    and (msg.get("reasoning") or msg.get("finish") == "length")):
+                    and ((msg.get("reasoning") and not content) or msg.get("finish") == "length")):
                 nudges += 1
                 messages.append({"role": "user", "content": OUTPUT_CONTINUE_NOTE})
                 continue
@@ -5803,11 +5972,13 @@ def _clean_quote(q):
     text = str(q.get("text") or "")[:2000]
     return {"who": who, "text": text} if text.strip() else None
 
-def _user_message(text, quote, fwd):
+def _user_message(text, quote, fwd, who=None):
     """The transcript's own record of what you sent: the text, plus the quote you attached to it and
     the forward mark, so reopening the chat draws back exactly what you sent rather than a plain
-    line. Kept in the same shape a bot's message uses, so nothing else has to know the difference."""
+    line. Kept in the same shape a bot's message uses, so nothing else has to know the difference.
+    `who` names a message you did not type — a routine's prompt — so it is not drawn as yours."""
     m = {"role": "user", "content": text, "ts": time.time()}
+    if who: m["who"] = who
     if quote: m["quote"] = {"who": quote.get("who") or "", "text": (quote.get("text") or "")[:1000]}
     if fwd: m["fwd"] = True
     return m
@@ -5834,7 +6005,7 @@ def _on_it(names):
     if len(names) == 1: return names[0] + " is on it."
     return ", ".join(names[:-1]) + " and " + names[-1] + " are on it."
 
-def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False):
+def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, who=None):
     if channel is None and solo is None:
         # A scoped id that resolves to neither a room nor a bot — a member's chat under a room that has
         # since been deleted, or a bot taken out of it. Returning with nothing opened a stream and closed
@@ -5855,7 +6026,7 @@ def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fw
         STEER[sid] = collections.deque()      # alive for exactly this turn: it is what a steer lands in
         STEER_CLOSED.discard(sid)
         try:
-            yield from _run_turn_inner(sid, text, bots, settings, channel, solo, quote, fwd, learn)
+            yield from _run_turn_inner(sid, text, bots, settings, channel, solo, quote, fwd, learn, who)
         finally:
             STEER.pop(sid, None)              # a steer that arrived too late is not stranded here
             STEER_CLOSED.discard(sid)
@@ -5888,12 +6059,15 @@ def _recent_ctx(sid, n=10, cap=600):
     msgs = [m for m in load(sid)["messages"] if m.get("role") in ("user", "assistant")][:-1]
     return "\n".join(f"{m.get('who') or m['role']}: {str(m.get('content') or '')[:cap]}" for m in msgs[-n:])
 
-def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, learn=None):
+def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, learn=None, who=None):
     set_work_dir(channel.get("folder") if channel else None)   # per-turn: a room's bots work in that room's repo
+    # The room's browser accounts ride with the turn, so a `browser_open` inside it routes through
+    # this room's list without the bot being told an account name. None = use the machine-wide list.
+    _WORK.routes = _room_routes(channel)
     ctx_saved = False        # set once a save has already carried the ctx chip, so `finally` need not repeat it
     try:
         st = load(sid)
-        if text: st["messages"].append(_user_message(text, quote, fwd)); save(sid, st)
+        if text: st["messages"].append(_user_message(text, quote, fwd, who)); save(sid, st)
         task = _task_with_quote(text, quote)      # what the bot is handed: the reply, with its quote
         yield {"type": "status", "state": "thinking"}
         wd = work_dir()
@@ -5939,7 +6113,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
                 yield {"type": "plan", "kind": "route", "text": _on_it(engaged)}
             final = out.get("text") or ""
             st = load(sid); st["messages"].extend(ran)
-            st["messages"].append({"role":"assistant","who": bot_by_id(bots, solo)["name"], "content": final, "ts": time.time()})
+            st["messages"].append({"role":"assistant","who": bot_by_id(bots, solo)["name"], "content": final, "ts": time.time(), "took": out.get("took")})
             rec = ctx_get(sid)                           # fold the ctx chip into this same save: one write
             if rec: st["ctx"] = rec; ctx_saved = True     # per turn, not two, on the common 1:1 path
             save(sid, st)
@@ -6056,11 +6230,18 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
     # slipped past that comparison, and a bot whose steps emit no `agent_text` had its report dropped
     # by it instead — the same words landing twice in one room, and nowhere at all in the other.
     heard = {}
-    def room_says(who, text):
+    def room_says(who, text, took=None):
         t = (text or "").strip()
         if t and heard.get(who) != t:
             heard[who] = t
-            room_said.append({"role": "assistant", "who": who, "content": text, "ts": time.time()})
+            row = {"role": "assistant", "who": who, "content": text, "ts": time.time()}
+            if took is not None: row["took"] = took
+            room_said.append(row)
+        elif took is not None:
+            # The report repeated the line already said, so no new row lands — but that row is this
+            # turn's assistant message and the duration still belongs on it.
+            for row in reversed(room_said):
+                if row.get("who") == who: row["took"] = took; break
     for m in targets:
         yield {"type": "agent", "id": m, "name": bot_by_id(bots, m)["name"], "state": "start"}
         engaged.append(bot_by_id(bots, m)["name"])
@@ -6114,7 +6295,7 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
         # puts into words is in the room's record the moment it says it, so repeating the report here
         # would write the closing line into the transcript twice. When no line of its reached the room
         # (a step that emitted no `agent_text`), the report is the only record of what it said and lands.
-        room_says(bot_by_id(bots, m)["name"], out.get("text"))
+        room_says(bot_by_id(bots, m)["name"], out.get("text"), out.get("took"))
         if room_said:
             st = load(sid); st["messages"].extend(room_said); save(sid, st); del room_said[:]
         did.append((m, out))
@@ -6253,7 +6434,7 @@ def _run_routine(r, bots, settings, chs):
     try:
         sid = r["session"]
         ch, solo = resolve_session(sid, r.get("bot"), chs, bots)
-        gen = _broadcast(sid, "", _run_turn(sid, r["prompt"], bots, settings, channel=ch, solo=solo))
+        gen = _broadcast(sid, "", _run_turn(sid, r["prompt"], bots, settings, channel=ch, solo=solo, who="Routine"))
         for _ in gen: pass
     except Exception as e: print("routine %s:" % r.get("id"), e)
     finally:
@@ -6532,12 +6713,12 @@ class H(BaseHTTPRequestHandler):
         except Exception: return {}
     def _sid(self, body): return body.get("session") or body.get("bot") or "producer"
     def _bots_public(self, bots):
-        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar")} for b in bots]
+        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar","genface")} for b in bots]
         # A record written before these keys existed still answers with them, so the client never
         # has to guess whether a missing key means "none" or "this bot is older than the feature".
         for x in out:
             x["outfit"] = x.get("outfit") or ""; x["accessory"] = x.get("accessory") or ""
-            x["avatar"] = x.get("avatar") or 0
+            x["avatar"] = x.get("avatar") or 0; x["genface"] = x.get("genface") or ""
         return out
 
     def _fail(self, e):
@@ -6685,6 +6866,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/browser/profiles":
             return self._json(browser_profiles())
         if u.path == "/api/browser/own":
+            # `?room=` scopes the list to a room's own accounts, which is what its editor draws.
+            rid = q.get("room", [""])[0]
+            if rid:
+                ch = channel_by_id(load_channels(), rid)
+                if not ch: return self._json({"ok": False, "err": "unknown room"})
+                return self._json(browser_own_profiles(ch["browser"]))
             return self._json(browser_own_profiles())
         if u.path.startswith("/api/logo/"):
             # The channel is looked up by id first, so the URL never becomes a path: only a stored
@@ -6699,6 +6886,25 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(blob)))
             # An uploaded SVG is served from our own origin, so a direct visit must not be able to
             # run anything in it. It is inert inside <img>; this covers the other case.
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.end_headers(); self.wfile.write(blob); return
+        if u.path == "/api/faces":
+            return self._json(faces_public(load_bots()))
+        if u.path.startswith("/api/face/"):
+            # A generated face is served by its file name, which only this server ever writes, and
+            # the name is checked against the shape those names have before it becomes a path.
+            name = u.path[len("/api/face/"):]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,60}\.(png|jpg|jpeg|webp|gif)", name):
+                return self.send_error(404)
+            p = os.path.join(FACES_DIR, name)
+            if not os.path.isfile(p): return self.send_error(404)
+            try: blob = open(p, "rb").read()
+            except OSError: return self.send_error(404)
+            self.send_response(200)
+            self.send_header("Content-Type", FACE_MIME.get(os.path.splitext(name)[1].lower(), "application/octet-stream"))
+            self.send_header("Content-Length", str(len(blob)))
             self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "private, max-age=300")
@@ -6917,6 +7123,9 @@ class H(BaseHTTPRequestHandler):
                 # ...and `name`, `mode`, `lead` and the rest come from the one shared list, so a
                 # create can never again write a record the loader has to repair (or crash on).
                 chs.append(_norm_channels([c])[0])
+            # One pass over the whole list, so an updated record is shaped by the same rules a loaded
+            # one is — the browser rows included, which is where a hand-sent field could otherwise land.
+            chs = _norm_channels(chs)
             save_channels(chs)
             return self._json({"ok": True, "channels": chs})
         if u.path == "/api/channel/delete":
@@ -6980,6 +7189,52 @@ class H(BaseHTTPRequestHandler):
             if not r["ok"]: return self._json(r)
             av = avatar_state(b); b["avatar"] = av["v"]; save_bots(bots)
             return self._json({"ok": True, "avatar": av["v"]})
+        if u.path == "/api/faces/source":
+            r = _save_image(FACES_DIR, "src", body.get("data"), "image", cap=6 << 20)
+            if not r.get("ok"): return self._json(r)
+            st = faces_batch(); st["source"] = r["file"]
+            _save_json(FACES_BATCH_PATH, st)
+            return self._json({"ok": True, "source": r["file"]})
+        if u.path == "/api/faces/generate":
+            if FACE_JOB["running"]: return self._json({"ok": False, "error": "the faces are still being drawn"})
+            st = faces_batch()
+            if not st["source"]: return self._json({"ok": False, "error": "introduce one image first"})
+            bots = load_bots()
+            if not bots: return self._json({"ok": False, "error": "there are no bots yet"})
+            try: raw = open(os.path.join(FACES_DIR, st["source"]), "rb").read()
+            except OSError: return self._json({"ok": False, "error": "the source image is gone"})
+            # The species and colour come from the client because it derives a species from the bot
+            # id exactly as the engine does; the record's own fields are the fallback.
+            spec = {x.get("id"): x for x in (body.get("targets") or []) if isinstance(x, dict)}
+            targets = []
+            for x in bots:
+                t = spec.get(x["id"]) or {}
+                targets.append((x["id"], t.get("species") or x.get("face") or "",
+                                t.get("color") or x.get("color") or ""))
+            batch_id = time.strftime("%Y%m%d-%H%M%S")
+            source = "data:%s;base64,%s" % (
+                FACE_MIME.get(os.path.splitext(st["source"])[1].lower(), "image/png"),
+                base64.b64encode(raw).decode())
+            FACE_JOB.update({"running": True, "done": 0, "total": len(targets), "error": "", "id": batch_id})
+            threading.Thread(target=_face_worker,
+                             args=(batch_id, st["source"], source, targets), daemon=True).start()
+            return self._json({"ok": True, "job": dict(FACE_JOB)})
+        if u.path == "/api/faces/assign":
+            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+            if not b: return self._json({"ok": False, "error": "unknown bot"})
+            f = (body.get("file") or "").strip()
+            if f and f not in faces_batch()["files"]:
+                return self._json({"ok": False, "error": "that face is not in the set"})
+            set_genface(b, f); save_bots(bots)
+            return self._json({"ok": True, "genface": b["genface"]})
+        if u.path == "/api/faces/clear":
+            bots = load_bots()
+            for b in bots: b["genface"] = ""
+            save_bots(bots)
+            # The introduced image stays: it is what the next set is drawn from, and the panel says so.
+            _save_json(FACES_BATCH_PATH, {"source": faces_batch()["source"]})
+            _faces_prune()
+            return self._json({"ok": True})
         if u.path == "/api/models/detect":
             try:
                 ids = fetch_models(); save_models(ids)
@@ -7176,9 +7431,11 @@ class H(BaseHTTPRequestHandler):
             if not url: return self._json({"ok": False, "err": "no url"})
             # The panel's box points *this chat's* bot at a page, so the screen that comes back is
             # attributed to the chat you are in — otherwise the panel would open a screen that its own
-            # scoping then refuses to show you.
-            _, actor = _computer_scope(self._sid(body))
-            out = BROWSER.call("open", url=url, timeout=60, _owner=actor)
+            # scoping then refuses to show you. It routes like a turn in that room does, too.
+            sid = self._sid(body)
+            _, actor = _computer_scope(sid)
+            ch, _solo = resolve_session(sid, None, load_channels(), load_bots())
+            out = BROWSER.call("open", url=url, timeout=60, _owner=actor, routes=_room_routes(ch))
             return self._json({"ok": BROWSER.ok, "out": out[:400]})
         if u.path == "/api/clear":
             sid = self._sid(body)

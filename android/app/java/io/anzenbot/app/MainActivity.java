@@ -27,19 +27,15 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 /**
- * The Anzen-bot app: a native client for the server running on your computer.
+ * The Anzen-bot app: the desktop's own workspace, on a phone.
  *
- * Nothing here is a browser. There is no WebView and no page: the conversation is drawn by
- * {@link ChatView} out of Android views, and the only thing that crosses the network is JSON to the
- * desktop app's own API — the same API the desktop window uses, over the same token.
- *
- * What this file owns is the door. The phone is bound to the desktop app: with that app closed there
- * is no server, no chats and no bots, so every launch — and every time the phone comes back to the
- * front, and once in a while while it is being used — the phone asks the computer whether it is
- * there. If it is not, the workspace comes off the screen and is replaced by the reason, and the
- * phone keeps looking on its own, so starting the app on the computer is all it takes to get back
- * in. Nothing is thrown away while that happens: the chat you were in is still in memory behind the
- * message, so it is exactly where you left it when the computer comes back.
+ * The chat surface is not rebuilt here — {@link Shell} loads the same page the desktop window loads,
+ * so the two cannot drift apart. What this file owns is the door. The phone is bound to the desktop
+ * app: with that app closed there is no server, no chats and no bots, so every launch — and every
+ * time the phone comes back to the front, and once in a while while it is being used — the phone asks
+ * the computer whether it is there. If it is not, the workspace comes off the screen and is replaced
+ * by the reason, and the phone keeps looking on its own, so starting the app on the computer is all it
+ * takes to get back in.
  */
 public class MainActivity extends Activity {
     private static final String PREFS = "anzen";
@@ -49,7 +45,7 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private FrameLayout root;
     private ScrollView setup, offline;
-    private ChatView chat;
+    private Shell shell;
     private EditText urlField, tokenField;
     private TextView status, offlineTitle, offlineMsg, offlineAddr;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -70,13 +66,16 @@ public class MainActivity extends Activity {
         // The colours have to be in place before the first view is built: every one of them reads
         // `Pal` once, at construction, and a background painted from a not-yet-loaded palette is a
         // transparent one. The server is the owner of the setting; this only reads the cache of it.
-        ChatView.wear(this);
+        Shell.wear(this);
         root = new FrameLayout(this);
         root.setBackgroundColor(Pal.BG);
-        chat = new ChatView(this);
+        shell = new Shell(this, new Shell.Host() {
+            @Override public void lost(String why) { showOffline("Anzen-bot is not running", why); }
+            @Override public void unpaired(String why) { showSetup(why); }
+        });
         setup = buildSetup();
         offline = buildOffline();
-        root.addView(chat, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(shell, new FrameLayout.LayoutParams(-1, -1));
         root.addView(setup, new FrameLayout.LayoutParams(-1, -1));
         root.addView(offline, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
@@ -88,7 +87,7 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
-        if (chat != null) chat.resume();
+        if (shell != null) shell.resume();
         // Coming back to the phone is exactly when the computer may have gone away, so the door is
         // checked again — unless the user is on the setup screen, where there is nothing to check yet.
         if (setup.getVisibility() != View.VISIBLE) check();
@@ -105,7 +104,7 @@ public class MainActivity extends Activity {
         // not just the fast one: the retry is the one that runs hottest.
         ui.removeCallbacks(keepAlive);
         ui.removeCallbacks(retry);
-        if (chat != null) chat.pause();
+        if (shell != null) shell.pause();
     }
 
     // ---- the door: is the desktop app there? -------------------------------------------------
@@ -141,15 +140,15 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    /** The app answered. Show the workspace — the same view, so a conversation that was open is
-        still open, and a turn that was streaming is still streaming. */
+    /** The app answered. Show the workspace — the same page, so a conversation that was open is still
+        open and a turn that was streaming is still streaming. */
     private void reachable(String url, String token) {
         ui.removeCallbacks(retry);
         live = true;
         offline.setVisibility(View.GONE);
         setup.setVisibility(View.GONE);
-        chat.setVisibility(View.VISIBLE);
-        chat.start(url, token);
+        shell.setVisibility(View.VISIBLE);
+        shell.start(url, token);
         ui.removeCallbacks(keepAlive);
         ui.postDelayed(keepAlive, KEEPALIVE_MS);   // and keep checking, so quitting it blocks the phone
     }
@@ -312,7 +311,7 @@ public class MainActivity extends Activity {
         live = false;
         setup.setVisibility(View.VISIBLE);
         offline.setVisibility(View.GONE);
-        chat.setVisibility(View.GONE);
+        shell.setVisibility(View.GONE);
         status.setText(message == null ? "" : message);
         if (urlField.getText().length() == 0) urlField.setText(prefs.getString("url", ""));
         if (tokenField.getText().length() == 0) tokenField.setText(prefs.getString("token", ""));
@@ -344,7 +343,7 @@ public class MainActivity extends Activity {
         offlineAddr.setText(url.isEmpty() ? "" : "Tried " + url);
         offline.setVisibility(View.VISIBLE);
         setup.setVisibility(View.GONE);
-        chat.setVisibility(View.GONE);
+        shell.setVisibility(View.GONE);
     }
 
     private ScrollView buildOffline() {
@@ -401,25 +400,24 @@ public class MainActivity extends Activity {
     // ---- back ---------------------------------------------------------------------------------
 
     @Override public void onBackPressed() {
-        // Back out of the chat first — a conversation, then the list, then the app itself. From the
-        // door there is nowhere to go back to: the workspace behind it is not usable.
-        if (chat.getVisibility() == View.VISIBLE && chat.back()) return;
-        super.onBackPressed();
+        // The page closes whatever surface it has open — a dialog, Settings, the drawer — and says so.
+        // Only when nothing was open does back mean the app itself. From the door there is nowhere to
+        // go back to: the workspace behind it is not usable.
+        if (shell.getVisibility() == View.VISIBLE) shell.back(new Runnable() {
+            @Override public void run() { leave(); }
+        });
+        else leave();
     }
 
-    /** The one result this app asks another screen for: the image picked for a room's logo or a bot's
-        avatar. A view has no result of its own, so it is handed on to the chat, which knows what was
-        waiting for it. */
+    /** The app closes — named rather than calling `super` from inside a callback, so the call site
+        says what it is. */
+    private void leave() { super.onBackPressed(); }
+
+    /** The one result this app asks another screen for: the file a page's own file input asked for.
+        A view has no result of its own, so it is handed on to the shell, which knows what is waiting. */
     @Override protected void onActivityResult(int req, int result, Intent data) {
         super.onActivityResult(req, result, data);
-        if (req == ChatView.PICK_PICTURE) chat.picturePicked(result == RESULT_OK ? data : null);
-    }
-
-    @Override protected void onDestroy() {
-        // The speech engine holds a system service and a callback; the view that made it is going, so
-        // it goes with it.
-        if (chat != null) chat.shutdown();
-        super.onDestroy();
+        if (req == Shell.PICK_FILE) shell.filePicked(result, data);
     }
 
     /** The status bar is drawn over the app, not beside it, from Android 15 — so a screen that began

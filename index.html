@@ -473,6 +473,10 @@
      colour the contrast check can measure, and an opacity is not: the mix is what the pixel gets. */
   .mts{margin-left:auto;flex:0 0 auto;white-space:nowrap;font-weight:500;letter-spacing:0;text-transform:none;
     color:color-mix(in srgb,var(--dim) 82%,var(--card));font-variant-numeric:tabular-nums}
+  /* How long the turn took, after the stamp. No `margin-left:auto` — `.mts` already pushes the pair
+     right, and this one follows it. */
+  .mtook{flex:0 0 auto;white-space:nowrap;margin-left:6px;font-weight:500;letter-spacing:0;text-transform:none;
+    color:color-mix(in srgb,var(--dim) 82%,var(--card));font-variant-numeric:tabular-nums}
   /* A bot's reply arrives as markdown, so it is rendered. The wrapper drops the bubble's
      pre-wrap — block spacing now comes from the elements, not from the source's newlines. */
   .md{white-space:normal}

@@ -328,6 +328,21 @@ st, j = post("/api/routine", {"prompt": "x", "session": "work-room"})
 ok("a routine with no schedule is refused", st == 400, (st, j))
 S.save_routines([])
 
+# A routine's prompt is stored as a user message so it can drive a turn, but it is not the user's:
+# with no `who` every transcript drew it under the user's own name ("Client" by default).
+_real_turn, seen = S._run_turn, {}
+def _fake_turn(sid, text, bots, settings, **kw):
+    seen.update(kw, sid=sid, text=text); return iter(())
+S._run_turn = _fake_turn
+S._RT_LIVE[0] += 1
+try:
+    S._run_routine({"id": "r1", "session": "work-room", "prompt": "standup"},
+                   S.load_bots(), S.load_settings(), S.load_channels())
+finally:
+    S._run_turn = _real_turn
+ok("a routine's turn is marked as the routine's, not the user's", seen.get("who") == "Routine", seen)
+ok("...and a message you typed still carries no who", "who" not in S._user_message("hi", None, False))
+
 st, j = post("/api/connector", {"id": "github", "base_url": "http://api.github.com"})
 ok("a cleartext connector base is refused at the route", not j.get("ok") and "https" in j.get("error", ""), (st, j))
 st, j = post("/api/connector", {"id": "github", "base_url": "https://u:p@api.github.com"})
@@ -351,6 +366,25 @@ ok("a valid relay url is accepted and recorded as wss",
 st, j = post("/api/relay", {"on": False})
 ok("the relay switches off again", j.get("ok") is True, (st, j))
 srv.shutdown()
+
+print("--- a turn's duration rides on the assistant row, never on a typed message ---")
+# The clock spans the whole turn — model steps and tool calls — and only `run_agent`'s `finally`
+# sees every way it can end. A turn that dies on a stall or an exception still took that long, so
+# the value must be set before the log write and on the path out, not on the happy branch alone.
+real_stream = S.chat_stream
+def quick_stream(model, messages, tools=None, max_tokens=None, attempts=None):
+    yield ("done", {"content": "done already", "tool_calls": []})
+S.chat_stream = quick_stream
+S.new_session("took-chat", bot="lead")
+out = {}
+try:
+    list(S.run_agent("took-chat", "lead", "do it", "", out, RB, {}, 0))
+finally:
+    S.chat_stream = real_stream
+ok("a finished turn records a numeric duration",
+   isinstance(out.get("took"), (int, float)) and not isinstance(out.get("took"), bool) and out["took"] >= 0, out)
+ok("...rounded to a tenth of a second", out.get("took") == round(out.get("took"), 1), out.get("took"))
+ok("a message the user typed carries no duration", "took" not in S._user_message("hi", None, False))
 
 print("\n%d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

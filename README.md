@@ -15,6 +15,14 @@
 
 *The default install: one room called Company, five bots already on the team.*
 
+### Bot faces: one image → a whole team
+
+[![Eleven cats drawn from one photo](docs/bot-faces.png)](docs/bot-faces.mp4)
+
+*One photo in, one complete mascot per bot out — and every drawing is the same animal as the photo. [Watch the 52-second recording](docs/bot-faces.mp4).*
+
+The prompt never names a species: it asks the model to redraw the subject and keep it. Telling it `Species: owl` drew a cat as an owl — [before and after, same photo and model](docs/bot-faces-why.png).
+
 ---
 
 ## 📌 Table of Contents
@@ -52,6 +60,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 **Bots and rooms**
 * **Rooms** — a shared team chat with its own transcript, members and responder rule.
 * **Bots as contacts** — each with its own model, approval level, memory, skills, tools, voice and animated face.
+* **Bot faces** — introduce one image and the image model draws a whole mascot for every bot from it, one different character each, all the same animal as the photo, with the outfit and accessory drawn on top. [Watch the 52-second demo](docs/bot-faces.mp4) · [the eleven cats it drew](docs/bot-faces.png)
 * **One repo per room** — pin a room to a folder and its bots work only inside it, so projects never mix.
 * **Scoped 1:1 chats** — talking to a bot from inside a room runs it in that room's repo.
 * **`@` mentions** — pick a room member from a filtered dropdown instead of remembering who is in it.
@@ -83,7 +92,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 * An Electron desktop app that runs with **no TCP port at all**, and a native Android client.
 
 **Make it yours**
-* 14 settings sections, 11 themes, 18 fonts, a per-room logo, and an animated mascot that follows the bot you are talking to.
+* 15 settings sections, 11 themes, 18 fonts, a per-room logo, and an animated mascot that follows the bot you are talking to.
 
 ---
 

@@ -13,7 +13,9 @@
    Plus the "scene" layer of props per state (desk, thought bubble, magnifier).
    An introduced picture (`opts.image`) is the bot's *face*: it is drawn where the eyes and mouth
    would be, and those are not drawn under it. Keyed against its own background, so it lands on the
-   bot rather than as a pasted-in square. Body, outfit, accessory and colour are drawn around it. */
+   bot rather than as a pasted-in square. Body, outfit, accessory and colour are drawn around it.
+   A generated whole-bot picture (`opts.whole`) is the character itself: ears, body and face all come
+   from the drawing, and only the outfit and accessory are drawn on top of it. */
 
 const MC = { INK: "#1A1412" };
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -233,6 +235,9 @@ export class MochiBot {
     this.outfit = OUTFITS[opts.outfit] ? opts.outfit : "";
     this.accessory = ACCESSORIES[opts.accessory] ? opts.accessory : "";
     this.image = opts.image || "";                   // an introduced picture: the bot's face
+    /* The face override wins over the generated whole bot, in the engine as well as in the client:
+       a bot with its own picture is drawn as a body with that face, not as the model's drawing. */
+    this.whole = this.image ? "" : (opts.whole || "");   // a generated picture: the whole character
     this.cv.width = this.size * this.dpr; this.cv.height = this.size * this.dpr;
     this.R = this.size * 0.326;                      // body radius; the unit every offset is quoted in
     this.yaw = 0; this.pitch = 0; this.tilt = 0; this.roll = 0; this.open = 1;
@@ -349,6 +354,7 @@ export class MochiBot {
       this.outfit = OUTFITS[look.outfit] ? look.outfit : "";
       this.accessory = ACCESSORIES[look.accessory] ? look.accessory : "";
       this.image = look.image || "";
+      this.whole = this.image ? "" : (look.whole || "");
     }
   }
   /* The feeling on top of the state. Idle bots drift through their own moods. */
@@ -490,16 +496,26 @@ export class MochiBot {
     if (this.tilt || this.roll) ctx.rotate(this.tilt + this.roll);
     ctx.scale(this.sx * (1 + (1 - this.sy) * 0.62), this.sy);
 
-    if (this.sp.antenna) this._antenna(ctx, R, rx, ry);
-    if (this.sp.ears !== "none") this._ears(ctx, R, rx, ry);
+    /* A generated whole-bot picture is the entire character, so none of the engine's own ears,
+       antenna, body, scan or face is drawn under it — they would show through the model's drawing.
+       Until it decodes the bot keeps its drawn body for that first frame, like an introduced face. */
+    const whole = this.whole ? textureFor(this.whole) : null;
+    const full = whole && whole.cv;
+    if (!full) {
+      if (this.sp.antenna) this._antenna(ctx, R, rx, ry);
+      if (this.sp.ears !== "none") this._ears(ctx, R, rx, ry);
+    }
 
-    if (this.glowA > 0.02) {
+    /* The glow is the silhouette's own, and a drawn character is not that silhouette: painted under
+       it, the shape shows as a grey oval the picture does not cover. The drawing already carries the
+       state through its own motion and the badge. */
+    if (this.glowA > 0.02 && !full) {
       ctx.save(); ctx.shadowColor = this.cfg.glow;
       ctx.shadowBlur = R * 0.9 * this.glowA; ctx.globalAlpha = 0.5 * this.glowA;
       this._shape(ctx, rx, ry); ctx.fillStyle = this.cfg.glow; ctx.fill(); ctx.restore();
     }
-    if (this.flat) {
-      /* Coucou's small-bot body: one flat fill, and none of the gradient, tint, shadow rim or
+    if (full) this._wholePic(ctx, full, rx, ry);
+    else if (this.flat) {      /* Coucou's small-bot body: one flat fill, and none of the gradient, tint, shadow rim or
          highlight a big mascot gets. Those are what wash the colour out at 46px — and a state
          tint would also hide the bot's colour, which is the only thing the row is saying. The
          glow behind it still rides the state, so the row lights up without losing its colour. */
@@ -520,22 +536,30 @@ export class MochiBot {
       hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
       this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
     }
-    if (this.cfg.scan) {
+    if (!full && this.cfg.scan) {
       ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
       const sx = this.scanX * rx;
       const lg = ctx.createLinearGradient(sx - 10, 0, sx + 10, 0);
       lg.addColorStop(0, "rgba(255,255,255,0)"); lg.addColorStop(0.5, "rgba(255,255,255,0.5)"); lg.addColorStop(1, "rgba(255,255,255,0)");
       ctx.fillStyle = lg; ctx.fillRect(sx - 10, -ry, 20, ry * 2); ctx.restore();
     }
-    this._outfit(ctx, R, rx, ry);
+    /* A garment is written for a head-and-torso bot: on a full-body drawing the band lands on the
+       face. Moved down to the drawing's own torso — below the head, inside the arms — a scarf reads
+       as a scarf again. */
+    const fr = full ? this._wholeFrame : { rx, ry, dy: 0, rx2: rx, ry2: ry };
+    ctx.save(); ctx.translate(0, fr.dy);
+    this._outfit(ctx, R, fr.rx2, fr.ry2);
+    ctx.restore();
     /* An introduced picture is the face, and the drawn eyes and mouth are *not* under it: the model
        is asked for a face, so a drawn eye on top of its own would be two eyes. Until the picture has
        decoded there is no canvas to draw, and the bot keeps its own face for that first frame rather
        than showing a hole — which is also what a bot with no picture at all does. */
-    const tex = textureFor(this.image);
-    if (tex && tex.cv) this._facePic(ctx, tex.cv, R, rx, ry);
-    else { this._eyes(ctx, R, rx, ry); this._mouth(ctx, R, rx, ry); }
-    this._accessory(ctx, R, rx, ry);
+    if (!full) {
+      const tex = textureFor(this.image);
+      if (tex && tex.cv) this._facePic(ctx, tex.cv, R, rx, ry);
+      else { this._eyes(ctx, R, rx, ry); this._mouth(ctx, R, rx, ry); }
+    }
+    this._accessory(ctx, R, fr.rx, fr.ry);
     ctx.restore();
 
     this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry);
@@ -631,6 +655,16 @@ export class MochiBot {
     ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
     ctx.drawImage(cv, B.x + this.yaw * B.w * 0.05, B.y + (B.h - h) / 2 + this.pitch * B.h * 0.04, B.w, h);
     ctx.restore();
+  }
+  /* The generated whole-bot picture, drawn as the character. Fitted to the silhouette's box with its
+     aspect kept: a head-and-body drawing is taller than the squircle, and stretching it to the box
+     would give the bot a fat head. The bob, tilt and squash of the engine still move it. */
+  _wholePic(ctx, cv, rx, ry) {
+    const w = rx * 2.30, h = ry * 2.30;
+    const s = Math.min(w / cv.width, h / cv.height);
+    this._wholeFrame = { rx: cv.width * s / 2, ry: cv.height * s / 2,
+      dy: cv.height * s * 0.13, rx2: cv.width * s * 0.30, ry2: cv.height * s * 0.30 };
+    ctx.drawImage(cv, -cv.width * s / 2, -cv.height * s / 2, cv.width * s, cv.height * s);
   }
   /* Where an eye actually lands, after the cylinder projection and the band limit. Both the
      renderer and the tests go through here, so the guarantee lives in one place. */
@@ -1116,8 +1150,25 @@ export function textureFor(url) {
       });
       if (agree) {
         const bg = [0, 1, 2].map(k => corners.reduce((a, c2) => a + c2[k], 0) / 4);
-        for (let i = 0; i < p.length; i += 4) {
-          if (Math.max(Math.abs(p[i] - bg[0]), Math.abs(p[i + 1] - bg[1]), Math.abs(p[i + 2] - bg[2])) < 30) p[i + 3] = 0;
+        const near = i => Math.max(Math.abs(p[i] - bg[0]), Math.abs(p[i + 1] - bg[1]),
+                                   Math.abs(p[i + 2] - bg[2])) < 30;
+        /* The backdrop is removed from the border inwards, not by colour alone. A cream cat on a
+           white backdrop is still a cat, and a global key ate most of its body: every pale pixel
+           became a hole. Only what is reachable from an edge through backdrop-coloured pixels is
+           backdrop; a pale patch inside the outline is the subject and stays. */
+        const seen = new Uint8Array(TEX_PX * TEX_PX), stack = [];
+        for (let x = 0; x < TEX_PX; x++) stack.push(x, x + M * TEX_PX);
+        for (let y = 0; y < TEX_PX; y++) stack.push(y * TEX_PX, y * TEX_PX + M);
+        while (stack.length) {
+          const q = stack.pop(); if (seen[q]) continue;
+          seen[q] = 1;
+          if (!near(q * 4)) continue;
+          p[q * 4 + 3] = 0;
+          const x = q % TEX_PX, y = (q - x) / TEX_PX;
+          if (x > 0) stack.push(q - 1);
+          if (x < M) stack.push(q + 1);
+          if (y > 0) stack.push(q - TEX_PX);
+          if (y < M) stack.push(q + TEX_PX);
         }
         c.putImageData(d, 0, 0);
       }

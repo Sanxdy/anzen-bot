@@ -352,12 +352,12 @@ def main():
         st1 = pg.eval_on_selector("#hStatus", "e=>e.textContent")
         check("dock poke does not change the state", st0 == st1, f"{st0}->{st1}")
 
-        # ---- 4. settings: 14 tabs, each renders ----
+        # ---- 4. settings: 15 tabs, each renders ----
         pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(500)
         tabs = pg.eval_on_selector_all("#setTabs .mtab .lbl", "els=>els.map(e=>e.textContent)")
-        check("settings has 14 tabs", len(tabs) == 14, str(tabs))
+        check("settings has 15 tabs", len(tabs) == 15, str(tabs))
         check("settings tabs cover the full surface",
-              all(t in tabs for t in ["General","AI model","Browser","Phone","Bots","Rooms",
+              all(t in tabs for t in ["General","AI model","Browser","Phone","Bots","Bot faces","Rooms",
                                       "Connected apps","Skills","Plugins","Memory","Approvals",
                                       "Voice","Appearance","Help"]), str(tabs))
         err0 = len(errors)
@@ -2312,6 +2312,59 @@ def main():
         check("the sidebar draws the picture on the bot", bool(drawn_av), str(len(drawn_av)))
         check("no JS error from the look editor", not js_errs(), str(js_errs()[:3]) + " | " + str(badresp[:3]))
 
+        # ---- 16c. Bot faces: one image, one whole mascot per bot ----
+        # Its own section, not a per-bot control: the point is a set drawn from one source. The model
+        # calls are stubbed — a real set is minutes of router work and would test the router — so what
+        # is checked is the wiring: the section exists, introducing an image and starting a run send
+        # the right things, and a face the server has assigned is what the sidebar draws.
+        # 16b reloaded the page, which closed the settings panel; the rail is rebuilt on open.
+        pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
+        pg.eval_on_selector("#tab-faces", "e=>e.click()"); pg.wait_for_timeout(600)
+        ftxt = pg.eval_on_selector("#setPanel", "e=>e.innerText")
+        check("Bot faces is a section of its own",
+              "Bot faces" in ftxt and "Introduce one image" in ftxt and "Draw a face for each bot" in ftxt, ftxt[:160])
+        pg.evaluate("""()=>{window.__fc=[]; const pf=window.fetch.bind(window);
+          window.fetch=(u,o)=>{const s=String(u);
+            if(!/[/]api[/]faces[/](source|generate)/.test(s)) return pf(u,o);
+            try{ window.__fc.push([s.replace(/^.*[/]api[/]faces[/]/,''), JSON.parse(o.body)]); }catch(e){}
+            if(/generate/.test(s)) return Promise.resolve(new Response(
+              JSON.stringify({ok:true, job:{running:true,done:0,total:2,error:'',id:'t'}}),
+              {status:200,headers:{'Content-Type':'application/json'}}));
+            return pf(u,o);};}""")
+        pg.locator("#setPanel input[type=file]").first.set_input_files(
+            files=[{"name": "team.png", "mimeType": "image/png", "buffer": png_blob(64)}])
+        pg.wait_for_timeout(900)
+        check("introducing one image stores it as the set's source",
+              pg.evaluate("()=>window.__fc.map(c=>c[0])").count("source") == 1
+              and pg.evaluate("()=>window.__fc[0][1].data").startswith("data:image/png;base64,"),
+              str(pg.evaluate("()=>window.__fc.map(c=>c[0])")))
+        pg.eval_on_selector_all("#setPanel .btn.pri", "els=>{const b=els.find(x=>/Draw a face/.test(x.textContent));if(b)b.click()}")
+        pg.wait_for_timeout(700)
+        gen = next((c[1] for c in pg.evaluate("()=>window.__fc") if c[0] == "generate"), {})
+        check("a run names every bot, with the species and colour its face is drawn for",
+              len(gen.get("targets") or []) >= 2
+              and all(t.get("id") and t.get("species") and t.get("color") for t in gen["targets"]),
+              str(gen)[:180])
+        check("the run reports its progress while it draws", "Drawing 0 of 2" in pg.eval_on_selector("#setPanel", "e=>e.innerText"))
+        # A bot's face from the set is the whole bot, so the engine must be told `whole` and not
+        # `image` (which would put the drawing on a drawn body). Read off the live sidebar bots.
+        pg.evaluate("""async(id)=>{
+            const r = await fetch('/api/faces/assign',{method:'POST',headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({id, file:''})});
+            return r.ok; }""", lookbot.get("id"))
+        check("a face outside the set is refused", not pg.evaluate("""async(id)=>{
+            const r = await fetch('/api/faces/assign',{method:'POST',headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({id, file:'f-nope-1.png'})});
+            return (await r.json()).ok; }""", lookbot.get("id")))
+        check("clearing the set keeps the image the next set is drawn from",
+              pg.evaluate("""async()=>{
+                const before = await (await fetch('/api/faces')).json();
+                const r = await (await fetch('/api/faces/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+                const after = await (await fetch('/api/faces')).json();
+                return r.ok && after.files.length === 0 && after.source === before.source && !!before.source; }"""))
+        check("no JS error from the Bot faces section", not js_errs(), str(js_errs()[:3]) + " | " + str(badresp[:3]))
+        pg.eval_on_selector("#sClose", "e=>e.click()"); pg.wait_for_timeout(400)   # back to the transcript
+
         # ---- 17. a bot's markdown reply is rendered, not shown raw ----
         # The reply is stubbed so the checks are about the renderer, not about what a model happens
         # to write. It goes through the real SSE path, so the whole client chain is exercised.
@@ -2569,7 +2622,10 @@ def main():
                 await new Promise(r=>setTimeout(r,500));
                 const c=await (await fetch('/api/config')).json();return c.settings.context.limit}""") == 0)
         finally:
-            json.dump(snap2, open(SETF2, "w"), indent=2)
+            # Through the API, not the file: load_settings() caches in memory, so a file write is
+            # undone by the server's own cache on the very next read.
+            pg.evaluate("""async(s)=>{await fetch('/api/settings',{method:'POST',
+                headers:{'Content-Type':'application/json'},body:JSON.stringify({settings:s})})}""", snap2)
         check("the test hands the real context setting back",
               pg.evaluate("async()=>{const c=await (await fetch('/api/config')).json();return c.settings.context.limit}")
               == snap2["context"]["limit"])

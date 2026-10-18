@@ -174,6 +174,17 @@ class Router(BaseHTTPRequestHandler):
                         '"finish_reason":"tool_calls"}]}\n\n').encode(), False)
             self._send(b"data: [DONE]\n\n", False)
             self.close_connection = True
+        elif MODE == "reasoning_with_answer":
+            # The shape a reasoning model answers in every time: it thinks, then says the answer, in
+            # one response. `reasoning` is set on all of these — so a nudge keyed on "it reasoned"
+            # rather than "it said nothing" re-asked a finished answer three times over, and the user
+            # waited for the last rephrasing. "thanks, that's all" cost four calls where one would do.
+            self._head(False)
+            self._send(b'data: {"choices":[{"delta":{"reasoning_content":"2+2 is 4"}}]}\n\n', False)
+            self._delta("4", False)
+            self._send(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', False)
+            self._send(b"data: [DONE]\n\n", False)
+            self.close_connection = True
         elif MODE == "function_call_only":
             # The single-call field `tool_calls` replaced. A gateway that still streams it, read as no
             # call at all, is a step the bot appears to have skipped.
@@ -632,6 +643,15 @@ ok("...with the turn not labelled as a stop", out.get("stop") is None, "stop=%r"
 ok("...and the room is not told the router failed",
    not any(e.get("type") == "notice" for e in events),
    [e["text"][:70] for e in events if e.get("type") == "notice"])
+
+# A reasoning model sets `reasoning` on every answer, including a complete one — so the nudge must
+# key on "said nothing", not on "thought first".
+HITS.clear(); MODE = "reasoning_with_answer"; S.MODEL_RETRIES = 0
+out3 = {}
+list(S.run_agent("reasoning-answered", bid, "what is 2+2?", "", out3, bots, {}, 0))
+ok("a complete answer from a reasoning model is taken on the first call",
+   HITS.get("reasoning_with_answer") == 1, "requests=%r" % HITS)
+ok("...and it is the answer the user is given", out3.get("text") == "4", "text=%r" % out3.get("text"))
 
 # A model that only ever thinks still has to land, so the nudge is bounded: after
 # OUTPUT_CONTINUE_LIMIT the turn falls through to its report instead of looping for ever.

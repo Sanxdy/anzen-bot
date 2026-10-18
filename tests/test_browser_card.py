@@ -186,6 +186,33 @@ try:
         check("  ...and it is not the other row's site",
               "127.0.0.1:%d" % site.server_address[1] not in note, note[:300])
         check("no JavaScript error was raised while doing any of that", not errs, errs)
+
+        # ---- a room's accounts are the room's ----
+        # The complaint behind this: every bot in every room saw the whole machine-wide list, so the
+        # user had to type an account name into the chat. The list a room's editor draws must be the
+        # room's own, and a room with none must still fall back rather than lose its routing.
+        api("/api/channel", {"channel": {"id": "promo", "name": "Promo",
+                                        "browser": [{"name": "Room acct", "sites": "example.com"}]}})
+        room = api("/api/browser/own?room=promo")
+        check("a room's account list is the room's own",
+              [p["name"] for p in room["profiles"]] == ["Room acct"], room["profiles"])
+        check("  ...and it knows the sites that room routes",
+              room["profiles"][0]["hosts"] == ["example.com"], room["profiles"][0]["hosts"])
+        check("the machine-wide list still answers for a chat outside a room",
+              len(api("/api/browser/own")["profiles"]) > 1, api("/api/browser/own")["profiles"])
+        check("a room with no accounts still falls back to the machine-wide ones",
+              S._room_routes(api("/api/config")["channels"][0]) is None)
+
+        # The room editor itself: the Browser section is there, and its rows belong to the room.
+        pg.click("#sClose"); pg.wait_for_timeout(400)
+        pg.click("#btnSettings"); pg.click("#tab-channels"); pg.wait_for_timeout(700)
+        pg.locator("button", has_text="Edit").first.click(); pg.wait_for_timeout(900)
+        panel = pg.locator("#setPanel")
+        check("the room editor has a Browser section", "Browser" in panel.inner_text(),
+              panel.inner_text()[:600])
+        check("  ...and says what an empty list means",
+              "machine-wide" in panel.inner_text(), panel.inner_text()[:900])
+        check("  ...and no JavaScript error was raised opening it", not errs, errs)
         b.close()
 finally:
     try:

@@ -239,6 +239,13 @@ for risky in ["find . -name '*.py'", "ls *.py", "ls; rm -rf ~", "git status && s
 for outside in ["cat /etc/hosts", "cat ~/.ssh/id_rsa", "git -C /elsewhere status", "ls /etc", "head -n1 ~/.zshrc"]:
     ok("read-only command that leaves the sandbox is risky: " + outside, S.is_risky(outside))
 
+# --- and the prompt must not ask for the thing the allowlist refuses ---
+# It did: "chain related commands into a single call" told every bot to build exactly the commands
+# above, which then raised an approval card nobody answered, and a greeting cost 42s.
+ok("the prompt does not tell bots to chain shell commands", "chain related commands" not in S.TOOL_DOC)
+for form in ["ls -la && cat x", "ls -la | head", "ls -la; cat x", "ls -la > x", "cat *.md"]:
+    ok("...and every form it warns about is the one the gate refuses: " + form, S.is_risky(form))
+
 # --- the folder picker: subdirectories only, and it never walks off the deep end ---
 os.makedirs(os.path.join(repo_a, "src", "deep")); os.makedirs(os.path.join(repo_a, ".hidden"))
 open(os.path.join(repo_a, "notes.txt"), "w").write("hi")

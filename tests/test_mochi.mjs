@@ -477,10 +477,43 @@ console.log("\n-- colour grading --");
   ok("the body, outfit and accessory are still drawn around a picture",
      withPic.some(inkish), JSON.stringify(withPic.filter(v => v).slice(0, 8)));
   ok("without a picture the bot still draws its own face", wears({}).includes(INK));
+  /* ---- a generated whole bot is the character ----
+     The Bot faces section asks the model for a complete mascot, so the drawing *is* the body and the
+     face: none of the engine's own body, ears or eyes may be drawn under it, or they show through.
+     The outfit and accessory still go on top, which is what the section promises. */
+  const wholeUrl = "/api/face/f-1-1.png";
+  const whole = wears({ whole: wholeUrl, outfit: "scarf", accessory: "crown" });
+  ok("a whole-bot picture is painted", whole.includes("img"));
+  ok("no drawn face under a whole bot", !whole.includes(INK));
+  ok("no drawn body under a whole bot", !whole.includes("#EDEDEF") && !whole.includes("#C4C5CA"));
+  ok("the outfit and accessory are drawn on top of a whole bot", whole.some(inkish));
+  ok("a bot's own picture overrides the generated whole bot",
+     mk({ image: pic, whole: wholeUrl }).whole === "" && mk({ whole: wholeUrl }).whole === wholeUrl);
+  /* ---- the backdrop is keyed from the edge inwards ----
+     A cream cat on a white backdrop is still a cat. The key used to remove every pixel close to the
+     corner colour, which ate the subject: this photo is a cream disc inside a dark outline on pure
+     white, and the disc has to survive while the corner goes. */
+  const N = 256, px = new Uint8ClampedArray(N * N * 4);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = (y * N + x) * 4, d = Math.hypot(x - 128, y - 128);
+    const col = d < 70 ? [245, 239, 228] : d < 76 ? [26, 20, 18] : [255, 255, 255];
+    px[i] = col[0]; px[i + 1] = col[1]; px[i + 2] = col[2]; px[i + 3] = 255;
+  }
+  const alphaAt = (x, y) => px[(y * N + x) * 4 + 3];
+  globalThis.document = { createElement: () => ({ width: 0, height: 0, getContext: () => ({
+    drawImage() {}, putImageData() {},
+    getImageData: () => ({ data: px }),                  // the same buffer the key writes into
+  }) }) };
+  textureFor("/api/face/cream-cat.png");
+  ok("the backdrop around a pale subject is removed", alphaAt(2, 2) === 0 && alphaAt(250, 6) === 0);
+  ok("a pale subject inside its own outline survives the key", alphaAt(128, 128) === 255);
   globalThis.document = realDoc; globalThis.Image = realImg;
   ok("skin() re-dresses a live bot",
      (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u" });
        return b.outfit === "tie" && b.accessory === "crown" && b.image === "u"; })());
+  ok("skin() with a whole bot keeps the drawing and drops the face override",
+     (() => { const b = mk({ image: "u" }); b.skin("mochi", null, { whole: wholeUrl });
+       return b.whole === wholeUrl && b.image === ""; })());
   ok("skin() with no look keeps what the bot is wearing",
      (() => { const b = mk({ outfit: "tie", accessory: "crown" }); b.skin("cat", { flat: FLAT });
        return b.outfit === "tie" && b.accessory === "crown"; })());

@@ -55,5 +55,78 @@ check("the tool doc never names Zen Pilot (it rides in every prompt)",
 check("the browser_open description never names Zen Pilot",
       "Zen Pilot" not in S.TOOL_SCHEMAS["browser_open"]["function"]["description"])
 
+# ---- a room's own accounts: the binding lives on the room, not in general settings ----
+# A room's browser setting is the room's, so a bot working there must be told about the room's
+# accounts and never about one it cannot route through.
+brief(mode="profiles", accounts=[{"name": "Global X", "sites": "x.com"}])
+room = {"id": "promo", "browser": [{"name": "Threads me", "sites": "threads.com"}]}
+rb = S.browser_brief(room)
+check("a room's brief names the room's account", "Threads me" in rb and "threads.com" in rb, rb)
+check("  ...and not the machine-wide one", "Global X" not in rb, rb)
+check("  ...and says the room is the scope", "this room is set up with accounts" in rb, rb)
+check("a chat outside a room still gets the machine-wide account", "Global X" in S.browser_brief())
+
+empty = S._norm_channels([{"id": "promo", "name": "Promo"}])[0]
+check("a room the file left without accounts gets an empty list", empty["browser"] == [], empty)
+junk = S._norm_channels([{"id": "promo", "name": "Promo", "browser": [
+    {"name": " Zenpilot.pro ", "sites": " x.com "}, {"sites": "y.com"}, "junk"]}])[0]
+check("a room's account rows keep only a name and sites, trimmed",
+      junk["browser"] == [{"name": "Zenpilot.pro", "sites": "x.com"}], junk["browser"])
+check("a room with no accounts falls back to the machine-wide list",
+      S._room_routes({"browser": []}) is None)
+check("a room with accounts routes its own sites",
+      S._room_routes(room) == {"threads.com": "Threads me"}, S._room_routes(room))
+
+B = S.BROWSER; rt = S._room_routes(room)
+check("the browser routes a room's site through the room's table",
+      B._route("https://threads.com/home", rt) == "Threads me")
+check("  ...and does not fall back to the machine-wide account for another site",
+      B._route("https://x.com/", rt) is None)
+check("a chat outside a room still routes through the machine-wide list",
+      B._route("https://x.com/") == "Global X")
+
+rp = S.browser_own_profiles([{"name": "Threads me", "sites": "threads.com"}])["profiles"]
+check("a room's account list shows only the room's accounts",
+      [p["name"] for p in rp] == ["Threads me"], [p["name"] for p in rp])
+check("  ...and knows the site it covers", rp[0]["hosts"] == ["threads.com"], rp[0]["hosts"])
+
+# The turn's own routing table reaches the browser: a `browser_open` inside a room must carry the
+# room's table, or the bot is told about an account it cannot actually reach.
+seen = {}
+real_call = S.BROWSER.call
+S.BROWSER.call = lambda fn, **kw: (seen.update(kw), "(stub)")[1]
+S._WORK.routes = rt
+S.exec_tool("producer", "browser_open", {"url": "https://threads.com/"})
+check("browser_open carries the room's routing table to the browser", seen.get("routes") == rt, seen)
+S._WORK.routes = None
+seen.clear()
+S.exec_tool("producer", "browser_open", {"url": "https://threads.com/"})
+check("  ...and a chat outside a room carries none, so the machine-wide list answers",
+      seen.get("routes") is None, seen)
+S.BROWSER.call = real_call
+
+# The wiring, not just the function: a turn running in a room must actually be handed the room's
+# brief. The model call is stubbed, so this is one prompt assembled exactly as a real one is.
+bots = [{"id": "lead", "name": "Lead", "model": "m", "instructions": "", "tools": []}]
+S.save_channels([{"id": "promo", "name": "Promo", "members": ["lead"], "mode": "lead", "lead": "lead",
+                  "instructions": "", "folder": "",
+                  "browser": [{"name": "Room acct", "sites": "example.com"}]}])
+sent = []
+def cap_stream(model, messages, tools=None, max_tokens=None, attempts=None):
+    sent.append(messages[0]["content"] if messages[0].get("role") == "system" else
+                "\n".join(m.get("content") or "" for m in messages if m.get("role") == "system"))
+    yield ("done", {"content": "ok", "tool_calls": []})
+real = S.chat_stream; S.chat_stream = cap_stream
+try:
+    S.new_session("promo", bot="lead")
+    list(S.run_agent("promo", "lead", "hi", "", {}, bots, S.load_settings(), 0))
+finally:
+    S.chat_stream = real
+sysmsg = sent[-1] if sent else ""
+check("a turn in a room gets that room's accounts in its prompt",
+      "Room acct" in sysmsg and "example.com" in sysmsg, sysmsg[-600:])
+check("  ...and not the machine-wide account, which it cannot route through",
+      "Global X" not in sysmsg, sysmsg[-600:])
+
 print("FAILED: " + ", ".join(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)
