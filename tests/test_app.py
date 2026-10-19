@@ -26,18 +26,6 @@ def accept_once(d):
     try: d.accept()
     except Exception: pass
 
-class _CDPStub(http.server.BaseHTTPRequestHandler):
-    """Stands in for ZenPilot's debug port: one profile (a webview target) and one devtools page,
-    which is exactly the shape the real app exposes on /json/list."""
-    def do_GET(self):
-        body = json.dumps([
-            {"id": "w1", "type": "webview", "url": "https://gemini.google.com/app", "title": "Gemini"},
-            {"id": "d1", "type": "page", "url": "devtools://devtools/bundled/devtools_app.html", "title": "DevTools"},
-        ]).encode() if self.path.startswith("/json/list") else b"{}"
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def log_message(self, *a): pass
-
 def png1x1():
     """A real one-pixel PNG, so the logo checks upload something a browser can actually decode
     rather than a header the server would take on trust."""
@@ -1032,21 +1020,11 @@ def main():
         check("image model picker is filled from the API key",
               pg.eval_on_selector_all("#setPanel select option", "e=>e.length") > 0,
               pg.evaluate("()=>[...document.querySelectorAll('#setPanel .card')].map(c=>(c.querySelector('.ct b')||{}).textContent+': '+(c.querySelector('.desc')||{}).textContent).join(' | ')")[:200])
-        # The browser is its own tab now, so the card checks below run there rather than here.
-        pg.eval_on_selector("#tab-browser", "e=>e.click()"); pg.wait_for_timeout(400)
-        check("the Browser tab has a Browser card",
-              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .card .ct b')].some(b=>/^Browser$/.test(b.textContent.trim()))"))
-        check("browser card offers ZenPilot over CDP",
-              pg.eval_on_selector_all("#setPanel select", "els=>els.some(s=>[...s.options].some(o=>/CDP/.test(o.textContent)))"))
-        check("browser card asks for a debug port, and only a port",
-              pg.evaluate("()=>{const i=[...document.querySelectorAll('#setPanel input')].find(x=>x.type==='number'&&x.max==='65535');"
-                          "return !!i&&i.placeholder==='9222'&&!document.querySelector('#setPanel input[placeholder*=\"--remote-debugging-port\"]')}"))
-        check("the port field says which endpoint it drives",
-              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .desc')].some(d=>/DEBUG PORT/.test(d.textContent)&&/127\\.0\\.0\\.1/.test(d.textContent))"))
-        check("browser card can launch ZenPilot from the port",
-              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')].some(b=>/Launch ZenPilot/.test(b.textContent))"))
-        check("browser card can pin which profile to use",
-              pg.eval_on_selector_all("#setPanel input", "els=>els.some(i=>/Profiles to keep/.test(i.placeholder||''))"))
+        # The browser's accounts moved out of Settings altogether — they belong to a room and are
+        # edited in its Computer panel — so the rail must not offer a Browser tab any more.
+        check("Settings has no Browser tab", pg.locator("#tab-browser").count() == 0)
+        check("the Computer panel carries the account rows",
+              pg.evaluate("()=>!!document.querySelector('#comp #compAcc') && !!document.querySelector('#compAccHint')"))
         pg.eval_on_selector("#tab-bots", "e=>e.click()"); pg.wait_for_timeout(400)   # Bots
         pg.eval_on_selector_all("#setPanel [data-a='edit']", "els=>els[0].click()"); pg.wait_for_timeout(400)
         # ---- 11d. the bot editor's model picker ----
@@ -1171,139 +1149,41 @@ def main():
         bad_img = pg.evaluate("async()=>await (await fetch('/api/media/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:''})})).json()")
         check("media endpoint rejects an empty model", not bad_img.get("ok"))
 
-        # ---- 11f. the bots can reuse a browser you already run (ZenPilot), over CDP ----
+        # ---- 11f. browsing: two modes, no debug port, and the accounts saved where a room reads them ----
         binfo = pg.evaluate("async()=>await (await fetch('/api/browser')).json()")
-        check("browser endpoint reports a mode", bool(binfo.get("ok")) and binfo.get("mode") in ("own", "cdp"), str(binfo)[:160])
-        check("browser endpoint reports running + attached", "running" in binfo and "attached" in binfo, str(binfo)[:120])
-        check("browser endpoint reports the port and the endpoint derived from it",
-              binfo.get("port") and binfo.get("cdp_url") == "http://127.0.0.1:%s" % binfo["port"],
-              str(binfo)[:150])
-        check("the retired launch command is gone, not left to disagree with the port",
-              "launch_cmd" not in binfo, str(list(binfo.keys())))
-        check("browser endpoint carries the profile filter",
-              "target_url" in binfo and "target_urls" in binfo, str(binfo)[:150])
+        check("browser endpoint reports a live mode",
+              bool(binfo.get("ok")) and binfo.get("mode") in ("own", "profiles"), str(binfo)[:160])
+        check("browser endpoint reports whether the engine is up", "running" in binfo, str(binfo)[:120])
+        check("the CDP leftovers are gone from the endpoint",
+              not [k for k in ("port", "cdp_url", "target_url", "target_urls", "attached", "hint") if k in binfo],
+              str(list(binfo.keys())))
+        for gone in ("/api/browser/profiles", "/api/browser/launch"):
+            code = pg.evaluate("async(u)=>(await fetch(u)).status", gone)
+            check("the retired endpoint %s answers 404" % gone, code == 404, code)
 
-        # The regression this guards: the port and the launch command each named a port, so the app
-        # could connect to one nothing was listening on. The port is now the only thing to set, and
-        # the endpoint the app connects to has to follow it.
-        pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
-        pg.eval_on_selector("#tab-browser", "e=>e.click()"); pg.wait_for_timeout(700)   # Browser
-        pg.evaluate("()=>{const i=[...document.querySelectorAll('#setPanel input')].find(x=>x.type==='number'&&x.max==='65535');"
-                    "i.value='9333';i.dispatchEvent(new Event('input'));i.dispatchEvent(new Event('change'))}")
-        hint = pg.evaluate("()=>[...document.querySelectorAll('#setPanel .desc')].map(d=>d.textContent).join(' ')")
-        check("the card names the endpoint the typed port drives", "127.0.0.1:9333" in hint, hint[:170])
-        # Scope to the Browser card: the Connection card's own "Test connection" comes first in the
-        # panel, and clicking that would test the router instead of moving the browser endpoint.
-        pg.evaluate("""()=>{const c=[...document.querySelectorAll('#setPanel .card')]
-          .find(x=>x.querySelector('input[type=number][max="65535"]'));
-          [...c.querySelectorAll('.btn')].find(b=>/Test connection/.test(b.textContent)).click()}""")
-        pg.wait_for_timeout(1500)
-        moved = pg.evaluate("async()=>await (await fetch('/api/browser')).json()")
-        check("saving the port moves the endpoint the app connects to",
-              moved.get("port") == 9333 and moved.get("cdp_url") == "http://127.0.0.1:9333", str(moved)[:160])
-        # put the port back where it was found, and reconnect there, so nothing is left borrowed
-        pg.evaluate("async(b)=>await (await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-                    "body:JSON.stringify({settings:{browser:b}})})).json()",
-                    {"mode": binfo.get("mode", "own"), "port": binfo.get("port", 9222)})
-        pg.evaluate("""()=>{const c=[...document.querySelectorAll('#setPanel .card')]
-          .find(x=>x.querySelector('input[type=number][max="65535"]'));
-          [...c.querySelectorAll('.btn')].find(b=>/Test connection/.test(b.textContent)).click()}""")
-        pg.wait_for_timeout(1200)
-        pg.eval_on_selector("#sClose", "e=>e.click()"); pg.wait_for_timeout(250)
-
-        # ---- 11g. import the ZenPilot profiles that are actually open, instead of typing them ----
-        zinfo = pg.evaluate("async()=>await (await fetch('/api/browser/profiles')).json()")
-        check("profiles endpoint says whether ZenPilot is installed",
-              zinfo.get("ok") is True and isinstance(zinfo.get("installed"), bool), str(zinfo)[:160])
-        check("profiles endpoint carries the page that sells ZenPilot",
-              zinfo.get("get_url") == "https://anzenpilot.gumroad.com/l/zenpilot", str(zinfo.get("get_url")))
-        check("profiles endpoint answers with a list and an up flag, never a guess",
-              isinstance(zinfo.get("profiles"), list) and isinstance(zinfo.get("up"), bool), str(zinfo)[:160])
-
-        stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CDPStub)
-        threading.Thread(target=stub.serve_forever, daemon=True).start()
-        sport = stub.server_address[1]
-        # The stub port goes into the real settings for the length of this block, so the restore
-        # has to happen even if a check below blows up -- otherwise the user's browser config is
-        # left pointing at a port that stopped listening when this test ended.
-        try:
-            pg.evaluate("async(p)=>await (await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-                        "body:JSON.stringify({settings:{browser:{mode:'cdp',port:Number(p)}}})})).json()",
-                        str(sport))
-            live = pg.evaluate("async()=>await (await fetch('/api/browser/profiles')).json()")
-            check("a running ZenPilot's profiles are listed by host",
-                  live.get("up") is True and [x.get("host") for x in live.get("profiles", [])] == ["gemini.google.com"],
-                  str(live)[:200])
-            check("the devtools page target is not mistaken for a profile",
-                  all("devtools" not in (x.get("host") or "") for x in live.get("profiles", [])), str(live.get("profiles"))[:160])
-
-            pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
-            pg.eval_on_selector("#tab-browser", "e=>e.click()"); pg.wait_for_timeout(600)   # Browser
-            check("the browser card offers to import ZenPilot profiles",
-                  pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')].some(b=>/Import profiles/.test(b.textContent))"))
-            glink = pg.evaluate("()=>{const a=document.querySelector('#setPanel [data-a=\"zp-get\"]');return a?a.getAttribute('href'):''}")
-            check("the card links to where ZenPilot can be got",
-                  glink == "https://anzenpilot.gumroad.com/l/zenpilot", str(glink))
-            check("no 'not installed' warning when ZenPilot is actually here",
-                  pg.evaluate("()=>getComputedStyle(document.querySelector('#setPanel .zpwarn')).display") == "none")
-            pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')].find(b=>/Import profiles/.test(b.textContent)).click()")
-            pg.wait_for_timeout(700)
-            rows = pg.eval_on_selector_all(".modal.pick .blist .sk b", "els=>els.map(e=>e.textContent)")
-            check("the import picker lists the profiles ZenPilot has open", rows == ["gemini.google.com"], str(rows))
-            pg.evaluate("()=>[...document.querySelectorAll('.modal.pick .bfoot .btn')].find(b=>/Import selected/.test(b.textContent)).click()")
-            pg.wait_for_timeout(700)
-            check("importing closes the picker", pg.evaluate("()=>!document.querySelector('.modal.pick')"))
-            pin = pg.evaluate("async()=>(await (await fetch('/api/browser')).json()).target_url")
-            check("importing pins the chosen profile for the bots", pin == "gemini.google.com", str(pin))
-            shown = pg.evaluate("()=>{const i=[...document.querySelectorAll('#setPanel input')].find(x=>/Profiles to keep/.test(x.placeholder||''));return i?i.value:''}")
-            check("the pin field shows what was imported", shown == "gemini.google.com", str(shown))
-        finally:
-            pg.evaluate("async(b)=>await (await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-                        "body:JSON.stringify({settings:{browser:b}})})).json()",
-                        {"mode": binfo.get("mode", "own"), "port": binfo.get("port", 9222),
-                         "target_url": binfo.get("target_url", "")})
-            stub.shutdown()
-        back = pg.evaluate("async()=>(await (await fetch('/api/browser')).json())")
-        check("the browser settings the test borrowed are handed back",
-              back.get("cdp_url") == binfo.get("cdp_url") and back.get("port") == binfo.get("port"), str(back)[:160])
-        pg.eval_on_selector("#sClose", "e=>e.click()"); pg.wait_for_timeout(250)
-
-        # ---- 11h. ZenPilot missing: a warning the user can act on, not a silent wrong browser ----
-        pg.route("**/api/browser/profiles", lambda r: r.fulfill(status=200, content_type="application/json",
-            body=json.dumps({"ok": True, "installed": False, "app": "", "cdp_url": "http://127.0.0.1:9222",
-                             "up": False, "profiles": [], "get_url": "https://anzenpilot.gumroad.com/l/zenpilot",
-                             "err": "refused", "hint": "nothing is listening on that port yet"})))
-        # The warning is about the CDP route: in "own" mode ZenPilot is irrelevant, so the card hides
-        # it. Put the server in cdp mode for this block, and hand the mode back at the end.
-        pg.evaluate("async()=>await (await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-                    "body:JSON.stringify({settings:{browser:{mode:'cdp',port:9222}}})})).json()")
-        pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
-        pg.eval_on_selector("#tab-browser", "e=>e.click()"); pg.wait_for_timeout(900)   # Browser
-        warn = pg.evaluate("()=>{const w=document.querySelector('#setPanel .zpwarn');return w?{d:getComputedStyle(w).display,t:w.innerText}:null}")
-        check("a missing ZenPilot raises a warning on the card", bool(warn) and warn["d"] != "none", str(warn))
-        check("the warning says ZenPilot is not installed and how to get it",
-              "not installed" in warn["t"] and "anzenpilot.gumroad.com/l/zenpilot" not in warn["t"], str(warn["t"])[:120])
-        check("the warning carries a Get ZenPilot button that opens the shop page",
-              pg.evaluate("()=>{const a=document.querySelector('#setPanel [data-a=\"zp-get\"]');"
-                          "return a&&a.getAttribute('href')==='https://anzenpilot.gumroad.com/l/zenpilot'"
-                          "&&a.getAttribute('target')==='_blank'}"))
-        check("the status line points at the warning instead of a raw connect error",
-              "not installed" in pg.evaluate("()=>document.querySelector('#setPanel .card .desc:last-of-type').textContent").lower()
-              or "not installed" in pg.evaluate("()=>[...document.querySelectorAll('#setPanel .desc')].map(e=>e.textContent).join(' ')").lower(),
-              pg.evaluate("()=>[...document.querySelectorAll('#setPanel .desc')].map(e=>e.textContent).join(' | ')")[:160])
-        pg.evaluate("()=>[...document.querySelectorAll('#setPanel .btn')].find(b=>/Import profiles/.test(b.textContent)).click()")
-        pg.wait_for_timeout(700)
-        dead = pg.evaluate("()=>{const m=document.querySelector('.modal.pick');return m?{t:m.innerText,rows:m.querySelectorAll('.blist .sk').length,use:!!m.querySelector('[data-a=\"use\"]')}:null}")
-        check("importing without ZenPilot explains why and offers no dead picker",
-              bool(dead) and dead["rows"] == 0 and not dead["use"] and "not installed" in dead["t"], str(dead)[:180])
-        check("the dead end still links to the shop page",
-              pg.evaluate("()=>{const a=document.querySelector('.modal.pick a');return a?a.getAttribute('href'):''}") == "https://anzenpilot.gumroad.com/l/zenpilot")
-        pg.evaluate("()=>document.querySelector('.modal.pick .x').click()"); pg.wait_for_timeout(200)
-        pg.eval_on_selector("#sClose", "e=>e.click()"); pg.wait_for_timeout(200)
-        pg.unroute("**/api/browser/profiles")
-        pg.evaluate("async(b)=>await (await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
-                    "body:JSON.stringify({settings:{browser:b}})})).json()",
-                    {"mode": binfo.get("mode", "own"), "port": binfo.get("port", 9222)})
+        saved = pg.evaluate("async()=>await (await fetch('/api/browser/accounts',{method:'POST',"
+                            "headers:{'Content-Type':'application/json'},"
+                            "body:JSON.stringify({accounts:[{name:'E2E acct',sites:'example.com'}]})})).json()")
+        check("the panel's rows save to the default list",
+              saved.get("ok") and saved.get("accounts") == [{"name": "E2E acct", "sites": "example.com"}], str(saved)[:160])
+        pg.evaluate("async()=>await fetch('/api/channel',{method:'POST',headers:{'Content-Type':'application/json'},"
+                    "body:JSON.stringify({channel:{id:'e2e-room',name:'E2E Room',browser:[{name:'Room acct',sites:'room.com'}]}})})")
+        rsaved = pg.evaluate("async()=>await (await fetch('/api/browser/accounts',{method:'POST',"
+                             "headers:{'Content-Type':'application/json'},"
+                             "body:JSON.stringify({room:'e2e-room',accounts:[{name:'Room 2',sites:'r2.com'}]})})).json()")
+        room_row = pg.evaluate("async()=>((await (await fetch('/api/config')).json()).channels||[]).find(c=>c.id==='e2e-room')")
+        check("a room's rows save to that room",
+              rsaved.get("ok") and room_row.get("browser") == [{"name": "Room 2", "sites": "r2.com"}], str(room_row)[:200])
+        check("  ...and the default list is left alone",
+              pg.evaluate("async()=>(await (await fetch('/api/browser/own')).json()).profiles.some(p=>p.name==='E2E acct')"))
+        bad_room = pg.evaluate("async()=>(await (await fetch('/api/browser/accounts',{method:'POST',"
+                               "headers:{'Content-Type':'application/json'},"
+                               "body:JSON.stringify({room:'no-such-room',accounts:[]})})).json())")
+        check("an unknown room is refused, not written to the default list", not bad_room.get("ok"), str(bad_room))
+        pg.evaluate("async()=>await fetch('/api/channel/delete',{method:'POST',headers:{'Content-Type':'application/json'},"
+                    "body:JSON.stringify({id:'e2e-room'})})")
+        pg.evaluate("async()=>await fetch('/api/browser/accounts',{method:'POST',headers:{'Content-Type':'application/json'},"
+                    "body:JSON.stringify({accounts:[]})})")
 
         # ---- 11i. Phone & tablet: the switch really opens the door the Android app comes through ----
         # The card is the whole setup path for the phone — no terminal, no flag — so it is checked
@@ -2105,6 +1985,16 @@ def main():
             id: li.dataset.id,
             sp: (li.querySelector('canvas.sidebot')||{dataset:{}}).dataset.species || null }))""")
         check("every sidebar bot draws a live face", len(faces) > 0 and all(f["sp"] for f in faces), str(faces[:4]))
+        # The CHATS list is a second place a bot's face is shown, and it used to draw a generic
+        # glyph there: setting a face changed the ROOMS row and nothing else. A direct chat now
+        # paints the bot's own face; a room keeps its icon.
+        chatfaces = pg.evaluate("""()=>[...document.querySelectorAll('#chats li.chat')].map(li=>({
+            id: li.dataset.id, canvas: !!li.querySelector('canvas.ck.face')}))""")
+        direct = [c for c in chatfaces if "/" in c["id"]]
+        check("a direct chat in the chats list draws its bot's face",
+              len(direct) > 0 and all(c["canvas"] for c in direct), str(chatfaces[:4]))
+        check("...and a room keeps its icon",
+              all(not c["canvas"] for c in chatfaces if c["id"] == "company"), str(chatfaces[:4]))
         defaults = {f["id"].split("/").pop(): f["sp"] for f in faces
                     if f["id"].split("/").pop() in ("producer","researcher","builder","qa","ops")}
         check("the five default bots each look different",

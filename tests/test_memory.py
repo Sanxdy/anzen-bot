@@ -4,19 +4,22 @@
 No router needed — server.chat is stubbed.  Usage:  python3 tests/test_memory.py
 """
 import os, sys, tempfile, base64
+tmp = tempfile.mkdtemp()
+os.environ["DATA_DIR"] = tmp                        # nothing may fall back to the real data dir
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server as S
 
-tmp = tempfile.mkdtemp()
 S.MEMDIR = tmp
 S.SESS_PATH = os.path.join(tmp, "sessions.json")   # keep run_agent's sessions out of the real data dir
 S.BOTS_PATH = os.path.join(tmp, "bots.json")       # keep build_team's bots out of the real data dir
 S.CH_PATH = os.path.join(tmp, "channels.json")
 S.AVATAR_DIR = os.path.join(tmp, "avatars")        # an uploaded avatar must not land in the real one
 S.LOGO_DIR = os.path.join(tmp, "logos")
+S.FACES_DIR = os.path.join(tmp, "faces")           # neither may a generated face
+S.FACES_BATCH_PATH = os.path.join(S.FACES_DIR, "batch.json")
 # run_agent now works in a per-bot folder and logs the turn, so both need a home inside tmp
 S.SANDBOX = os.path.join(tmp, "sandbox"); os.makedirs(S.SANDBOX)
-S.LOGDIR = os.path.join(tmp, "logs"); os.makedirs(S.LOGDIR)
+S.LOGDIR = os.path.join(tmp, "logs"); os.makedirs(S.LOGDIR, exist_ok=True)
 assert S.LOGDIR.startswith(tmp) and S.SANDBOX.startswith(tmp), "a bot's field and log must stay in tmp"
 PASS = FAIL = 0
 def ok(name, cond):
@@ -320,18 +323,25 @@ ok("...an accessory", _pub["accessory"] == "")
 ok("...and no avatar version", _pub["avatar"] == 0)
 ok("a bot with an outfit keeps it", S.H._bots_public(None, [{"id": "n", "outfit": "hoodie"}])[0]["outfit"] == "hoodie")
 
-# --- Bot faces: the photo decides the animal, and a chosen face beats an older picture ---
+# --- Bot faces: a head only, and a chosen face beats an older picture ---
 # The prompt used to name the bot's engine species ("Species: owl"), and the model obeyed it over
 # the photo: a cat came back as an owl. The species is still passed in (the caller has it) but it
 # must not reach the prompt.
 _p = S.face_prompt("owl", "purple", 0, 3)
 ok("the face prompt does not name the bot's species", "owl" not in _p and "Species:" not in _p)
-ok("the face prompt keeps the animal in the photo", "SAME ANIMAL" in _p and "never change its species" in _p)
-ok("the bot's colour is only an accent, not a recolour", "Only a collar" in _p and "purple" in _p)
-ok("...and a run with no colour says nothing about one", "Only a collar" not in S.face_prompt("", "", 0, 1))
+ok("the face prompt asks for a head and hair, never a body",
+   "HEAD AND HAIR ONLY" in _p and "no body" in _p)
+ok("the face prompt keeps the animal in the photo", "Redraw the subject of the photo" in _p)
+ok("the face prompt demands the ink outline the backdrop key stops at", "ink outline" in _p)
+ok("the face prompt varies the expression, not the body", S.FACE_EXPRESSIONS[0] in _p)
+ok("the expressions cycle per bot",
+   S.FACE_EXPRESSIONS[0] in S.face_prompt("", "", len(S.FACE_EXPRESSIONS), 9))
+ok("the shut-eye prompt changes only the eyes", "change ONLY the eyes" in S.face_closed_prompt())
+ok("the avatar prompt no longer names a species or a colour",
+   "Species:" not in S.avatar_prompt("owl", "purple") and "Colour:" not in S.avatar_prompt("owl", "purple"))
 
 S.save_avatar("fb1", _data("image/png", PNG))
-_b = {"id": "fb1", "genface": "", "avatar": 7}
+_b = {"id": "fb1", "genface": "", "genface_closed": "", "avatar": 7}
 S.set_genface(_b, "f-1-1.png")
 ok("a face from the set lands on the bot", _b["genface"] == "f-1-1.png")
 ok("...and it drops an older per-bot picture that would have outranked it", _b["avatar"] == 0)
@@ -339,6 +349,47 @@ ok("...including the stored file, so nothing is left behind",
    not os.path.isfile(os.path.join(S.AVATAR_DIR, "fb1.png")))
 S.set_genface(_b, "")
 ok("clearing a face puts the bot back on its drawn bot", _b["genface"] == "")
+
+# The shut-eye frame is a sibling file, not a record of its own: the face name finds it, and losing
+# the face loses the blink with it.
+os.makedirs(S.FACES_DIR, exist_ok=True)
+for f in ("f-1-1.png", "f-1-1-closed.png"):
+    open(os.path.join(S.FACES_DIR, f), "wb").write(PNG)
+S.set_genface(_b, "f-1-1.png")
+ok("a face finds its shut-eye frame beside it", _b["genface_closed"] == "f-1-1-closed.png")
+S.set_genface(_b, "")
+ok("...and clearing the face clears the shut-eye frame", _b["genface_closed"] == "")
+os.remove(os.path.join(S.FACES_DIR, "f-1-1-closed.png"))
+S.set_genface(_b, "f-1-1.png")
+ok("a face with no shut-eye frame simply does not blink", _b["genface_closed"] == "")
+
+open(os.path.join(S.FACES_DIR, "f-1-1-closed.png"), "wb").write(PNG)
+S._save_json(S.FACES_BATCH_PATH, {"files": ["f-1-1.png", "f-1-1-closed.png"]})
+ok("the picker lists one entry per bot, not its blink frame",
+   S.faces_batch()["files"] == ["f-1-1.png"])
+S._faces_prune(["f-1-1.png"])
+ok("pruning keeps the shut-eye frame of a kept face",
+   os.path.isfile(os.path.join(S.FACES_DIR, "f-1-1-closed.png")))
+S._faces_prune([])
+ok("...and drops it with the face",
+   not os.path.isfile(os.path.join(S.FACES_DIR, "f-1-1-closed.png")))
+
+# The other direction of the same rule: a picture is the newer choice, so it clears the drawing
+# rather than losing to it — otherwise introducing a photo in the bot editor would look like it
+# did nothing, which is exactly how it was reported.
+_b = {"id": "fb1", "genface": "f-1-1.png", "genface_closed": "f-1-1-closed.png", "avatar": 0}
+S.set_avatar(_b, _data("image/png", PNG))
+ok("a bot's own picture clears the set's drawing",
+   _b["genface"] == "" and _b["genface_closed"] == "")
+ok("...and becomes its avatar", _b["avatar"] > 0)
+
+S._save_image(S.AVATAR_DIR, "fb1-closed", _data("image/png", PNG))
+_av = S.avatar_state({"id": "fb1"})
+ok("a picture reports its shut-eye frame and its version",
+   bool(_av["closed_path"]) and _av["closed_v"] > 0)
+S.remove_avatar("fb1")
+ok("removing the picture removes its shut-eye frame too",
+   not os.path.isfile(os.path.join(S.AVATAR_DIR, "fb1-closed.png")))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

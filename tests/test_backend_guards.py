@@ -180,6 +180,23 @@ refused = S.run_shell("cat " + S.TOKEN_PATH)
 ok("run_shell turns the read away", isinstance(refused, tuple) and refused[1] == 1, refused)
 ok("...with the refusal itself as its text", refused[0] == "(refused: %s)" % S.SECRET_REFUSAL, refused)
 
+print("--- no bot reaches another browser's profile, cookies or keychain ---")
+# A bot browses with the browser this app launches. It read Arc's profile off disk through
+# `run_shell`, so another browser's data is now a refusal of the same kind as the secret store: the
+# answer cannot change the outcome, so no card is raised for it. Ordinary work that merely mentions
+# cookies or a browser is untouched, or the guard would refuse half of a front-end repo.
+for cmd in ("ls ~/Library/Application Support/Arc/User Data/Profile 2",
+            'sqlite3 ~/Library/Application\\ Support/Arc/User\\ Data/Profile\\ 2/Cookies "select 1"',
+            "cat '/Users/x/Library/Application Support/Google/Chrome/Default/Login Data'",
+            "sqlite3 ~/.mozilla/firefox/abc/cookies.sqlite .dump",
+            "ls ~/Library/Safari/History.db",
+            "security find-internet-password -s premierleague.com"):
+    ok("refused: " + cmd[:48], S.shell_refused(cmd) is True)
+for cmd in ("grep -rn Cookies app.js", "cat docs/cookies.md", "git log --oneline", "ls -la"):
+    ok("allowed: " + cmd, S.shell_refused(cmd) is False)
+fb = S.run_shell("ls ~/Library/Application Support/Arc")
+ok("run_shell turns the Arc read away", fb[1] == 1 and "another browser" in fb[0], fb)
+
 print("--- the app stopping the bot is recognised, and the bot's own failure is not ---")
 # `exec_tool` hands `run_shell`'s result on prefixed with its own exit code, which is the shape the
 # loop actually sees. Each of these is the app refusing rather than the command failing; a plain
@@ -277,6 +294,35 @@ ok("a delegation to a member still runs",
 ok("...and its report reaches the lead", any("dev did it" in h for h in handed), handed)
 ok("...with no refusal raised", not any(e.get("type") == "notice" for e in evs2), evs2)
 ok("...and the lead still lands its own turn", out2.get("text") == "landed", out2.get("text"))
+
+print("--- a lead can hand a task to every teammate, not just the first three ---")
+# The lead's brief says "at most once per teammate per turn", and that is the whole rule. A hard cap
+# of three on top of it turned a six-bot room into a three-bot room: the three it cut off were told
+# "delegation limit reached" and reported nothing, which reads as a team that ignored the job.
+S.save_bots([{"id": "lead", "name": "Lead", "model": "m", "instructions": "l", "approval": "full",
+              "memory": False, "skills": []}] +
+            [{"id": "m%d" % i, "name": "M%d" % i, "model": "m", "instructions": "x",
+              "approval": "full", "memory": False, "skills": []} for i in range(1, 7)])
+S.save_channels([{"id": "big-room", "name": "Big Room", "lead": "lead", "mode": "lead",
+                  "members": ["lead"] + ["m%d" % i for i in range(1, 7)],
+                  "instructions": "", "folder": ""}])
+BIG = S.load_bots()
+def big_stub(model, messages, tools=None, max_tokens=1600):
+    """The lead hands out six tasks in one step; each member answers, then the lead lands."""
+    if "You are Lead." not in messages[0]["content"]: return {"content": "did it", "tool_calls": []}
+    if any(m.get("role") == "tool" for m in messages): return {"content": "landed", "tool_calls": []}
+    return {"content": "", "tool_calls": [
+        {"id": "t%d" % i, "function": {"name": "delegate",
+                                       "arguments": json.dumps({"role": "m%d" % i, "task": "audit it"})}}
+        for i in range(1, 7)]}
+S.chat = big_stub
+big_out = {}
+big_evs = list(S.run_agent("big-room", "lead", "ship it", "", big_out, BIG, {}, 0))
+S.chat = real_chat
+started = [e["id"] for e in big_evs if e.get("type") == "agent" and e.get("state") == "start"]
+ok("every member of a six-bot team is handed its task", started == ["m%d" % i for i in range(1, 7)], started)
+ok("...and none is refused for a limit", not any("delegation limit" in json.dumps(e) for e in big_evs), big_evs)
+ok("...so the lead still lands its own turn", big_out.get("text") == "landed", big_out.get("text"))
 
 print("--- a call the app turns away for its shape is reported, not just drawn ---")
 # The same silent-stop gap the refusal work closed, one layer earlier: a call whose arguments do not

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Checks for the Browser card's account rows.
+"""Checks for the Computer panel's account rows.
 
 The complaint this answers: you sign in, and the row still says "Sign in" — with no hint that closing
 the window is what saves the login, and no way to tell whether it worked. So the claim under test is
 that the row says what actually happened and what to do next, and that it notices a sign-in by itself.
 
-Drives the real Settings card in a real browser against a real server, in this process so the
+Drives the real Computer panel in a real browser against a real server, in this process so the
 throwaway site can be one the app knows how to judge — the branch a real site like x.com lands in.
 The local page plays a real site: it hands out a tracking cookie to everyone, and its sign-in cookie
 only on the login page. Nothing here touches the internet.
@@ -77,7 +77,7 @@ try:
                      # browser, so these two share one — and the site has to come from the row clicked.
                      {"name": "Local", "sites": "localhost:%d" % site.server_address[1]}]}}})
     # The mode is read when the browser attaches, so it has to be restarted for the server to be in
-    # profiles mode — the same thing the card's own mode selector does.
+    # profiles mode — the same thing the old settings card did.
     api("/api/browser/restart", {})
     # "Unknown" is a site the app ships no sign-in cookie for, and it has been opened once already —
     # a folder with nothing saved in it. That is the state whose row used to answer "opened", which
@@ -91,8 +91,7 @@ try:
         pg.on("pageerror", lambda e: errs.append(str(e)))
         pg.goto("http://127.0.0.1:%d/" % PORT, wait_until="domcontentloaded")
         pg.wait_for_timeout(1200)
-        pg.click("#btnSettings"); pg.click("#tab-browser"); pg.wait_for_timeout(700)
-        card = pg.locator(".card", has=pg.locator("b", has_text="Browser")).first
+        pg.click("#btnComp"); pg.wait_for_timeout(900)
         def row_for(i):
             return pg.locator('input[placeholder="Account name"]').nth(i).locator("xpath=ancestor::div[1]")
         fresh, local, unknown = row_for(0), row_for(1), row_for(2)
@@ -100,8 +99,9 @@ try:
             return (r.locator("span.desc").inner_text(), r.locator("button").first.inner_text().strip(),
                     r.locator("span.desc").get_attribute("title") or "")
 
-        check("the card says what to do after signing in, including closing the window",
-              "close the window" in card.inner_text(), card.inner_text()[:400])
+        hint0 = pg.locator("#compAccHint").inner_text()
+        check("the panel says what the accounts are for",
+              "accounts" in hint0 and ("room" in hint0 or "chat with one bot" in hint0), hint0[:400])
         t, btn, why = state(fresh)
         check("an account never opened says so, and the button offers the sign-in",
               t == "Not signed in yet" and btn == "Sign in", "%r / %r" % (t, btn))
@@ -131,7 +131,7 @@ try:
             pg.wait_for_timeout(1000)
             if "Signed in" in state(local)[0]: break
         t, btn, why = state(local)
-        check("the card notices the sign-in by itself, with no click and no refresh",
+        check("the panel notices the sign-in by itself, with no click and no refresh",
               "Signed in" in t and btn == "Open window", "%r / %r" % (t, btn))
         check("  ...and says the window is still open, because it is",
               "window is open" in t, t)
@@ -179,8 +179,8 @@ try:
         row_for(3).locator("button").first.click()
         for _ in range(40):
             pg.wait_for_timeout(500)
-            if "localhost" in pg.locator("#browserNote").inner_text(): break
-        note = pg.locator("#browserNote").inner_text()
+            if "localhost" in pg.locator("#compAccSay").inner_text(): break
+        note = pg.locator("#compAccSay").inner_text()
         check("the row's own site is what opens, not the first site of the name it shares",
               "https://localhost:%d" % site.server_address[1] in note, note[:300])
         check("  ...and it is not the other row's site",
@@ -200,19 +200,33 @@ try:
               room["profiles"][0]["hosts"] == ["example.com"], room["profiles"][0]["hosts"])
         check("the machine-wide list still answers for a chat outside a room",
               len(api("/api/browser/own")["profiles"]) > 1, api("/api/browser/own")["profiles"])
-        check("a room with no accounts still falls back to the machine-wide ones",
-              S._room_routes(api("/api/config")["channels"][0]) is None)
+        # The complaint that made this move: the accounts were one machine-wide list in a Settings tab
+        # that no longer exists. The page opens on a room, so the rows it showed were that room's
+        # fallback — and the first edit in its panel must adopt them onto the room, not vanish.
+        seeded = [c for c in api("/api/config")["channels"] if c["id"] == "company"][0]
+        check("the first edit in a room's panel gives that room the rows it was showing",
+              [a["name"] for a in seeded["browser"]] == ["Fresh", "Local", "Unknown", "Local", "local"],
+              seeded["browser"])
+        check("  ...and a room with none left still falls back rather than losing its routing",
+              S._room_routes({"browser": []}) is None)
 
-        # The room editor itself: the Browser section is there, and its rows belong to the room.
-        pg.click("#sClose"); pg.wait_for_timeout(400)
-        pg.click("#btnSettings"); pg.click("#tab-channels"); pg.wait_for_timeout(700)
-        pg.locator("button", has_text="Edit").first.click(); pg.wait_for_timeout(900)
-        panel = pg.locator("#setPanel")
-        check("the room editor has a Browser section", "Browser" in panel.inner_text(),
-              panel.inner_text()[:600])
-        check("  ...and says what an empty list means",
-              "machine-wide" in panel.inner_text(), panel.inner_text()[:900])
-        check("  ...and no JavaScript error was raised opening it", not errs, errs)
+        # The panel itself is where those rows live now, scoped to the chat you are in. It replaced
+        # both the room editor's Browser section and the Settings → Browser tab, so neither may exist.
+        pg.reload(wait_until="domcontentloaded"); pg.wait_for_timeout(1400)
+        pg.click("#btnComp"); pg.wait_for_timeout(1000)
+        names = lambda: pg.locator('#compAcc input[placeholder="Account name"]').evaluate_all("e => e.map(x => x.value)")
+        check("a one-bot chat's panel shows the default accounts", "Local" in names(), names())
+        pg.click('#chans li.bot[data-id="promo"]'); pg.wait_for_timeout(900)   # a press outside closes the panel
+        pg.click("#btnComp"); pg.wait_for_timeout(1000)
+        check("switching to a room swaps the panel's rows for that room's",
+              names() == ["Room acct"], names())
+        check("  ...and the hint names the room the rows belong to",
+              "Promo" in pg.locator("#compAccHint").inner_text(),
+              pg.locator("#compAccHint").inner_text())
+        pg.click("#btnSettings"); pg.wait_for_timeout(500)
+        check("Settings no longer has a Browser tab",
+              pg.locator("#tab-browser").count() == 0, pg.locator("#tabBrowserNav").count())
+        check("no JavaScript error was raised while doing any of that", not errs, errs)
         b.close()
 finally:
     try:

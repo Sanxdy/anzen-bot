@@ -424,33 +424,6 @@ ok("the skill is switched off on every bot", "pdf-toolkit" not in (S.load_bots()
 ok("uninstalling something that is not installed is a clean no", S.remove_skill("ghost-skill") is False)
 S.save_bots([])
 
-# --- ZenPilot: found on disk or not, and the profile list never invents anything ---
-empty = tempfile.mkdtemp()
-ok("ZenPilot is reported missing when it is not in any of the looked-at folders",
-   S.zenpilot_app(bases=(empty,)) == "")
-have = tempfile.mkdtemp(); os.makedirs(os.path.join(have, "Zen Pilot.app"))
-ok("ZenPilot is found by its app bundle", S.zenpilot_app(bases=(have,)) == os.path.join(have, "Zen Pilot.app"))
-ok("a folder that cannot be listed is skipped, not fatal", S.zenpilot_app(bases=(os.path.join(empty, "nope"), have)) != "")
-_s = S.load_settings(); _s["browser"] = {"mode": "cdp", "port": 9}
-_save_raw(_s)
-bp = S.browser_profiles()
-ok("the profile list says it is ok even when nothing is reachable", bp["ok"] is True)
-ok("an unreachable debug port is reported as down, with a reason",
-   bp["up"] is False and bool(bp["err"]), str(bp)[:120])
-ok("no profiles are invented when the port is down", bp["profiles"] == [])
-ok("the profile list hands back the page that says where to get ZenPilot",
-   bp["get_url"] == "https://anzenpilot.gumroad.com/l/zenpilot")
-ok("a refused connection is explained in a sentence, not a stack trace",
-   "listening on that port" in bp["hint"] and "ECONNREFUSED" not in bp["hint"], str(bp.get("hint")))
-ok("a missing browser engine names the command that installs it",
-   "playwright install" in S.browser_hint("Executable doesn't exist ... playwright not installed"))
-ok("an unknown failure is still said out loud", S.browser_hint("weird thing") == "weird thing")
-ok("no error at all reads as still starting", "starting" in S.browser_hint(""))
-ok("the endpoint is derived from the port, not typed twice",
-   S.BROWSER._cfg() == ("cdp", "http://127.0.0.1:9"), str(S.BROWSER._cfg()))
-_save_raw({**S.load_settings(), "browser": {"mode": "own", "port": 9222}})
-ok("own mode is left alone", S.BROWSER._cfg() == ("own", "http://127.0.0.1:9222"), str(S.BROWSER._cfg()))
-
 # A click whose selector matched nothing used to spend the full 12s actionability timeout and come
 # back as a Playwright wall — which is most of what "the Top tab click returned nothing before time
 # ran out" was. And the page it returned was read after a fixed 800ms sleep, so a tab that swaps the
@@ -491,36 +464,19 @@ ok("a value that fits is handed over whole",
    S.BROWSER.eval("1", max_chars=400) == '{"a": "' + "x" * 100 + '"}')
 S.BROWSER.page = _keep_page
 
-# --- the launch command is built from the port, so the two can never name different ports ---
-cmd = S.zenpilot_launch_cmd(9333)
-ok("the launch command opens the app with the debug flag",
-   cmd == ["open", "-a", "Zen Pilot", "--args", "--remote-debugging-port=9333"], str(cmd))
-ok("the port appears in the command exactly once",
-   sum("9333" in a for a in cmd) == 1, str(cmd))
-ok("a found app bundle is launched by its path, not its name",
-   S.zenpilot_launch_cmd(9222, "/Applications/Zen Pilot.app")[2] == "/Applications/Zen Pilot.app",
-   str(S.zenpilot_launch_cmd(9222, "/Applications/Zen Pilot.app")))
-ok("the command is an argv, so nothing needs quoting", isinstance(cmd, list) and all(isinstance(a, str) for a in cmd))
-ok("a nonsense port falls back to the default instead of building a broken command",
-   S.browser_port({"port": 0}) == 9222 and S.browser_port({"port": "abc"}) == 9222
-   and S.browser_port({"port": 70000}) == 9222 and S.browser_port({"port": "9333"}) == 9333)
-
-# --- a save from before the change is folded onto the one port, not left to disagree ---
+# --- a save from the retired CDP mode is moved onto saved profiles ---
 def _migrated(br):
     _save_raw({"browser": br})
     return S.load_settings()["browser"]
-m = _migrated({"mode": "cdp", "port": 8009, "launch_cmd": 'open -a "Zen Pilot" --args --remote-debugging-port=9222'})
-ok("the port the launch command actually opened wins over a stale port field",
-   m["port"] == 9222, str(m))
-ok("the retired launch command is dropped from the save", "launch_cmd" not in m, str(m))
-m = _migrated({"mode": "cdp", "port": 9222, "cdp_url": "http://127.0.0.1:8009"})
-ok("a CDP URL's port is adopted too", m["port"] == 8009, str(m))
-ok("the retired CDP URL is dropped from the save", "cdp_url" not in m, str(m))
-m = _migrated({"mode": "cdp", "port": 9333, "launch_cmd": 'open -a "Zen Pilot" --args --remote-debugging-port=9333'})
-ok("a save that already agreed keeps its port", m["port"] == 9333, str(m))
-m = _migrated({"mode": "cdp", "port": 9333})
-ok("a save with no legacy keys is left alone", m["port"] == 9333 and "launch_cmd" not in m, str(m))
-_save_raw({**S.load_settings(), "browser": {"mode": "own", "port": 9222}})
+m = _migrated({"mode": "cdp", "port": 8009, "target_url": "www.youtube.com", "profile": "default",
+               "launch_cmd": 'open -a "Zen Pilot" --args --remote-debugging-port=9222'})
+ok("a save that still says cdp comes back as saved profiles", m["mode"] == "profiles", str(m))
+ok("the fields only that mode used are retired",
+   not [k for k in ("port", "target_url", "profile", "launch_cmd", "cdp_url") if k in m], str(m))
+ok("the older name of that mode is moved the same way", _migrated({"mode": "zenpilot"})["mode"] == "profiles")
+m = _migrated({"mode": "own", "accounts": [{"name": "A", "sites": "x.com"}]})
+ok("a save already on a live mode is left alone",
+   m["mode"] == "own" and m["accounts"] == [{"name": "A", "sites": "x.com"}], str(m))
 
 # --- the dead engines list is retired, not merely hidden ---
 # It was a list of engine rows with on/off toggles that nothing read: every turn goes to the router in
@@ -533,181 +489,27 @@ ok("a save that still carries the engines list comes back without it", "engines"
 # The browser is served load_settings() through settings_public, so the retirement above is what
 # keeps an engine list out of /api/config — nothing downstream has to remember to strip it.
 ok("the whole load -> serve path carries no engine list", "engines" not in S.settings_public(_retired))
-_save_raw({**S.load_settings(), "browser": {"mode": "own", "port": 9222}})
+_save_raw({**S.load_settings(), "browser": {"mode": "own"}})
 
-# --- the Computer panel is a live screen: the bot's own profile when it is on screen, otherwise
-#     the one that is, with a caption saying so -- and it never raises while working that out ---
-# Zen Pilot paints one profile at a time and a hidden <webview> never produces a frame, so the panel
-# used to sit on a 30s blocking capture of a profile that would never answer. `preview()` now tries
-# the bot's own profile briefly and falls back to whatever is actually on screen.
-def _fake_browser(targets, live_ids, own_id):
-    """A Browser whose CDP answers a capture only for the profiles in `live_ids`."""
-    b = S.Browser()
-    b.engine = "webview"; b.target_id = own_id; b.url = "https://bot.example/"
-    class _CDP:
-        def targets(self): return [dict(t) for t in targets]
-        def attach(self, tid): return "sess-" + tid
-        def detach(self, sid): pass
-        def cmd(self, method, params=None, session=None, **kw):
-            tid = (session or "").replace("sess-", "")
-            if method == "Page.captureScreenshot" and tid in live_ids:
-                return {"data": base64.b64encode(b"PNG-" + tid.encode()).decode()}
-            raise RuntimeError("this profile is not on screen in Zen Pilot")
-    class _Page:                      # the bot's own page object, used only when it is the one shown
-        sid = "sess-own"              # `_switch_webview` detaches the previous page's session
-        url = "https://bot.example/"
-        def title(self): return "bot"
-        def screenshot(self, tries=(6, 8)):
-            if own_id in live_ids: return b"PNG-" + own_id.encode()
-            raise RuntimeError("not on screen")
-    b.cdp = _CDP(); b.page = _Page()
-    return b
+# --- the Computer panel shows the page the bot is on, and says so when there is none ---
+class _ShotPage:
+    url = "https://bot.example/"
+    def screenshot(self): return b"PNG"
+    def title(self): return "bot"
+_b = S.Browser(); _b.page = _ShotPage()
+d = json.loads(_b.preview())
+ok("preview shows the page the bot is on",
+   d["png"].startswith("data:image/png") and d["url"] == "https://bot.example/", d)
+ok("...and names the page", d["title"] == "bot" and d["err"] == "", d)
+_b.page = None
+d = json.loads(_b.preview())
+ok("with no page open the panel says so instead of hanging",
+   d["png"] == "" and "no page is open" in d["err"], d)
 
-_own = {"id": "wv-own", "type": "webview", "url": "https://bot.example/", "title": "bot"}
-_other = {"id": "wv-other", "type": "webview", "url": "https://www.youtube.com/", "title": "YouTube"}
-
-d = json.loads(_fake_browser([_own, _other], {"wv-own"}, "wv-own").preview())
-ok("preview shows the bot's own profile when it is on screen", d["png"].startswith("data:image/png") and d["err"] == "", d)
-ok("...and names it", d["url"] == "https://bot.example/", d)
-
-d = json.loads(_fake_browser([_own, _other], {"wv-other"}, "wv-own").preview())
-ok("preview falls back to the profile that is on screen", d["png"].startswith("data:image/png"), d)
-ok("...and says plainly that this is not the bot's own profile",
-   "on screen" in d["err"] and "background" in d["err"], d["err"])
-ok("...and shows the on-screen profile's url, not the bot's", d["url"] == "https://www.youtube.com/", d)
-
-d = json.loads(_fake_browser([_own, _other], set(), "wv-own").preview())
-ok("with nothing on screen the panel says so instead of hanging",
-   d["png"] == "" and "on screen" in d["err"], d)
-
-# the first poll decides; a second poll inside the cache window reuses the choice without re-deciding
-_b = _fake_browser([_own, _other], {"wv-other"}, "wv-own")
-_json = json.loads(_b.preview()); _json2 = json.loads(_b.preview())
-ok("a second poll keeps showing the same profile", _json2["png"] == _json["png"] and _json2["url"] == _json["url"],
-   (_json, _json2))
-
-# --- browser_open goes to the profile that is FOR the site, not whichever profile happens to be open ---
-# Zen Pilot paints one profile at a time, so "the profile showing this site" is the wrong question when
-# the profile for the site is not the one attached: a Threads request used to be opened in the YouTube
-# profile simply because that was the profile on screen, and the request then ran on YouTube's cookies.
-# The app window knows which profile each service belongs to -- that decides now, and a site with no
-# profile is refused instead of being opened in somebody else's.
+# --- a site is the host, so routing can be keyed on it ---
 ok("www is not a different site", S._host("https://www.threads.com/@x") == "threads.com" == S._host("http://threads.com/"))
 ok("a port is not part of the site", S._host("http://127.0.0.1:8899/gallery.html") == "127.0.0.1")
 ok("a blank url has no site at all", S._host("") == "" and S._host("nonsense") == "")
-
-_SHELL = {"id": "shell", "type": "page", "url": "file:///Applications/Zen%20Pilot.app/dist/", "title": "Zen Pilot"}
-_YT = {"id": "wv-yt", "type": "webview", "url": "https://www.youtube.com/", "title": "YouTube"}
-_TH = {"id": "wv-th", "type": "webview", "url": "https://www.threads.com/", "title": "Threads"}
-_SVCS = [{"id": 5, "name": "Youtube", "url": "https://www.youtube.com/"},
-         {"id": 60, "name": "Threads", "url": "https://www.threads.com/"}]
-_PROFS = [{"id": 8, "name": "Dipta Youtube", "service_id": 5},
-          {"id": 74, "name": "ZenPilot Threads", "service_id": 60}]
-
-def _fake_pilot(targets, webviews=(), app="pilot", openable=None):
-    """A Browser attached to a fake Zen Pilot. `webviews` is what the app window reports as open
-    (profile id, url); `openable` maps a profile id to the <webview> that appears once the app is
-    asked to open it, so the not-open-yet path is exercised for real rather than assumed. `app` is
-    "pilot" (the real app), "other" (an Electron app with no profile list) or "dead" (no answer)."""
-    b = S.Browser(); b.engine = "webview"; b.target_id = "wv-yt"; b.url = _YT["url"]
-    tg = list(targets); b.opened = []; b.nav = []; openable = openable or {}
-    class _CDP:
-        def targets(self): return [dict(t) for t in tg]
-        def attach(self, tid): return "sess-" + tid
-        def detach(self, sid): pass
-        def cmd(self, method, params=None, session=None, **kw):
-            if method == "Page.navigate": b.nav.append((session, (params or {}).get("url"))); return {}
-            if method != "Runtime.evaluate": raise RuntimeError(method)
-            if session != "sess-shell": return {"result": {"value": "complete"}}   # a profile: readyState only
-            if app == "dead": raise RuntimeError("the app window did not answer")
-            js = (params or {}).get("expression", "")
-            if "querySelectorAll" in js:
-                return {"result": {"value": [{"p": "persist:profile_%d" % p, "u": u} for p, u in webviews]}}
-            if "profiles.getAll" in js:
-                if app != "pilot": return {"result": {"value": {"api": False, "p": [], "s": [], "r": []}}}
-                return {"result": {"value": {"api": True, "p": _PROFS, "s": _SVCS,
-                                             "r": [p for p, _ in webviews]}}}
-            pid = int(js.split("profiles.open(")[1].split(")")[0])
-            b.opened.append(pid)
-            for t in openable.get(pid, []): tg.append(dict(t))
-            return {"result": {"value": True}}
-    b.cdp = _CDP()
-    class _Page:
-        sid = "sess-own"              # `_switch_webview` detaches the previous page's session
-        url = "https://bot.example/"
-        def goto(self, u, **kw): b.nav.append(("own", u))
-        def wait_for_timeout(self, ms): pass
-        def inner_text(self, s="body"): return "text"
-        def title(self): return "bot"
-    b.page = _Page()
-    return b
-
-_b = _fake_pilot([_SHELL, _YT, _TH], webviews=[(8, _YT["url"]), (74, _TH["url"])])
-ok("a site that is already open attaches to that site's profile",
-   S.Browser._profile_target(_b, "https://www.youtube.com/watch?v=1")[0]["id"] == "wv-yt")
-ok("...and asks the app for nothing", _b.opened == [], _b.opened)
-
-# the reported bug: the Threads profile exists but is not open, and YouTube is the profile attached
-_b = _fake_pilot([_SHELL, _YT], webviews=[(8, _YT["url"])], openable={74: [_TH]})
-_t, _why = S.Browser._profile_target(_b, "https://www.threads.com/@someone")
-ok("a site whose profile is not open resolves to that profile, not the one on screen",
-   _t["id"] == "wv-th" and _why == "", (_t, _why))
-ok("...by asking Zen Pilot to open the profile that is for that site", _b.opened == [74], _b.opened)
-
-_b = _fake_pilot([_SHELL, _YT], webviews=[(8, _YT["url"])], openable={74: [_TH]})
-d = json.loads(S.Browser.open(_b, "https://www.threads.com/@someone"))
-ok("browser_open drives the Threads profile and never navigates the YouTube one",
-   ("sess-wv-th", "https://www.threads.com/@someone") in _b.nav
-   and not any("wv-yt" in s for s, _ in _b.nav), _b.nav)
-
-# a profile left on some other site by an earlier run is still that profile
-_b = _fake_pilot([_SHELL, {"id": "wv-lost", "type": "webview", "url": "https://elsewhere.example/x"}],
-                 webviews=[(74, "https://elsewhere.example/x")])
-ok("a profile that has wandered off its own site is found by what it is, not what it shows",
-   S.Browser._profile_target(_b, "https://www.threads.com/@x")[0]["id"] == "wv-lost")
-ok("...and nothing is opened for it", _b.opened == [], _b.opened)
-
-# a site with no profile of its own resolves to no profile at all, and the profile on screen is left
-# exactly where it was. It is then read anonymously in a throwaway browser rather than refused: a
-# public page needs no login, and refusing it is the dead end that sent the bot off to shell out.
-_b = _fake_pilot([_SHELL, _YT], webviews=[(8, _YT["url"])])
-_t, _why = S.Browser._profile_target(_b, "https://example.com/")
-ok("a site with no Zen Pilot profile resolves to no profile, not another profile", _t is None, _t)
-ok("...and the reason names the sites the profiles are actually for",
-   "no Zen Pilot profile" in _why and "youtube.com" in _why, _why)
-ok("...without asking the app to open anything", _b.opened == [], _b.opened)
-_anon_nav = []
-class _Anon:
-    url = "https://example.com/"
-    def goto(self, u, **kw): _anon_nav.append(u)
-    def wait_for_timeout(self, ms): pass
-    def inner_text(self, s="body"): return "Example Domain"
-    def title(self): return "Example Domain"
-_b._headless = lambda: _Anon()
-d = json.loads(S.Browser.open(_b, "https://example.com/"))
-ok("...and browser_open reads it anonymously instead of refusing",
-   d["text"] == "Example Domain" and "anonymously" in d.get("note", ""), d)
-ok("...in a throwaway browser, never the attached profile",
-   _anon_nav == ["https://example.com/"] and _b.nav == [], (_anon_nav, _b.nav))
-
-# an Electron app that is not Zen Pilot has no profile list, so there is nothing to protect: drive what is open
-_s = S.load_settings(); _s["browser"] = {"mode": "cdp", "port": 9222, "target_url": "www.youtube.com"}
-_save_raw(_s)
-_b = _fake_pilot([_SHELL, _YT], app="other")
-ok("a browser with no profile list still drives the page it has",
-   S.Browser._profile_target(_b, "https://example.com/")[0]["id"] == "wv-yt")
-
-# but an app that simply did not answer must not be read as "no profile list" -- that would navigate
-# the wrong profile, which is the whole bug
-_b = _fake_pilot([_SHELL, _YT], app="dead")
-_t, _why = S.Browser._profile_target(_b, "https://example.com/")
-ok("an app that did not answer is refused, not guessed at", _t is None and "could not read" in _why, _why)
-ok("...and nothing is navigated", _b.nav == [], _b.nav)
-def _boom(): raise AssertionError("must not read anonymously when the app is silent")
-_b._headless = _boom
-ok("...and browser_open refuses it rather than falling back to an anonymous read",
-   "not opened" in json.loads(S.Browser.open(_b, "https://example.com/"))["text"])
-_save_raw({**S.load_settings(), "browser": {"mode": "own", "port": 9222}})
 
 # --- provider keys stay write-only, like connector tokens ---
 pub = S.settings_public({"api_keys": {"xai": "sk-secret"}, "voice": {"key": "vk-secret"},

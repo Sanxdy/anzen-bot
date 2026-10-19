@@ -123,8 +123,18 @@ final class Shell extends FrameLayout {
         ValueCallback<Uri[]> cb = picking;
         picking = null;
         if (cb == null) return;
-        Uri one = result == Activity.RESULT_OK && data != null ? data.getData() : null;
-        cb.onReceiveValue(one == null ? null : new Uri[]{one});
+        Uri[] uris = null;
+        if (result == Activity.RESULT_OK && data != null) {
+            // Several files come back in the clip data; a single one in the intent's own data.
+            android.content.ClipData clip = data.getClipData();
+            if (clip != null) {
+                uris = new Uri[clip.getItemCount()];
+                for (int i = 0; i < uris.length; i++) uris[i] = clip.getItemAt(i).getUri();
+            } else if (data.getData() != null) {
+                uris = new Uri[]{data.getData()};
+            }
+        }
+        cb.onReceiveValue(uris);
     }
 
     // ---- what a page cannot do for itself ------------------------------------------------------
@@ -167,6 +177,8 @@ final class Shell extends FrameLayout {
                 String[] accept = p.getAcceptTypes();
                 if (accept != null && accept.length > 1) i.putExtra(Intent.EXTRA_MIME_TYPES, accept);
                 i.setType(accept != null && accept.length > 0 && accept[0].contains("/") ? accept[0] : "*/*");
+                // The page's input takes several files, so the picker must let you pick several.
+                if (p.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                 try {
                     ((Activity) getContext()).startActivityForResult(
                             Intent.createChooser(i, "Choose a file"), PICK_FILE);

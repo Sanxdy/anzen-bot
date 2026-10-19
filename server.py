@@ -12,7 +12,7 @@ browser tool needs Playwright (optional).
 Run:  python3 server.py
 Env:  PORT, HOST, DATA_DIR, SANDBOX_DIR, ROUTER_URL, ROUTER_KEY, DEFAULT_MODEL, VISION_MODEL
 """
-import json, os, re, select, signal, socket, socketserver, struct, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3, random
+import json, os, re, select, signal, socket, socketserver, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3, random, mimetypes
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
@@ -27,6 +27,9 @@ except Exception: link = None
 VERSION = "1.0.0"
 DATA = os.environ.get("DATA_DIR", os.path.join(HERE, "data"))
 SANDBOX = os.environ.get("SANDBOX_DIR", os.path.join(HERE, "sandbox"))
+# Where a message's attachments land: `<sandbox>/_uploads/<chat>/`. Under the sandbox rather than the
+# data dir on purpose — the data dir is the secret store `run_shell` refuses, and a bot has to be able
+# to open an attachment (`unzip -l`, say). One folder per chat, so two chats' files never mix.
 # The directory the web shell is served out of. From source it is this one. In a bundle it is not:
 # electron-builder puts the frozen backend under `Resources/backend/anzen-backend` — so this module's
 # `__file__` lands in its `_internal` — and the shell under `Resources/app`, a sibling two levels up.
@@ -246,19 +249,15 @@ DEFAULT_SETTINGS = {
   # default" for both.
   "context": {"limit": 0, "compress": True, "max_steps": 0, "max_seconds": 0,
               "model_retries": 0, "model_stall_seconds": 0},
-  # port is the one place the debug endpoint is named; the launch command and the CDP URL are both
-  # derived from it, so the app cannot connect to a port the launch never opened.
-  # How the bots browse. "own" launches a throwaway browser — fast, but logged out. "cdp" attaches
-  # to ZenPilot (or any browser) already running on the debug port. "profiles" launches a browser
-  # with a *saved* profile per account: the cookies live in a folder on disk, so you sign in once by
-  # hand and every later run is already signed in. `accounts` is the list you make in the UI — a name
-  # and the sites it handles — and it is what sends a site to the account that owns it. `headless` is
-  # how the *bots'* browsers run; signing in always opens a window, because that is the one thing
-  # that cannot be done without one. `channel` is which browser to launch: "auto" prefers a real
-  # Chrome-family browser installed on this machine, because Google refuses to sign anyone in on the
-  # Chromium Playwright ships — see browser_channel().
-  "browser": {"mode": "own", "port": 9222, "target_url": "", "profile": "default",
-              "accounts": [], "headless": False, "channel": "auto"},
+  # How the bots browse. "own" launches a throwaway browser — fast, but logged out. "profiles" (the
+  # default) launches a browser with a *saved* profile per account: the cookies live in a folder on
+  # disk, so you sign in once by hand and every later run is already signed in. `accounts` is the
+  # default list, used by a chat with one bot and by any room that has not set its own; a room's own
+  # list lives on the room record. `headless` is how the *bots'* browsers run; signing in always opens
+  # a window, because that is the one thing that cannot be done without one. `channel` is which
+  # browser to launch: "auto" prefers a real Chrome-family browser installed on this machine, because
+  # Google refuses to sign anyone in on the Chromium Playwright ships — see browser_channel().
+  "browser": {"mode": "profiles", "accounts": [], "headless": False, "channel": "auto"},
   "media": {"router_image": False},
   # Notification chimes. The browser synthesises them, so all that is kept is the switch and the
   # level — there is no audio file to ship, fetch or license.
@@ -295,19 +294,14 @@ def _load_settings_raw():
             if CONNECTORS.get(d["id"], {}).get("auth") == "google":   # only Google needs the OAuth client
                 e.setdefault("client_id", ""); e.setdefault("client_secret", "")
         s["connectors"] = list(by.values())
-    # The debug endpoint used to be named twice — a CDP URL and a launch command, each carrying its
-    # own port — so the app could connect to one the launch never opened (ECONNREFUSED on a port
-    # nothing listened on). The port is now the single source of truth; adopt whichever port those
-    # two actually named, then retire them so they can never disagree again.
+    # Browsing used to have a second mode — attach to a browser already running on a debug port —
+    # and with it a port, a profile filter and a launch command. The app launches the browsers
+    # itself now, so a save that still names that mode is moved to saved profiles rather than left
+    # pointing at a path nothing reads, and the settings that only it used are retired.
     br = s.get("browser")
     if isinstance(br, dict):
-        for src in (br.get("launch_cmd") or "", br.get("cdp_url") or ""):
-            m = re.search(r"remote-debugging-port=(\d{2,5})|:(\d{2,5})(?:\D|$)", src)
-            if m:
-                p = int(m.group(1) or m.group(2))
-                if 1 <= p <= 65535: br["port"] = p
-                break
-        br.pop("launch_cmd", None); br.pop("cdp_url", None)
+        if (br.get("mode") or "").lower() in ("cdp", "zenpilot"): br["mode"] = "profiles"
+        for k in ("port", "target_url", "profile", "launch_cmd", "cdp_url"): br.pop(k, None)
     return s
 
 # Settings are read on nearly every request, so the parsed, migrated dict is cached and handed out as
@@ -388,12 +382,15 @@ TOOL_DOC = ("\n\nYou have real tools (function calling). Use them to actually DO
             "globs) is not read-only, so below Full access it raises an approval card and the turn "
             "waits on it — the slowest thing that can happen to a simple question."
             "\n\nFor anything on a web page, use the browser tools — never drive a browser through "
-            "`run_shell`. No `curl` for a page, no hand-written CDP/websocket script, no saved helper "
-            "script: those cost a step each and read less than the page really holds. `browser_open` "
+            "`run_shell`. No `curl` for a page, no saved helper script: those cost a step each and "
+            "read less than the page really holds. The browser tools are the ONLY browser you have: "
+            "never read another browser's profile, cookies or saved logins from disk (Arc, Chrome, "
+            "Safari, Firefox, Brave, Edge — none of them), and never reach for the system keychain. "
+            "If a site needs a login, it is one of the accounts set up for this room, and the browser "
+            "opens it already signed in; anything else opens logged out, and that is the answer. "
+            "`browser_open` "
             # Where a site opens is decided by the browsing mode, which is read live and spelled out
-            # under “Browsing” below — so this points there instead of naming a mechanism. It used to
-            # name the Zen Pilot profile outright, which is a lie in saved-profiles mode and sent a
-            # bot off to launch Zen Pilot by hand for two minutes before it gave up and used the tool.
+            # under “Browsing” below — so this points there instead of naming a mechanism.
             "the site's own URL (which sites open already signed in, and which anonymously, is set out "
             "under “Browsing” below), then do the work "
             "with `browser_eval`, which runs your JavaScript "
@@ -504,10 +501,11 @@ def _norm_bots(b):
         _fill(x, "emoji", BOT_EMOJI.get(x["id"], ""))
         _fill(x, "face", "")   # blank = the client derives a species from the id
         # The look the avatar editor edits: an outfit and an accessory the client draws, the
-        # version of an uploaded avatar (0 = none, so the drawn face shows), and the generated
-        # whole-bot picture from the Bot faces section ("" = none, so the drawn bot shows).
+        # version of an uploaded avatar (0 = none, so the drawn face shows), and the head drawn
+        # from the Bot faces section ("" = none, so the drawn bot shows) with its shut-eye frame.
         _fill(x, "outfit", ""); _fill(x, "accessory", ""); _fill(x, "avatar", 0)
-        _fill(x, "genface", "")
+        _fill(x, "avatar_closed", 0); _fill(x, "genface", ""); _fill(x, "genface_closed", "")
+        _fill(x, "preset", "")
         # A record with no model, or one the current router does not serve, would 404 on every turn —
         # and `_agent_loop` reads `bot["model"]` unguarded, so a missing one is a TypeError mid-turn.
         _fill(x, "model", DEFAULT_MODEL)
@@ -568,6 +566,20 @@ def load_channels():
     return _norm_channels(c)
 def save_channels(c): _save_json(CH_PATH, c)
 def channel_by_id(chs, cid): return next((x for x in chs if x.get("id") == cid), None)
+
+def _migrate_room_browser():
+    """The browser accounts used to be one machine-wide list set in Settings → Browser. That tab is
+    gone and the list belongs to a room now, so every room that never had one adopts the old list
+    once — otherwise the accounts the user set up would exist only as a fallback nobody can see.
+    `browser_seeded` records the adoption, so emptying a room's list later is a choice the next boot
+    does not undo."""
+    acc = _norm_accounts((load_settings().get("browser") or {}).get("accounts"))
+    if not acc: return
+    chs = load_channels(); changed = False
+    for ch in chs:
+        if ch.get("browser") or ch.get("browser_seeded"): continue
+        ch["browser"] = [dict(x) for x in acc]; ch["browser_seeded"] = True; changed = True
+    if changed: save_channels(chs)
 
 def reorder(seq, ids, key=lambda x: x.get("id")):
     """Put `seq` in the order `ids` names. Anything the caller did not name keeps its relative
@@ -783,10 +795,11 @@ SKILL_DOC_CHARS = 12000        # how much of one skill's guidance a single `use_
 # routing is by site, so a bot never has to choose between them.
 BROWSER_BRIEF_CHARS = 900
 # The one line that must never be missing where this app owns its browsers: there is no other browser
-# in play, and a bot's own memory often says there is (notes written back when the mode was "cdp").
-# Without it a bot goes looking for an app that will never answer — the live failure was two minutes of
-# `pgrep`/`lsof`/launch attempts against a dead debug port before it gave up and used `browser_open`,
-# which worked. Short on purpose: it rides in every prompt, so it shares BROWSER_BRIEF_CHARS' budget.
+# in play, and a bot's own memory sometimes says there is (notes written when browsing attached to an
+# app on a debug port). Without it a bot goes looking for one that will never answer — the live
+# failure was two minutes of `pgrep`/`lsof`/launch attempts against a dead port before it gave up and
+# used `browser_open`, which worked. Short on purpose: it rides in every prompt, so it shares
+# BROWSER_BRIEF_CHARS' budget.
 BROWSER_OWN_LINE = (" This app opens and drives those browsers itself: never start, attach to, or "
                     "probe another browser or a debug port.")
 
@@ -1120,12 +1133,18 @@ def remove_logo(cid):
 # magic-byte checks as a logo.
 AVATAR_DIR = os.path.join(DATA, "avatars")
 def avatar_state(b):
-    """A bot's avatar: the stored file and a version that changes whenever it does, or nothing."""
+    """A bot's avatar: the stored file and a version that changes whenever it does, or nothing.
+    The shut-eye frame is a second file beside it with its own version, so a browser can cache the
+    blink frame and still pick up a new one when the picture is redrawn."""
     bid = _logo_id(b.get("id"))
     for ext in LOGO_MIME.values():
         p = os.path.join(AVATAR_DIR, bid + ext)
-        if bid and os.path.isfile(p): return {"path": p, "v": _logo_ver(p), "source": "upload"}
-    return {"path": "", "v": 0, "source": ""}
+        if bid and os.path.isfile(p):
+            closed = next((os.path.join(AVATAR_DIR, bid + "-closed" + e) for e in LOGO_MIME.values()
+                           if os.path.isfile(os.path.join(AVATAR_DIR, bid + "-closed" + e))), "")
+            return {"path": p, "v": _logo_ver(p), "source": "upload",
+                    "closed_path": closed, "closed_v": _logo_ver(closed) if closed else 0}
+    return {"path": "", "v": 0, "source": "", "closed_path": "", "closed_v": 0}
 
 def save_avatar(bid, data_url):
     """Store an uploaded avatar for one bot. A bot id is the same slug shape as a channel id, so
@@ -1136,40 +1155,75 @@ def save_avatar(bid, data_url):
     return {"ok": True} if r.get("ok") else r
 
 def remove_avatar(bid):
-    """Drop the uploaded avatar; the client draws the bot's face again."""
+    """Drop the uploaded avatar; the client draws the bot's face again. The shut-eye frame goes with
+    it — left behind, it would blink an old picture's eyes onto whatever comes next."""
     bid = _logo_id(bid)
-    return _remove_image(AVATAR_DIR, bid) if bid else False
+    if not bid: return False
+    gone = _remove_image(AVATAR_DIR, bid)
+    return _remove_image(AVATAR_DIR, bid + "-closed") or gone
+
+def set_avatar(b, data_url):
+    """Store a bot's picture and make it the one on screen. A picture is the newer choice, so it
+    also clears the set's drawing — the mirror of `set_genface`, and what makes "whichever you
+    picked last wins" true in both directions. A new picture has no shut-eye frame yet."""
+    r = save_avatar(b.get("id"), data_url)
+    if r.get("ok"):
+        b["genface"] = ""; b["genface_closed"] = ""
+        bid = _logo_id(b.get("id"))
+        if bid: _remove_image(AVATAR_DIR, bid + "-closed")
+        b["avatar"] = avatar_state(b)["v"]; b["avatar_closed"] = 0
+    return r
 
 def avatar_prompt(species, color):
     """What the image model is asked for when turning a photo into a bot's face: the *face* only,
-    filling the frame. The bot's body, outfit and accessory are drawn by the engine around it, so a
-    body would land underneath them — and a background or an icon frame would land on the head as a
-    pasted-in square, which is why the frame is ruled out as firmly as the body."""
+    filling the frame. The bot's own motion still moves it, and a body or a background would land
+    on the head as a pasted-in square, which is why the frame is ruled out as firmly as the body.
+    The species and colour are not named: the model obeyed "Species: owl" over the photo and drew
+    a cat as an owl — the same defect the Bot faces prompt was fixed for."""
     return ("Redraw the subject of the photo as a cute flat-vector mascot FACE, filling the whole "
             "square edge to edge: keep its colours, hair, eyes and distinctive features, drawn as a "
             "friendly cartoon character's face. FACE ONLY — no body, no arms, no hands, no text. NO "
             "background, no frame, no border, no rounded-square icon, no drop shadow: the head itself "
-            "reaches all four edges. Species: %s. Colour: %s."
-            % (str(species or "as in the photo")[:60], str(color or "as in the photo")[:40]))
+            "reaches all four edges.")
 
 # ---------------------------------------------------------------- bot faces
-# One source image, and the image model draws a whole mascot for each bot from it — head and body
-# together, one distinct character per bot. This is the section's picture, not a per-bot upload: a
-# batch is drawn once and every bot takes a different one from it. The engine draws the outfit and
-# accessory on top, so the model is asked for a clothing-free body.
+# One source image, and the image model draws a head for each bot from it — one distinct face per
+# bot. This is the section's picture, not a per-bot upload: a batch is drawn once and every bot
+# takes a different one from it. The drawing *is* the bot — the engine draws no body, ears, outfit
+# or accessory around it — so the model is asked for a head and nothing else.
 # A bot record only carries the filename of the drawing it took, so swapping a bot's face for
 # another from the same set is one field, not a new image.
 FACES_DIR = os.path.join(DATA, "faces")
+# Complete characters that ship with the app: one WebP per animation frame. They are read-only app
+# files rather than per-user data, so they sit beside the shell — a preset is never uploaded, edited
+# or pruned, and a bot record only names it.
+PRESET_DIR = os.path.join(SHELL, "faces")
+PRESETS = [{"id": "woman", "label": "Woman"}, {"id": "woman-auburn", "label": "Woman (auburn)"},
+           {"id": "woman-teal", "label": "Woman (teal)"}, {"id": "man", "label": "Man"},
+           {"id": "man-brown", "label": "Man (brown)"}, {"id": "man-blond", "label": "Man (blond)"},
+           {"id": "cat", "label": "Cat"}]
+PRESET_IDS = {p["id"] for p in PRESETS}
 FACES_BATCH_PATH = os.path.join(FACES_DIR, "batch.json")
 FACE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
              ".webp": "image/webp", ".gif": "image/gif"}
 # One batch at a time: the router is slow, and two runs at once would assign bots from both.
 FACE_JOB = {"running": False, "done": 0, "total": 0, "error": "", "id": ""}
+# The body is gone, so expression and head angle are all that is left to vary per bot. Cycled, not
+# random, so a rerun of the same batch lands on the same faces.
+FACE_EXPRESSIONS = [
+    "stern and determined, brows lowered, mouth level, head facing straight ahead",
+    "cheerful, a wide open smile, brows raised, head tilted slightly to one side",
+    "sleepy, heavy half-closed eyelids, a small flat mouth, head drooping slightly",
+    "surprised, eyes wide open, brows high, a small round open mouth, head turned slightly",
+]
 
 def faces_batch():
-    """The current set: its source picture and the drawings that really exist on disk."""
+    """The current set: its source picture and the drawings that really exist on disk. The shut-eye
+    frames are siblings of an open one, not entries of their own — the picker shows one per bot."""
     st = _load_json(FACES_BATCH_PATH, {}) or {}
-    files = [f for f in (st.get("files") or []) if os.path.isfile(os.path.join(FACES_DIR, f))]
+    files = [f for f in (st.get("files") or [])
+             if os.path.isfile(os.path.join(FACES_DIR, f))
+             and not os.path.splitext(f)[0].endswith("-closed")]
     src = st.get("source") or ""
     if src and not os.path.isfile(os.path.join(FACES_DIR, src)): src = ""
     return {"id": st.get("id") or "", "at": st.get("at") or 0, "source": src, "files": files}
@@ -1177,51 +1231,76 @@ def faces_batch():
 def faces_public(bots):
     b = faces_batch()
     return {"id": b["id"], "at": b["at"], "source": b["source"], "files": b["files"],
-            "job": dict(FACE_JOB),
+            "job": dict(FACE_JOB), "presets": PRESETS,
             "bots": [{"id": x["id"], "name": x.get("name") or x["id"], "genface": x.get("genface") or "",
+                      "genface_closed": x.get("genface_closed") or "",
+                      "preset": x.get("preset") or "",
                       "avatar": x.get("avatar") or 0}
                      for x in bots]}
 
 def face_prompt(species, color, i, n):
-    """A whole mascot: head and body in one drawing, on a plain backdrop the client keys out.
+    """A head, and nothing else: the drawing *is* the bot, so the engine draws no body around it.
 
     The animal comes from the photo and nothing else. Naming the bot's engine species here drew a
-    cat as an owl — the model obeyed "Species: owl" over the picture it was given. The bot's colour
-    is only an accent, for the same reason: recolouring the subject is what made one photo come
-    back as several different animals. Clothing and accessories are ruled out because the engine
-    draws the bot's own on top, and the backdrop is pure white because that is what the key removes.
-    A white subject is allowed now — the key is edge-connected, so it takes the backdrop and not the
-    cat sitting on it."""
-    accent = str(color or "").strip()[:40]
-    return ("Redraw the subject of the photo as a cute flat-vector mascot character: the WHOLE bot, "
-            "head and body together, standing upright, centred and filling the square. Keep the "
-            "SAME ANIMAL as the photo — never change its species — and keep its own fur or feather "
-            "colours, markings, ears, eyes and face. This is character %d of %d, so give it its own "
-            "pose or a small prop; the animal itself stays the one in the photo.%s Background: one "
-            "flat pure white (#FFFFFF), nothing else — no scenery, no frame, no border, no text, no "
-            "shadow. Simple body with no clothing, no hat, no glasses and no accessories: those are "
-            "drawn on afterwards."
-            % (i + 1, n, (" Only a collar or another small detail may use %s." % accent) if accent else ""))
+    cat as an owl — the model obeyed "Species: owl" over the picture it was given. The species is
+    still passed in (the caller has it) but never reaches the prompt.
+
+    The ink outline is mandatory. The client removes the white backdrop by flood-filling in from the
+    edges, and a pale animal's fur is nearly the same white as the backdrop: without an outline the
+    fill punches holes in its cheeks and leaves a halo on a dark sidebar. The outline is the edge it
+    stops at. This was observed, not theorised."""
+    return ("Redraw the subject of the photo as a cute flat-vector mascot FACE, filling the whole "
+            "square edge to edge: keep its colours, HAIR, eyebrows, EYES and facial expression as in "
+            "the photo — same hair shape and length, same eye colour and shape — drawn as a friendly "
+            "cartoon character's face. HEAD AND HAIR ONLY: no shoulders, no neck line, no body, no "
+            "arms, no hands, no clothing, no collar, no props, no text. Draw a thick, even dark ink "
+            "outline around the ENTIRE head, the same weight all the way round. Background: one flat "
+            "pure white (#FFFFFF), nothing else — no frame, no border, no rounded-square icon, no "
+            "drop shadow. This is bot %d of %d: give it %s."
+            % (i + 1, n, FACE_EXPRESSIONS[i % len(FACE_EXPRESSIONS)]))
+
+def face_closed_prompt():
+    """The same head with its eyes shut, for the blink. Fed the open frame back in: the model returns
+    a frame that matches it everywhere above the eyes, so the cross-fade does not jitter."""
+    return ("Take this exact cartoon head and change ONLY the eyes: close them, both eyelids fully "
+            "shut, with the same eyelash line. Keep everything else identical — the same hair, the "
+            "same head shape and angle, the same skin colour, the same brows, the same mouth, the "
+            "same ink outline, the same framing and the same flat white background.")
 
 def set_genface(b, f):
-    """Give a bot a face from the set. It also drops an older per-bot picture: picking a face here
-    is the newer, deliberate choice, and a picture left over from the bot editor would otherwise
-    keep winning in the client — the section would look like it did nothing."""
+    """Give a bot a face from the set, with the shut-eye frame drawn beside it if there is one. It
+    also drops an older per-bot picture: picking a face here is the newer, deliberate choice, and a
+    picture left over from the bot editor would otherwise keep winning in the client — the section
+    would look like it did nothing."""
     b["genface"] = f or ""
+    b["preset"] = ""      # one face source wins: the drawn face replaces the character outright
+    closed = ""
+    if b["genface"]:
+        stem = os.path.splitext(b["genface"])[0]
+        closed = next((stem + "-closed" + e for e in FACE_MIME
+                       if os.path.isfile(os.path.join(FACES_DIR, stem + "-closed" + e))), "")
+    b["genface_closed"] = closed
     if b["genface"] and b.get("avatar"):
-        remove_avatar(b["id"]); b["avatar"] = 0
+        remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
 
 def _faces_prune(keep=()):
-    """Drop drawings no bot can reach any more. `keep` is the set that just landed."""
+    """Drop drawings no bot can reach any more. `keep` is the set that just landed. A shut-eye frame
+    is kept while the open frame it belongs to is kept, and goes with it."""
     if not os.path.isdir(FACES_DIR): return
+    keep = {os.path.splitext(f)[0] for f in keep}
     for f in os.listdir(FACES_DIR):
-        if f.startswith("f-") and f not in keep:
+        if not f.startswith("f-"): continue
+        stem = os.path.splitext(f)[0]
+        base = stem[:-len("-closed")] if stem.endswith("-closed") else stem
+        if base not in keep:
             try: os.remove(os.path.join(FACES_DIR, f))
             except OSError: pass
 
 def _face_worker(batch_id, source_name, source, targets):
-    """Draw one mascot per bot, saving and assigning each as it lands: a run that dies halfway still
-    leaves the bots it finished with their faces instead of nothing at all."""
+    """Draw one face per bot, saving and assigning each as it lands: a run that dies halfway still
+    leaves the bots it finished with their faces instead of nothing at all. Each bot also gets a
+    shut-eye frame for its blink; a failed second frame only costs that bot its blink, so it never
+    counts as a failure — only a failed open frame does."""
     made, err = [], ""
     try:
         for i, (bid, species, color) in enumerate(targets):
@@ -1237,6 +1316,15 @@ def _face_worker(batch_id, source_name, source, targets):
                 if not r.get("ok"):
                     err = r.get("error") or err
                 else:
+                    # Drawn from the open frame, so the two line up exactly and the cross-fade does
+                    # not jitter. Best effort: no frame, no blink.
+                    try:
+                        shut, _ = gen_image(face_closed_prompt(), image=data_url, timeout=180)
+                        if shut:
+                            _save_image(FACES_DIR, os.path.splitext(r["file"])[0] + "-closed",
+                                        shut, "face", cap=8 << 20)
+                    except Exception:
+                        pass
                     made.append(r["file"])
                     bots = load_bots()
                     b = bot_by_id(bots, bid)
@@ -1255,7 +1343,8 @@ def _face_worker(batch_id, source_name, source, targets):
             # a file that is not there any more.
             bots = load_bots()
             for b in bots:
-                if b.get("genface") and b["genface"] not in made: b["genface"] = ""
+                if b.get("genface") and b["genface"] not in made:
+                    b["genface"] = ""; b["genface_closed"] = ""
             save_bots(bots)
         FACE_JOB["error"] = "" if made else (err or "the image model drew nothing")
         FACE_JOB["running"] = False
@@ -1963,19 +2052,94 @@ def _in_sandbox(path):
     root = os.path.realpath(work_dir())    # both ends resolved, so a symlinked data dir still matches
     raw = (path or "").strip()
     p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(root, raw))
-    return p if p == root or p.startswith(root + os.sep) else None
+    if p == root or p.startswith(root + os.sep): return p
+    # This turn's attachments live outside the repo (a room's repo is the user's own), so they are
+    # the one other place a bot may read — otherwise it is handed a file path it cannot open.
+    up = getattr(_WORK, "uploads", None)
+    up = os.path.realpath(up) if up else ""
+    return p if up and (p == up or p.startswith(up + os.sep)) else None
 def _data_bytes(s):
     """Decode a `data:<type>;base64,<payload>` URL, or None if it is not one."""
     if not isinstance(s, str) or not s.startswith("data:") or "," not in s: return None
     try: return base64.b64decode(s.split(",", 1)[1])
     except Exception: return None
+MAX_UPLOAD = 20_000_000      # one attachment; the body cap is what really bounds the whole message
+# Pictures the model can be handed inline. A screenshot over the cap is not sent at all rather than
+# cut: a truncated PNG is not a smaller picture, and the note says so instead.
+IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+MAX_IMAGE = 5_000_000
+def _image_data_url(path, mime=""):
+    """A picture on disk as the data URL a model's image part takes, or "" when it is not one."""
+    mime = (mime or "").lower()
+    if not mime.startswith("image/"):
+        if os.path.splitext(path)[1].lower() not in IMG_EXT: return ""
+        mime = mimetypes.guess_type(path)[0] or "image/png"
+    try:
+        with open(path, "rb") as f: raw = f.read(MAX_IMAGE + 1)
+    except OSError: return ""
+    if len(raw) > MAX_IMAGE: return ""
+    return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode())
+def _upload_folder(sid):
+    return os.path.join(SANDBOX, "_uploads",
+                        re.sub(r"[^A-Za-z0-9_-]", "_", sid or "chat")[:80] or "chat")
+def _save_uploads(sid, items):
+    """A message's attachments -> the records the transcript keeps.
+
+    Each arrives as a data URL, which is the same shape the skill installer already takes, so a
+    client needs no second upload path. The file keeps its own name for the reader and gets a stamped
+    one on disk, so two `report.pdf` in one chat are two files. A file too big, or a payload that is
+    not base64, is dropped rather than failing the message: the words still go through. A retry
+    sends back a record it was given, with no payload — that one is kept only if it names a file this
+    same chat already has, so the client cannot point the server at any path it likes."""
+    if not isinstance(items, list): return []
+    d = _upload_folder(sid); out = []
+    for it in items[:20]:
+        if not isinstance(it, dict): continue
+        if not it.get("data"):
+            p = os.path.realpath(str(it.get("path") or ""))
+            if p.startswith(os.path.realpath(d) + os.sep) and os.path.isfile(p):
+                out.append(dict(it, path=p)); continue
+            continue
+        raw = _data_bytes(it.get("data") or "")
+        if not raw or len(raw) > MAX_UPLOAD: continue
+        name = os.path.basename(str(it.get("name") or "").replace("\\", "/"))[:120] or "file"
+        fn = "%d-%s" % (int(time.time() * 1000), re.sub(r"[^A-Za-z0-9._-]", "_", name) or "file")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, fn), "wb") as f: f.write(raw)
+        except OSError: continue
+        out.append({"name": name, "size": len(raw), "type": str(it.get("type") or "")[:120],
+                    "path": os.path.join(d, fn), "url": "/api/upload/" + os.path.basename(d) + "/" + fn})
+    return out
+def _attachments_note(atts, shown=()):
+    """The task as the bot reads it, plus what came with it. A picture that rode in the message needs
+    no path — the model is already looking at it — while everything else is a file it has to open."""
+    if not atts: return ""
+    lines = ["The user attached %d file%s:" % (len(atts), "" if len(atts) == 1 else "s")]
+    for a in atts:
+        p = a.get("path") or ""
+        if p in shown:
+            lines.append("- %s (%s) — a picture attached to this message; you can already see it. Do "
+                         "not call read_file on it." % (a["name"], _kb(a["size"])))
+        elif (a.get("type") or "").startswith("image/") or os.path.splitext(p)[1].lower() in IMG_EXT:
+            lines.append("- %s (%s) — a picture too large to attach; ask the user for a smaller one."
+                         % (a["name"], _kb(a["size"])))
+        else:
+            lines.append("- %s (%s) — %s (read_file for text, run_shell for an archive, a PDF or media)"
+                         % (a["name"], _kb(a["size"]), p))
+    return "\n\n" + "\n".join(lines)
+def _kb(n):
+    if n < 1024: return "%d B" % n
+    if n < 1024 * 1024: return "%.1f KB" % (n / 1024.0)
+    return "%.1f MB" % (n / 1048576.0)
 SHELL_OUT_CAP = 6000        # characters of output a bot is shown
 SHELL_READ_CAP = 1 << 20    # bytes actually buffered before the rest is dropped
 def run_shell(cmd, timeout=45):
     if not isinstance(cmd, str):
         return "(error: run_shell command must be a string)", 1
-    if shell_refused(cmd):
-        return "(refused: %s)" % SECRET_REFUSAL, 1
+    why = shell_refusal(cmd)
+    if why:
+        return "(refused: %s)" % why, 1
     # A bot may ask for longer than the 45s default (an install, a test run). Only the *top* is
     # clamped: a huge number is a lever on the turn's own wall clock, a small one is harmless.
     try: timeout = max(1, min(int(timeout), 600))
@@ -2072,10 +2236,15 @@ def _names_outside_path(args):
     *inside* the repo stay frictionless, and a flag (`-C`, `--pretty=…`) is skipped: the path it names
     is the next bare word and is checked there."""
     root = os.path.realpath(work_dir())
+    # This turn's attachments are readable like the repo is: `unzip -l <upload>` is the ordinary way
+    # to look at a file the user just sent, and a card for it would be a card for the feature.
+    up = getattr(_WORK, "uploads", None); up = os.path.realpath(up) if up else ""
     for a in args:
         if a.startswith("-") or not (a.startswith("/") or a.startswith("~")): continue
         p = os.path.realpath(os.path.expanduser(a))
-        if p != root and not p.startswith(root + os.sep): return True
+        if p == root or p.startswith(root + os.sep): continue
+        if up and (p == up or p.startswith(up + os.sep)): continue
+        return True
     return False
 
 def _safe_command_words(words):
@@ -2146,17 +2315,50 @@ def names_secrets(cmd):
         d = (d or "").replace("\\", "/")
         if d and d in c: return True
     return any(w in c for w in SECRET_NAMES)
-def shell_refused(cmd):
-    """True when `run_shell` will turn this command away whatever the user answers.
+# A bot browses with the browser this app launches and with nothing else. `run_shell` is a shell on
+# the whole machine, so a bot could read any *other* browser's profile straight off disk — cookies,
+# saved logins, history — and one did: a turn went through Arc's profile looking for a login. That is
+# never something the user wants approved, so it is a refusal and not a card, the same as the store.
+# The match is on where browsers keep their data, not on the word "browser", so ordinary work (a
+# repo file called cookies.md, a `grep Cookies app.js`) is untouched.
+BROWSER_DATA = (
+    "library/application support/arc", "library/application support/google/chrome",
+    "library/application support/chromium", "library/application support/bravesoftware",
+    "library/application support/microsoft edge", "library/application support/firefox",
+    "library/safari", "library/cookies", "library/keychains",
+    ".mozilla/firefox", ".config/google-chrome", ".config/chromium", ".config/bravesoftware",
+    ".config/microsoft-edge", ".microsoft-edge",
+    "appdata/local/google/chrome", "appdata/local/microsoft/edge",
+    "appdata/roaming/mozilla/firefox", "appdata/roaming/bravesoftware",
+)
+# The login stores by name, for a browser not listed above or a path reached some other way. A bare
+# word is not enough; it has to be a path segment, and the file name has to end there.
+BROWSER_FILES = re.compile(r"(?:^|/)(cookies(?:\.sqlite|\.binarycookies)?|login data|logins\.json|"
+                           r"key4\.db|signons\.sqlite)(?:$|[\s\"';|&)])", re.I)
+KEYCHAIN_CMDS = ("security find-generic-password", "security find-internet-password",
+                 "security dump-keychain")
+BROWSER_REFUSAL = ("another browser's data is not yours to read — you browse with the app's own "
+                   "browser, through the browser tools")
+def names_foreign_browser(cmd):
+    c = cmd.replace("\\ ", " ").replace("\\", "/").lower()   # `Application\ Support` is one path
+    if any(f in c for f in BROWSER_DATA) or any(k in c for k in KEYCHAIN_CMDS): return True
+    return bool(BROWSER_FILES.search(c))
+def shell_refusal(cmd):
+    """Why `run_shell` turns this command away whatever the user answers, or "".
 
-    The approval card is a question; a refusal is not one. An absolute path into the store is both
-    out of the sandbox (so it reads as risky and would raise a card) and forbidden outright (so the
-    answer cannot change the outcome) — and a card that approves nothing is one the user learns to
-    click past, while a bot that keeps reaching for the store parks the turn on it for the rest of
-    the budget. `run_shell` returns the refusal and the agent loop skips the card, both from here,
-    so the two can never disagree about which commands are refused.
+    The approval card is a question; a refusal is not one. An absolute path into the store or into
+    another browser is both out of the sandbox (so it reads as risky and would raise a card) and
+    forbidden outright (so the answer cannot change the outcome) — and a card that approves nothing
+    is one the user learns to click past, while a bot that keeps reaching parks the turn on it for
+    the rest of the budget. `run_shell` returns this and the agent loop skips the card, both from
+    here, so the two can never disagree about which commands are refused.
     """
-    return isinstance(cmd, str) and names_secrets(cmd)
+    if not isinstance(cmd, str): return ""
+    if names_secrets(cmd): return SECRET_REFUSAL
+    if names_foreign_browser(cmd): return BROWSER_REFUSAL
+    return ""
+def shell_refused(cmd):
+    return bool(shell_refusal(cmd))
 
 # The other way round the same refusal. The browser tools run JavaScript in a page this process
 # controls, and a `file://` page is a page like any other — `browser_open file://<DATA>/access_token`
@@ -2178,328 +2380,20 @@ def browser_url_guard(url):
     return ""
 
 # ---------------------------------------------------------------- browser (computer use)
-# ---------------------------------------------------------------- raw CDP (Electron webviews)
-# Playwright cannot see <webview> targets, and Electron apps such as ZenPilot show every
-# logged-in profile as one. So for those we speak the DevTools Protocol directly: a stdlib
-# websocket client, one attach, and the same page-shaped surface the browser tools already use.
-class _WS:
-    def __init__(self, url, timeout=20):
-        assert url.startswith("ws://"), url
-        hostport, _, path = url[5:].partition("/")
-        host, _, port = hostport.partition(":")
-        self.s = socket.create_connection((host, int(port or 80)), timeout=timeout)
-        # A refused or half-open handshake must close the socket it opened: the browser panel retries
-        # every few seconds, and a leak here was one stranded fd per failed attach.
-        try:
-            key = base64.b64encode(os.urandom(16)).decode()
-            self.s.sendall(("GET /%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                            "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                            % (path, hostport, key)).encode())
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                d = self.s.recv(4096)
-                if not d: raise ConnectionError("handshake closed")
-                buf += d
-            head, _, self.buf = buf.partition(b"\r\n\r\n")
-            if b"101" not in head.split(b"\r\n")[0]:
-                raise ConnectionError("handshake refused: %s" % head[:120].decode("utf-8", "replace"))
-        except Exception:
-            try: self.s.close()
-            except Exception: pass
-            raise
-
-    def _take(self, n, deadline=None):
-        # A frame only exists once all of it has arrived, and a peer that trickles a byte at a time
-        # never lets one arrive. `recv` on its own cannot catch that: the socket timeout is per read,
-        # so every trickled byte resets it — the same trap as the model path, and here it pins the one
-        # browser thread, which silently turns every later browser call into "(browser timeout)". So
-        # the caller's own clock is checked between reads, and a frame that will not complete inside
-        # the call's budget ends the call instead of the thread.
-        while len(self.buf) < n:
-            if deadline is not None and time.time() > deadline:
-                raise TimeoutError("no complete frame within the call's budget")
-            d = self.s.recv(65536)
-            if not d: raise ConnectionError("closed")
-            self.buf += d
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
-
-    def _frame(self, op, data):
-        hdr = bytearray([0x80 | op]); n = len(data)
-        if n < 126: hdr.append(0x80 | n)
-        elif n < 65536: hdr.append(0x80 | 126); hdr += struct.pack(">H", n)
-        else: hdr.append(0x80 | 127); hdr += struct.pack(">Q", n)
-        mask = os.urandom(4); hdr += mask
-        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
-
-    def send(self, text): self._frame(0x1, text.encode())
-
-    def recv(self, deadline=None):
-        parts = []
-        while True:
-            b0, b1 = self._take(2, deadline)
-            fin, op, ln = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
-            if ln == 126: ln = struct.unpack(">H", self._take(2, deadline))[0]
-            elif ln == 127: ln = struct.unpack(">Q", self._take(8, deadline))[0]
-            mk = self._take(4, deadline) if b1 & 0x80 else None
-            data = self._take(ln, deadline)
-            if mk: data = bytes(b ^ mk[i % 4] for i, b in enumerate(data))
-            if op == 0x9: self._frame(0xA, data); continue
-            if op == 0xA: continue
-            if op == 0x8: raise ConnectionError("closed by peer")
-            parts.append(data)
-            if fin: return b"".join(parts).decode("utf-8", "replace")
-
-    def close(self):
-        try: self._frame(0x8, b"")
-        except Exception: pass
-        try: self.s.close()
-        except Exception: pass
-
-
-def cdp_targets(endpoint):
-    """What a running browser has open, over plain HTTP. Listing targets needs no websocket, so
-    this works even when all we want to know is which profiles ZenPilot has."""
-    return json.load(urllib.request.urlopen(endpoint.rstrip("/") + "/json/list", timeout=10))
-
-class _CDP:
-    """DevTools Protocol client: HTTP for the target list, one websocket for the commands."""
-
-    def __init__(self, endpoint):
-        self.ep = endpoint.rstrip("/")
-        ver = json.load(urllib.request.urlopen(self.ep + "/json/version", timeout=10))
-        self.ws = _WS(ver["webSocketDebuggerUrl"]); self._id = 0
-
-    def targets(self):
-        return cdp_targets(self.ep)
-
-    def cmd(self, method, params=None, session=None, timeout=30, sock_timeout=None):
-        self._id += 1; mid = self._id
-        msg = {"id": mid, "method": method, "params": params or {}}
-        if session: msg["sessionId"] = session
-        old = None
-        if sock_timeout is not None:
-            old = self.ws.s.gettimeout(); self.ws.s.settimeout(sock_timeout)
-        try:
-            self.ws.send(json.dumps(msg))
-            end = time.time() + timeout
-            while time.time() < end:
-                # `end` rides into the read as well, so the clock bounds the frame that is being
-                # assembled and not only the gaps between frames (see `_WS._take`).
-                m = json.loads(self.ws.recv(deadline=end))
-                if m.get("id") == mid:
-                    if "error" in m: raise RuntimeError("%s -> %s" % (method, m["error"]))
-                    return m.get("result", {})
-            raise TimeoutError(method)
-        finally:
-            if old is not None:
-                try: self.ws.s.settimeout(old)
-                except Exception: pass
-
-    def attach(self, target_id):
-        return self.cmd("Target.attachToTarget", {"targetId": target_id, "flatten": True})["sessionId"]
-
-    def detach(self, session_id):
-        """Close a session opened by `attach`. Every attach the browser holds until it is closed, so a
-        screenshot that leaves its session open leaks one per call — and the Computer panel polls."""
-        try: self.cmd("Target.detachFromTarget", {"sessionId": session_id})
-        except Exception: pass
-
-    def close(self): self.ws.close()
-
-
-class _El:
-    def __init__(self, page, selector): self.page = page; self.selector = selector
-
-    def evaluate(self, js):
-        if "=>" in js or js.lstrip().startswith(("function", "(")):
-            return self.page._ev("(%s)(document.querySelector(%s))" % (js, json.dumps(self.selector)))
-        return self.page._ev(js)
-
-class _Count:
-    """The one method `Browser.click` needs from a Playwright locator: how many elements match."""
-    def __init__(self, page, selector): self.page = page; self.selector = selector
-
-    def count(self):
-        return self.page._ev("document.querySelectorAll(%s).length" % json.dumps(self.selector)) or 0
-
-
-class CDPPage:
-    """Playwright-shaped page backed by raw CDP, for targets Playwright will not surface."""
-
-    KEYS = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "ArrowDown": 40, "ArrowUp": 38,
-            "ArrowLeft": 37, "ArrowRight": 39, " ": 32}
-
-    def __init__(self, cdp, session):
-        self.cdp = cdp; self.sid = session; self.keyboard = self._KB(self)
-
-    class _KB:
-        def __init__(self, page): self.page = page
-        def press(self, key):
-            code = CDPPage.KEYS.get(key, ord(key[0]) if key else 0)
-            for typ in ("keyDown", "keyUp"):
-                try:
-                    self.page.cdp.cmd("Input.dispatchKeyEvent",
-                                      {"type": typ, "key": key, "windowsVirtualKeyCode": code,
-                                       "text": "\r" if key == "Enter" else (key if len(key) == 1 else "")},
-                                      session=self.page.sid)
-                except Exception: pass
-
-    def _ev(self, expr, arg=None, timeout=30):
-        if "=>" in expr or expr.lstrip().startswith(("function", "async", "(")):
-            js = "(%s)" % expr
-            if arg is not None: js += "(%s)" % json.dumps(arg)
-        else: js = expr
-        r = self.cdp.cmd("Runtime.evaluate",
-                         {"expression": js, "returnByValue": True, "awaitPromise": True},
-                         session=self.sid, timeout=timeout)
-        return r.get("result", {}).get("value")
-
-    def evaluate(self, expr, arg=None): return self._ev(expr, arg)
-
-    @property
-    def url(self): return self._ev("location.href") or ""
-
-    def title(self): return self._ev("document.title") or ""
-
-    def wait_for_timeout(self, ms): time.sleep(max(0, ms) / 1000.0)
-
-    def goto(self, url, wait_until=None, timeout=45000):
-        self.cdp.cmd("Page.navigate", {"url": url}, session=self.sid)
-        # `wait_until` is honoured, mapped onto the one signal a CDP page can read: "domcontentloaded"
-        # is readyState "interactive", "load" is "complete". "interactive" is also accepted for a
-        # "complete" wait, because a page whose sub-resources never finish (a tracker that hangs, an
-        # endless long-poll) holds readyState at "interactive" for ever — waiting for "complete" then
-        # burned the whole 45s on a page that was ready to read, and the caller settles for the paint.
-        want = ("complete",) if wait_until == "load" else ("interactive", "complete")
-        end = time.time() + timeout / 1000.0
-        while time.time() < end:
-            try:
-                if self._ev("document.readyState", timeout=8) in want: break
-            except Exception: pass
-            time.sleep(0.15)
-        return self
-
-    def go_back(self, wait_until=None, timeout=30000):
-        # The parameters mirror the Playwright page's signature so one call site serves both engines;
-        # over CDP the back navigation is followed by a short settle rather than a readiness probe.
-        try: self._ev("history.back()")
-        except Exception: pass
-        time.sleep(1.0)
-        return self
-
-    def inner_text(self, selector="body"):
-        return self._ev("(s=>{const e=document.querySelector(s)||document.body;return e?e.innerText:''})(%s)"
-                        % json.dumps(selector)) or ""
-
-    def wait_for_selector(self, selector, timeout=12000, state="attached"):
-        # `state` mirrors the Playwright page's signature so one call site serves both engines; over
-        # CDP only presence ("attached") can be probed, which is the state every caller asks for.
-        end = time.time() + timeout / 1000.0
-        while time.time() < end:
-            try:
-                if self._ev("!!document.querySelector(%s)" % json.dumps(selector)): return _El(self, selector)
-            except Exception: pass
-            time.sleep(0.2)
-        raise TimeoutError("no element matching %s" % selector)
-
-    def locator(self, selector):
-        # Playwright's page has this and `Browser.click` asks it how many elements a selector matches
-        # before spending an actionability timeout on nothing; the shape is mirrored here for the same
-        # reason `wait_for_selector` is, so one call site serves both engines.
-        return _Count(self, selector)
-
-    def click(self, selector, timeout=12000):
-        self.wait_for_selector(selector, timeout=timeout).evaluate(
-            "e=>{e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();"
-            "const o={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2};"
-            "for(const t of ['pointerdown','mousedown','pointerup','mouseup','click'])"
-            "e.dispatchEvent(t.startsWith('pointer')?new PointerEvent(t,o):new MouseEvent(t,o));return 1}")
-        return self
-
-    def fill(self, selector, text):
-        self.wait_for_selector(selector)
-        self._ev("(a)=>{const e=document.querySelector(a.s);if(!e)return '';e.focus();"
-                 "const proto=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
-                 "const d=Object.getOwnPropertyDescriptor(proto,'value');"
-                 "if(d&&d.set)d.set.call(e,a.v);else e.value=a.v;"
-                 "e.dispatchEvent(new Event('input',{bubbles:true}));"
-                 "e.dispatchEvent(new Event('change',{bubbles:true}));return e.value}",
-                 {"s": selector, "v": text})
-        return self
-
-    def screenshot(self, tries=(6, 8)):
-        # Two quirks of webview targets: they live on their own surface (ask for the page, not the
-        # surface), and the first capture after attaching can wait for a frame. Both attempts are
-        # short on purpose. Zen Pilot paints one profile at a time and a <webview> that is not on
-        # screen never produces a frame at all — so a long wait here is not patience, it is a panel
-        # that hangs. Two quick tries, then say what is actually wrong.
-        p = {"format": "png", "fromSurface": False}
-        last = None
-        for wait in tries:
-            try:
-                return base64.b64decode(
-                    self.cdp.cmd("Page.captureScreenshot", p, session=self.sid, sock_timeout=wait)["data"])
-            except Exception as e: last = e
-        raise RuntimeError("this profile is not on screen in Zen Pilot — open it there to watch it work")
-
-BROWSER_RETRY_S = 5          # at most how often a browser that failed to attach is retried
-NO_PAGE_ERR = ("nothing is open to drive — open a profile in Zen Pilot (or a tab in that browser) "
-               "and the screen appears")
-
-def _drivable(url):
-    """Whether a page is one the bots may drive. The browser's own chrome — the app shell of an
-    Electron app such as Zen Pilot, or devtools — is not one: driving it would navigate away the
-    window you are working in. A Zen Pilot profile is a <webview> target and is reached over raw
-    CDP before this fallback ever runs, so a profile is still what the bots use."""
-    return not (url or "").startswith(("file:", "devtools:", "chrome:", "chrome-extension:"))
-
 def _host(u):
     """The bare site of a URL — no scheme, port, or leading www — so www.threads.com and threads.com
     count as one site. Which site a request needs is what decides which profile it must run in."""
     h = (urlparse(u or "").netloc or "").split(":")[0].lower()
     return h[4:] if h.startswith("www.") else h
 
-def _fg_js(pid, name, svc):
-    """The two expressions `Browser._foreground` runs in the Zen Pilot window, as (click, show).
-
-    `click` brings one profile's sidebar row on screen; `show` asks whether it is on screen yet. Zen
-    Pilot hides an inactive profile by putting `hidden` on its container, not on the <webview> itself —
-    and a <webview> carries no height of its own — so "on screen" is "no ancestor still says
-    display:none". A profile in lazy memory mode is not rendered at all, which reads the same way.
-    Module level so tests/test_foreground.py runs this exact JS rather than a copy of it."""
-    vis = ("const vis=pid=>{const el=[...document.querySelectorAll('webview')]"
-           ".find(x=>x.partition==='persist:profile_'+pid);"
-           "if(!el)return false;"
-           "for(let n=el;n&&n!==document.body;n=n.parentElement){"
-           "const c=getComputedStyle(n);if(c.display==='none'||c.visibility==='hidden')return false;}"
-           "return true;};")
-    click = ("(async()=>{const pid=%d,name=%s,svc=%s;" % (pid, json.dumps(name), json.dumps(svc))
-             + vis +
-             "if(vis(pid))return 'visible';"
-             "const find=()=>[...document.querySelectorAll('button')].find(b=>{const s=b.querySelector('span.truncate');"
-             "return s&&s.textContent.trim()===name;});"
-             "let b=find();"
-             "if(!b){[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-expanded')==='false'"
-             "&&svc&&x.textContent.includes(svc)).forEach(x=>x.click());"
-             "await new Promise(r=>setTimeout(r,250));b=find();}"
-             "if(!b)return 'no-row';b.click();return 'clicked';})()")
-    return click, "(()=>{%s return vis(%d)})()" % (vis, pid)
-
 class Browser:
-    """One browser owned by a dedicated thread. Either we launch it, or we attach over CDP to a
-    browser that is already running (ZenPilot), so the bots reuse profiles you are logged into and
-    we open no extra window."""
+    """One browser owned by a dedicated thread. We launch it ourselves, with a saved profile folder
+    per account, so the bots reuse logins you made once by hand."""
     def __init__(self):
         self.q = queue.Queue(); self.ready = threading.Event()
         self.thread = None; self.ok = False; self.err = ""; self.url = ""; self.title = ""
-        self.mode = "own"; self.cdp_url = ""; self.attached = False
-        self.engine = ""; self.cdp = None; self.target_id = ""; self.last_try = 0.0
-        self._cdp_owner = None                      # the thread whose cdp this is (see _run's sentinel)
-        self._shot_id = ""; self._shot_at = 0.0     # the profile the Computer panel last drew
+        self.mode = "profiles"; self.last_try = 0.0
         self.owner = ""                             # the bot whose page is the one on screen (see _computer_scope)
-        self._sh = None                             # CDP session on the app window itself
-        self._no_profile = False                    # the last open() found no Zen Pilot profile for the site
         self.page = None                            # set by _attach; stays None in profiles mode until a site needs one
         # Everything Playwright hands us belongs to the thread that made it: the sync API refuses to
         # be touched from any other one, and refuses a second driver in the same one. A restart runs
@@ -2512,7 +2406,7 @@ class Browser:
         return self._thr.setdefault(threading.current_thread(), {"pp": None, "hb": None, "hctx": None, "hpage": None, "ctxs": {}})
     def start(self):
         if self.thread and self.thread.is_alive(): return
-        self.ready.clear(); self.ok = False; self.err = ""; self.attached = False
+        self.ready.clear(); self.ok = False; self.err = ""
         self.q = queue.Queue()   # a fresh queue per thread: a restart must not leave two threads reading one
         self.thread = threading.Thread(target=self._run, args=(self.q,), daemon=True); self.thread.start()
         self.ready.wait(90)
@@ -2525,19 +2419,25 @@ class Browser:
         # thread, on the sentinel above: these browsers belong to it and it is the only thread that
         # can touch them.
         self.start()
-        return {"ok": self.ok, "mode": self.mode, "attached": self.attached, "err": self.err}
+        return {"ok": self.ok, "mode": self.mode, "err": self.err}
     def _routes(self): return _route_pairs()
-    def _route(self, url, routes=None):
+    def _route(self, url, routes=None, account=None):
         """The profile a site belongs to, or None for a site nobody routed. The exact host wins, then
         each parent domain in turn, so one `x.com=<profile>` line also covers `mobile.x.com`.
         `routes` is the room's own table when the caller has one; the machine-wide list is the
-        fallback, and the call comes from the turn's thread with the room already resolved."""
+        fallback, and the call comes from the turn's thread with the room already resolved.
+        `account` picks one of the several accounts that can cover a site — without it the first one
+        set up answers. An account that does not cover the site answers None: it must not be handed
+        another account's session just because it was named."""
         h = _host_key(url)
         if not h: return None
         r = routes if routes is not None else self._routes(); parts = h.split(".")
         for i in range(len(parts) - 1):
             cand = ".".join(parts[i:])
-            if cand in r: return r[cand]
+            names = r.get(cand)
+            if names:
+                if account is None: return names[0]
+                return account if account in names else None
         return None
     def _ensure_ctx(self, name, headless=None):
         """One named profile's browser, launched the first time a site needs it and kept warm after
@@ -2619,7 +2519,7 @@ class Browser:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try: page.bring_to_front()
         except Exception: pass
-        self.page = page; self.engine = "own"; self.mode = "profiles"
+        self.page = page; self.mode = "profiles"
         if url:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -2630,243 +2530,21 @@ class Browser:
                     "done. The bots use that same window and the same saved logins." % (name, url))
         return ("the %s window is open. Type the site's address to sign in — or put its site in this "
                 "account's row and press Sign in again to land straight on it." % name)
-    def _cfg(self):
-        b = load_settings().get("browser") or {}
-        mode = (b.get("mode") or "own").lower()
-        # Attaching over CDP always means a debug port on this machine, so the URL is derived from
-        # the one port setting — `browser_port` — so the two can never disagree.
-        return mode, ("http://127.0.0.1:%d" % browser_port(b))
-    def _targets(self):
-        """The 'Which profile?' setting: one or more URL fragments, comma or newline separated."""
-        b = load_settings().get("browser") or {}
-        return [x.strip() for x in re.split(r"[,\n]", b.get("target_url") or "") if x.strip()]
-    def _match_webview(self, wv, url=""):
-        """The profile that fits the site: one already showing it, else one matching a pinned
-        fragment. None when nothing matches (so a pinned list never yanks the bot off its profile)."""
-        host = (urlparse(url).netloc or "").split(":")[0] if url else ""
-        if host:
-            for t in wv:
-                if host in (t.get("url") or ""): return t
-        for p in self._targets():
-            for t in wv:
-                if p in (t.get("url") or ""): return t
-        return None
-    def _attach_webview(self, url=""):
-        """Electron apps (ZenPilot) expose each logged-in profile as a <webview> target. Playwright
-        cannot see those; we drive them over raw CDP, so one attach reaches the profiles you are
-        already signed into -- no second window, no logging in again. Several profiles can be
-        pinned at once, one per site."""
-        cdp = None
-        try:
-            cdp = _CDP(self.cdp_url)
-            wv = [t for t in cdp.targets() if t.get("type") == "webview"]
-            if not wv: return False
-            pick = self._match_webview(wv, url) or wv[0]
-            self.cdp = cdp; self._sh = None
-            # Who owns this connection. A restart starts a new thread that attaches its own, and the
-            # old thread must not close that one on its way out — see the sentinel branch in _run.
-            self._cdp_owner = threading.current_thread()
-            self.page = CDPPage(cdp, cdp.attach(pick["id"]))
-            self.target_id = pick["id"]
-            self.url = pick.get("url", ""); self.engine = "webview"; self.attached = True
-            cdp = None                        # handed to self.cdp now, so the finally must not close it
-            return True
-        except Exception as e:
-            self.err = "webview: %s" % e
-            return False
-        finally:
-            # A failed attach used to leak its socket: nothing else ever held the connection, and the
-            # caller retries on a timer, so a browser that lists targets but refuses to attach leaked
-            # one WebSocket per retry.
-            if cdp is not None:
-                try: cdp.close()
-                except Exception: pass
-    def _shell_ev(self, js):
-        """Run one expression in the app window itself, where electronAPI lives. The window is a
-        'page' target whose URL is a file: URL — a profile is a <webview>, so this is the only target
-        that is the app and not a site. None when there is no such target or the app is not ZenPilot."""
-        if not getattr(self, "cdp", None): return None
-        if self._sh is None:
-            for t in self.cdp.targets():
-                if t.get("type") == "page" and (t.get("url") or "").startswith("file:"):
-                    self._sh = self.cdp.attach(t["id"]); break
-        if not self._sh: return None
-        try:
-            r = self.cdp.cmd("Runtime.evaluate",
-                             {"expression": js, "returnByValue": True, "awaitPromise": True},
-                             session=self._sh, timeout=30)
-        except Exception:
-            self._sh = None; raise        # a dead session must be re-made, not reused forever
-        return r.get("result", {}).get("value")
-    def _site_profiles(self):
-        """Zen Pilot's own answer to 'which profile is this site?' — every service with its home URL,
-        every profile with the service it belongs to, and which profiles are running. What a profile
-        is *showing* right now says nothing about what it is for, which is how a Threads request ended
-        up being opened in the YouTube profile. `api` says whether the app answered at all: an Electron
-        app that is not Zen Pilot has no profile list, while None means the app could not be asked."""
-        js = ("(async()=>{const e=window.electronAPI;"
-              "if(!e||!e.profiles) return {api:false,p:[],s:[],r:[]};"
-              "const p=await e.profiles.getAll(), s=await e.services.getAll(), r=await e.profiles.getRunning();"
-              "return {api:true,p:p.map(x=>({id:x.id,name:x.name,service_id:x.service_id})),"
-              "s:s.map(x=>({id:x.id,name:x.name,url:x.default_url||''})),r:r}})()")
-        try: return self._shell_ev(js)
-        except Exception: return None
-    def _app_webviews(self):
-        """The app window's own list of open profiles: each <webview>'s partition (persist:profile_<id>)
-        and the URL it is on. This is the only thing that ties a profile id to a CDP target — the
-        order of the target list does not match the order of the profiles."""
-        try: return self._shell_ev("[...document.querySelectorAll('webview')].map(w=>({p:w.partition,"
-                                   "u:(w.getURL?w.getURL():w.src)||''}))") or []
-        except Exception: return []
-    def _by_profile(self, pid, wv):
-        """The <webview> target for one profile id, found by the URL the app says that profile is on.
-        Two profiles on the same URL (two Gmails) are the same site either way, so picking either is
-        not the mistake this guards against."""
-        for w in self._app_webviews():
-            if str(w.get("p") or "") != "persist:profile_%d" % pid: continue
-            for t in wv:
-                if (t.get("url") or "") == (w.get("u") or ""): return t
-        return None
-    def _profile_target(self, url):
-        """(target, "") for the webview that owns this site, or (None, why). The profile already
-        showing the site wins; otherwise Zen Pilot's profile list names the profile that is for this
-        site and we ask the app to open it. A site with no profile of its own is refused rather than
-        opened in somebody else's profile, which would hand the request the wrong cookies."""
-        wv = lambda: [t for t in self.cdp.targets() if t.get("type") == "webview"]
-        host = _host(url)
-        self._no_profile = False
-        if not host: return None, "that URL has no site in it"
-        for t in wv():
-            if _host(t.get("url")) == host: return t, ""
-        m = self._site_profiles()
-        if not m:                       # the app could not be asked: refuse, never guess a profile
-            return None, ("could not read Zen Pilot's profile list — check that Zen Pilot is running "
-                          "and its debug port answers")
-        if not m.get("api"):            # an Electron app with no profile list: nothing to protect, so drive what is open
-            pick = self._match_webview(wv(), url) or (wv() or [None])[0]
-            return (pick, "") if pick else (None, "nothing is open to drive")
-        svc = next((s for s in m.get("s") or [] if _host(s.get("url")) == host), None)
-        if not svc:
-            # The site has no profile of its own. That is the ordinary case for a public page, and it
-            # is not a reason to refuse — see `open`, which reads such a site anonymously.
-            self._no_profile = True
-            have = sorted({_host(t.get("url")) for t in wv() if _host(t.get("url"))})
-            return None, ("no Zen Pilot profile is set up for %s — the profiles it has are for %s. "
-                          "Add a profile for this site in Zen Pilot, or use a site one already covers."
-                          % (host, ", ".join(have) or "nothing yet"))
-        ids = [p["id"] for p in m.get("p") or [] if p.get("service_id") == svc["id"]]
-        if not ids:
-            self._no_profile = True
-            return None, ("Zen Pilot's %s has no profile yet — add one there first." % svc["name"])
-        for pid in ids:                 # already open, even if it has wandered off its own site
-            t = self._by_profile(pid, wv())
-            if t: return t, ""
-        before = {t["id"] for t in wv()}
-        try: self._shell_ev("window.electronAPI.profiles.open(%d)" % ids[0])
-        except Exception as e: return None, "could not open the %s profile: %s" % (svc["name"], e)
-        end = time.time() + 25
-        while time.time() < end:
-            new = [t for t in wv() if t["id"] not in before]
-            if new: return new[0], ""
-            time.sleep(0.5)
-        return None, "Zen Pilot did not open its %s profile" % svc["name"]
-    def _switch_webview(self, url):
-        """Point at the profile that owns the site about to be opened. Returns "" on success, else why
-        the site cannot be opened here. Same app, no new window."""
-        if not getattr(self, "cdp", None): return "the browser is not attached"
-        try: pick, why = self._profile_target(url)
-        except Exception as e: return "could not pick a profile: %s" % e
-        if not pick: return why
-        if pick["id"] != getattr(self, "target_id", ""):
-            # Each attach is held by the browser until it is detached, so switching profile without
-            # letting the last session go leaked one per cross-site open.
-            prev = getattr(self, "page", None)
-            if prev: self.cdp.detach(prev.sid)
-            self.page = CDPPage(self.cdp, self.cdp.attach(pick["id"]))
-            self.target_id = pick["id"]; self.url = pick.get("url", "")
-        return self._foreground(pick)
-    def _pid_of(self, target):
-        """Zen Pilot's profile id for a webview target, or None. The app's own list pairs each
-        profile's partition with the URL it is on — the same pairing `_by_profile` reads the other way
-        round. Two profiles on one URL are the same site either way, so the first match will do."""
-        u = target.get("url") or ""
-        for w in self._app_webviews():
-            if (w.get("u") or "") != u: continue
-            p = str(w.get("p") or "")
-            if p.startswith("persist:profile_"):
-                try: return int(p.rsplit("_", 1)[1])
-                except Exception: return None
-        return None
-    def _foreground(self, target):
-        """Make Zen Pilot actually show the profile behind `target`. It renders one profile at a time
-        and a hidden <webview> is 0x0 — it never paints, so a click lands on nothing and a screenshot
-        has no frame: the bot drives a profile nobody can see and every action is a no-op that still
-        reports success. The app exposes no focus call, so its own sidebar row is the only switch:
-        click the row labelled with the profile's name, expanding its service group if collapsed.
-        Returns "" once that profile is on screen, else why it would not come on screen."""
-        # ponytail: foregrounded at open time only. A turn that switches profiles behind the bot's
-        # back (or two profiles of one service) can still leave it clicking a background webview;
-        # add the same check to click/type/press if that shows up in a turn.
-        pid = self._pid_of(target)
-        if pid is None: return ""           # an Electron app with no profile list: nothing to switch
-        m = self._site_profiles() or {}
-        prof = next((p for p in m.get("p") or [] if p.get("id") == pid), None)
-        if not prof: return ""
-        svc = next((s.get("name") or "" for s in m.get("s") or [] if s.get("id") == prof.get("service_id")), "")
-        name = prof.get("name") or ""
-        click, show = _fg_js(pid, name, svc)
-        end = time.time() + 8
-        while True:
-            try: r = self._shell_ev(click)
-            except Exception: return ""     # cannot reach the app window: leave the open alone
-            if r is None or r == "visible": return ""   # cannot ask, or it is already on screen
-            if r == "clicked": break
-            if time.time() >= end: return ""            # no row ever appeared: leave the open alone
-            time.sleep(0.5)                 # a session that is still starting has no sidebar row yet
-        for _ in range(20):
-            time.sleep(0.3)
-            try: s = self._shell_ev(show)
-            except Exception: return ""
-            if s is not False: return ""    # True = on screen; None = cannot ask
-        return ("Zen Pilot's %s profile is open but will not come on screen, so clicks would land on "
-                "nothing — bring that profile up in Zen Pilot and try again." % name)
     def _attach(self):
-        """Connect to the configured browser, setting self.ok / self.err. Called once when the thread
-        starts and again when a job arrives with no browser yet, so a browser that was not running —
-        or that had no profile open — is picked up as soon as it is."""
-        # A half-made attempt must not pile up. A browser we launched is ours to close; one we
-        # attached to over CDP is somebody else's window, so only our connection to it is dropped.
+        """Set self.ok / self.err for the mode in Settings. In profiles mode nothing is launched
+        here: a profile's browser comes up the first time a site is routed to it, so a machine that
+        never browses never pays for one — and `self.page` stays None until then, which the call
+        guard reports as "open something first" rather than as a crash."""
+        self.mode = (load_settings().get("browser") or {}).get("mode") or "profiles"
+        if self.mode not in ("own", "profiles"): self.mode = "profiles"
+        self.ok = False; self.err = ""; self.page = None
         try:
-            if getattr(self, "browser", None) and not self.attached: self.browser.close()
-        except Exception: pass
-        self.browser = None
-        self.pw = self._driver()    # one driver per thread, shared with the saved profiles
-        self.mode, self.cdp_url = self._cfg()
-        self.ok = False; self.err = ""; self.attached = False; self.page = None
-        try:
-            if self.mode == "profiles":
-                # Nothing is launched here. A profile's browser comes up the first time a site is
-                # routed to it, so a machine that never browses never pays for one — and `self.page`
-                # stays None until then, which the call guard reports as "open something first"
-                # rather than as a crash. There is no port and no attach: we own these browsers.
-                self.engine = "own"; self.attached = False; self.ok = True
-            elif self.mode in ("cdp", "zenpilot") and self.cdp_url and self._attach_webview():
-                pass
-            elif self.mode in ("cdp", "zenpilot") and self.cdp_url:
-                self.browser = self.pw.chromium.connect_over_cdp(self.cdp_url, timeout=30000)
-                ctx = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
-                # A page you already have open is the point of attaching; the browser's own window is
-                # not. (Zen Pilot cannot open a tab for us over CDP either — Target.createTarget is
-                # not supported — so when no profile is open there is genuinely nothing to drive.)
-                page = next((p for p in ctx.pages if _drivable(p.url)), None)
-                if page is None: raise RuntimeError(NO_PAGE_ERR)
-                self.page = page; self.attached = True; self.engine = "cdp"
-                try: self.url = page.url; self.title = page.title()
-                except Exception: pass
-            else:
+            self.pw = self._driver()    # one driver per thread, shared with the saved profiles
+            if self.mode == "own":
+                # A fresh throwaway browser, kept only so the panel has something to show before a
+                # site is opened. Nothing in it survives the process.
                 self.browser = self.pw.chromium.launch(**_launch_opts(True))
                 self.page = _plain_ctx(self.browser).new_page()
-                self.engine = "own"
             self.ok = True
         except Exception as e: self.err = str(e)
         return self.ok
@@ -2876,13 +2554,6 @@ class Browser:
         while True:
             job = q.get()
             if job is None:
-                # Close only the connection this thread made. A restart has already started the next
-                # thread, and that one may own self.cdp by now — closing it here would break it.
-                if self._cdp_owner is threading.current_thread():
-                    try:
-                        if getattr(self, "cdp", None): self.cdp.close()
-                    except Exception: pass
-                    self.cdp = None; self._cdp_owner = None
                 # The saved profiles are per thread, so this one is always ours to end — on a restart
                 # the next thread's browsers live in its own slot and are never touched from here.
                 self._close_persistent()
@@ -2934,10 +2605,10 @@ class Browser:
             me["pp"] = sync_playwright().start()
         return me["pp"]
     def _headless(self):
-        """The throwaway headless browser, launched on first use and kept warm after that. A site with
-        no Zen Pilot profile is a public page: it needs no login, so it needs none of your cookies.
-        Reading it here is the point — refusing it is what sent the bot off to shell out (curl, a
-        hand-rolled CDP script), which is many times slower and sees far less of the page."""
+        """The throwaway headless browser, launched on first use and kept warm after that. A site no
+        account covers is a public page: it needs no login, so it needs none of your cookies.
+        Reading it here is the point — refusing it is what sent the bot off to shell out, which is
+        many times slower and sees far less of the page."""
         me = self._mine()
         try:
             if me["hpage"] is None:
@@ -2949,7 +2620,7 @@ class Browser:
             me["hb"] = None; me["hctx"] = None; me["hpage"] = None
             self.err = "headless: %s" % e
             return None
-    def open(self, url, routes=None):
+    def open(self, url, routes=None, account=None):
         # Every browser URL a bot or the panel asks for comes through here, so this is where the
         # secret store is kept out of reach (see browser_url_guard) rather than at each tool call.
         why = browser_url_guard(url)
@@ -2958,24 +2629,18 @@ class Browser:
         # left alone — prefixing blindly turned a file: URL into "https://file:...".
         if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url): url = "https://" + url
         anon = False; note = ""
-        if self.engine == "webview":
-            why = self._switch_webview(url)   # the profile that is for this site, not whichever is open
-            if why:
-                # No profile for this site. If that is the only problem, read it anonymously rather
-                # than refuse — a public page is the common case, and a refusal is a dead end the bot
-                # works around the slow way. A profiled site whose profile would not open is still a
-                # refusal: serving it anonymously would quietly drop the login the profile exists for.
-                page = self._headless() if self._no_profile else None
-                if page is None:
-                    return json.dumps({"url": url, "title": "", "text": "(not opened — %s)" % why})
-                self.page = page; anon = True
-                note = ("read anonymously in a throwaway browser: no Zen Pilot profile covers this "
-                        "site, so a page that needs a login shows its login wall here")
-        elif self.mode == "profiles":
+        if self.mode == "profiles":
             # A routed site opens in the account that owns it; anything else is a public page and
             # gets the throwaway browser, because opening a logged-in profile for it would hand it
             # cookies it has no business seeing.
-            name = self._route(url, routes)
+            name = self._route(url, routes, account)
+            # A named account that does not cover the site is a mistake worth reporting: opening
+            # anonymously would hide it, and the bot would read the login wall as "not signed in".
+            if account and not name:
+                return json.dumps({"url": url, "title": "", "text":
+                                   "(not opened — no account named %r covers %s; the accounts that do "
+                                   "are listed under Browsing. Leave `account` out for the default.)"
+                                   % (account, _host(url) or url)})
             if name:
                 try:
                     ctx = self._ensure_ctx(name)
@@ -2991,9 +2656,8 @@ class Browser:
                 self.page = page; anon = True
                 note = ("read anonymously in a throwaway browser: no account covers %s, so a page that "
                         "needs a login shows its login wall here. If this site should be signed in, tell "
-                        "the user to add it to an account's sites in %s." %
-                        (_host(url) or url, "this room's Browser section" if routes is not None
-                         else "Settings → Browser"))
+                        "the user to add it to an account's sites in the room's Computer panel." %
+                        (_host(url) or url))
         self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
         self._settle()
         snap = self._snap()
@@ -3050,71 +2714,16 @@ class Browser:
     def back(self):
         self.page.go_back(wait_until="domcontentloaded", timeout=30000); return self._snap()
     def shot(self): return self._png(self.page.screenshot())
-    def _grab(self, target_id, tries=(4,)):
-        """One screenshot from a profile, over a CDP session that is detached again straight away.
-        Each `Target.attachToTarget` opens a session the browser holds until it is closed, and the
-        Computer panel polls faster than they are reclaimed — so a session left open per poll grew
-        without bound (slowness, then attach failures). Detaching here keeps exactly one alive."""
-        sid = self.cdp.attach(target_id)
-        try: return self._png(CDPPage(self.cdp, sid).screenshot(tries=tries))
-        finally: self.cdp.detach(sid)
-    def _on_screen(self):
-        """The profile Zen Pilot is actually showing, as (target, png), or (None, None).
-
-        Zen Pilot renders one profile at a time and a hidden <webview> never produces a frame, so
-        the only honest test of "which one is on screen" is to try to capture each in turn. The one
-        that answers is the one you are looking at."""
-        for t in self.cdp.targets():
-            if t.get("type") != "webview": continue
-            try: return t, self._grab(t["id"])
-            except Exception: continue
-        return None, None
     def _png(self, raw): return "data:image/png;base64," + base64.b64encode(raw).decode()
     def preview(self, force=False):
-        """What the Computer panel shows, as JSON.
-
-        The bot's own profile when it is on screen; otherwise the profile that is — so the panel is
-        a live screen rather than an empty frame, and the caption says which profile you are looking
-        at. This never touches `self.page`, so watching a turn cannot move the bot off its target.
-
-        `force` is the panel's Refresh: it skips the remembered profile below and re-decides from
-        scratch, which is the one thing the poll's own call cannot do."""
+        """What the Computer panel shows, as JSON: the page the bot is on, as a live screenshot.
+        This never touches `self.page`, so watching a turn cannot move the bot off its target.
+        `force` is the panel's Refresh — it re-shoots even when the panel poll would have."""
         if not getattr(self, "page", None):
             return json.dumps({"png": "", "url": "", "title": "", "err":
                                "no page is open yet — ask a bot to browse, or open a profile window below"})
-        if self.engine != "webview" or not getattr(self, "cdp", None):
-            return json.dumps({"png": self._png(self.page.screenshot()), "url": self.page.url,
-                               "title": self.page.title(), "err": ""})
-        # Which profile answers is remembered for a few seconds: on a hidden one it costs two
-        # timeouts to find out, and the panel polls faster than that, so re-deciding every poll is
-        # what would back the browser queue up. The remembered profile is re-captured each time —
-        # this is a live screen, only the *choice* is cached.
-        now = time.time()
-        if not force and self._shot_id and now - self._shot_at < 5:
-            t = next((x for x in self.cdp.targets() if x["id"] == self._shot_id), None)
-            if t is not None:
-                try:
-                    png = self._grab(t["id"])
-                    self._shot_at = now
-                    return json.dumps({"png": png, "url": t.get("url", ""), "title": t.get("title", ""),
-                                       "err": "" if t["id"] == self.target_id else self._behind()})
-                except Exception: self._shot_id = ""
-        try:
-            png = self._png(self.page.screenshot(tries=(4,)))
-            self._shot_id, self._shot_at = self.target_id, now
-            return json.dumps({"png": png, "url": self.page.url, "title": self.page.title(), "err": ""})
-        except Exception:
-            pass
-        t, png = self._on_screen()
-        if not png:
-            return json.dumps({"png": "", "url": "", "title": "", "err":
-                               "no profile is on screen in Zen Pilot — open one there and it appears here"})
-        self._shot_id, self._shot_at = t["id"], now
-        return json.dumps({"png": png, "url": t.get("url", ""),
-                           "title": t.get("title", ""), "err": self._behind()})
-    def _behind(self):
-        return ("showing the profile that is on screen; the bot's own profile (%s) is in the background"
-                % (self.url or "unknown"))
+        return json.dumps({"png": self._png(self.page.screenshot()), "url": self.page.url,
+                           "title": self.page.title(), "err": ""})
     def save(self, selector="img", wait_ms=60000):
         """Wait for `selector`, then download what it points at (img / video / canvas) as a data URL.
         This is the 'wait for the attachment, then download it' step of the free web route."""
@@ -3135,46 +2744,6 @@ class Browser:
                 "image/webp" if low.endswith(".webp") else "image/png")
         return "data:%s;base64,%s" % (mime, b64)
 BROWSER = Browser()
-ZENPILOT_GET = "https://anzenpilot.gumroad.com/l/zenpilot"
-
-def browser_hint(err):
-    """Playwright's connect failures are a stack trace; say the same thing in a sentence, and keep
-    the raw text for the tooltip so nothing is hidden."""
-    e = (err or "").lower()
-    if not err: return "the browser is still starting"
-    if "econnrefused" in e or "connection refused" in e:
-        return "nothing is listening on that port yet; press “Launch ZenPilot & connect”"
-    if "playwright" in e and "not installed" in e:
-        return "the browser engine is not installed on the server; run python3 -m playwright install chromium"
-    if "timeout" in e: return "the browser did not answer in time"
-    return err.split("\n")[0][:160]
-
-def zenpilot_app(bases=("/Applications", os.path.expanduser("~/Applications"))):
-    """The Zen Pilot app bundle if it is on this machine, else ''. A directory listing, not a
-    guess: we only tell the user it is missing after actually looking and not finding it."""
-    for base in bases:
-        try: names = os.listdir(base)
-        except OSError: continue
-        for n in sorted(names):
-            low = n.lower()
-            if low.endswith(".app") and "zen" in low and "pilot" in low:
-                return os.path.join(base, n)
-    return ""
-
-def browser_port(b=None):
-    """The one number that says where the debug port is. Everything else — the launch command, the
-    CDP URL — is derived from it, so they cannot disagree."""
-    b = b if b is not None else (load_settings().get("browser") or {})
-    try: port = int(b.get("port") or 9222)
-    except Exception: port = 9222
-    return port if 1 <= port <= 65535 else 9222
-
-def zenpilot_launch_cmd(port, app=""):
-    """The argv that opens ZenPilot with its debug port. It is identical on every machine, so it is
-    built from the port instead of being typed into a setting (and an argv, not a shell string, so
-    nothing has to be quoted)."""
-    return ["open", "-a", app or "Zen Pilot", "--args", "--remote-debugging-port=%d" % int(port)]
-
 def _host_key(x):
     """A bare host or a whole URL, as the host alone. The sites box is typed by hand, so both
     spellings have to work — and `_host` reads a URL's netloc, which a bare host like `x.com` has
@@ -3185,10 +2754,13 @@ def _host_key(x):
     return x[4:] if x.startswith("www.") else x
 
 def _route_pairs(b=None):
-    """Which account owns which site, as {host: account name}. The settings hold the accounts you
+    """Which accounts own which site, as {host: [account names]}. The settings hold the accounts you
     made in the UI — a name and the sites it handles — and this is the one place that turns them into
-    a lookup, so the browser and the settings page can never disagree. A site nobody claims is read
-    anonymously: sending it to an account would hand it cookies it has no business seeing."""
+    a lookup, so the browser and the settings page can never disagree. A host can be claimed by more
+    than one account — two FPL teams, two inboxes on one provider — so every claimant is kept, in the
+    order it was set up: keying by host alone let the second account silently replace the first, and
+    then nothing could reach it. The first is the default. A site nobody claims is read anonymously:
+    sending it to an account would hand it cookies it has no business seeing."""
     b = b if b is not None else (load_settings().get("browser") or {})
     out = {}
     for a in b.get("accounts") or []:
@@ -3197,7 +2769,7 @@ def _route_pairs(b=None):
         if not name: continue                       # an account with no name cannot be routed to
         for s in re.split(r"[,\s]+", a.get("sites") or ""):
             h = _host_key(s)
-            if h: out[h] = name
+            if h and name not in out.setdefault(h, []): out[h].append(name)
     return out
 
 def _room_routes(ch):
@@ -3338,8 +2910,8 @@ def account_site(name):
     site routed to it. Two rows can share a name, so this can only ever be the first of them; the row
     a button was clicked in is the one that knows, and it uses `first_site`. Empty when nothing is
     routed to the name, and then there is nowhere to land."""
-    for h, n in _route_pairs().items():
-        if n == name: return "https://" + h
+    for h, names in _route_pairs().items():
+        if name in names: return "https://" + h
     return ""
 
 # The cookie names a site only hands out once you are actually signed in. A site gives a brand-new
@@ -3362,6 +2934,7 @@ AUTH_COOKIES = {
     "tiktok.com":   ("sessionid",),
     "pinterest.com": ("_auth",),
     "openai.com":   ("__Secure-next-auth.session-token",),
+    "premierleague.com": ("ST", "global_sso_id"),
 }
 
 def _bare_host(h):
@@ -3454,7 +3027,7 @@ def browser_own_profiles(accounts=None):
     for i in sorted(ids):
         names = ids[i]
         d = os.path.join(base, i); ex = os.path.isdir(d)
-        hosts = sorted(h for h, p in routes.items() if canon(p) == i)
+        hosts = sorted(h for h, ns in routes.items() if any(canon(n) == i for n in ns))
         opened = next((n for n in names if n in up), None)
         si = None
         if not ex:
@@ -3482,9 +3055,6 @@ def browser_brief(ch=None):
     there would tell a bot about an account it cannot use."""
     b = load_settings().get("browser") or {}
     mode = (b.get("mode") or "own").lower()
-    if mode in ("cdp", "zenpilot"):
-        return ("\n\nBrowsing: a site you are signed into in Zen Pilot opens in its profile, already "
-                "logged in; any other site opens anonymously in a blank throwaway browser.")
     room = (ch or {}).get("browser") or []
     rows = browser_own_profiles(room if room else None)["profiles"] if mode == "profiles" else []
     named = [(p["name"], p["hosts"], p["signed_in"]) for p in rows if p["hosts"]]
@@ -3508,12 +3078,20 @@ def browser_brief(ch=None):
         if shown and used + len(ent) > BROWSER_BRIEF_CHARS:
             shown.append("and %d more" % (len(named) - len(shown))); break
         shown.append(ent); used += len(ent)
+    # Several accounts can cover one site — two FPL teams — so the bot must be told it may name one:
+    # without that it could only ever drive whichever account the routing table defaults to.
+    claims = {}
+    for _n, hs, _si in named:
+        for h in hs: claims[h] = claims.get(h, 0) + 1
+    pick = (" Where a site is listed for more than one account, pass the account name as `account` "
+            "to `browser_open` to drive that one; without it the first listed is used."
+            if any(c > 1 for c in claims.values()) else "")
     return ("\n\nBrowsing: " + ("this room is set up with accounts — " if room
                                 else "the user has set up accounts — ") + "; ".join(shown) +
             ". `browser_open` one of those sites and it opens in that account's own browser, already "
             "logged in: never try to log in or type a password yourself. Any other site opens in a "
             "blank throwaway browser with no cookies — that is the right way to search the web or read "
-            "a public page." + BROWSER_OWN_LINE)
+            "a public page." + pick + BROWSER_OWN_LINE)
 
 def open_own_profile(name, sites=None):
     """Open one profile's window so you can sign in to it. The bot drives that same window
@@ -3528,59 +3106,6 @@ def open_own_profile(name, sites=None):
     url = first_site(sites) or account_site(name)
     out = BROWSER.call("profile_open", name=name, url=url, timeout=180)
     return {"ok": not str(out).startswith("("), "out": str(out)[:300]}
-
-def browser_profiles():
-    """What ZenPilot actually has open -- one entry per profile you are logged into (a <webview>
-    target). Also says plainly whether the app is installed and whether its debug port answers, so
-    the UI can tell the user what to do instead of silently using the wrong browser."""
-    b = load_settings().get("browser") or {}
-    port = browser_port(b)
-    url = "http://127.0.0.1:%d" % port
-    app = zenpilot_app()
-    out = {"ok": True, "installed": bool(app), "app": app, "cdp_url": url, "up": False,
-           "profiles": [], "get_url": ZENPILOT_GET, "err": "", "hint": ""}
-    try:
-        targets = cdp_targets(url)
-    except Exception as e:
-        out["err"] = str(e) or "no debug port"; out["hint"] = browser_hint(out["err"]); return out
-    out["up"] = True
-    seen = set()
-    for t in targets:
-        if t.get("type") != "webview": continue
-        host = (urlparse(t.get("url") or "").netloc or "").split(":")[0]
-        if not host or host in seen: continue      # one pin per site; a fragment cannot tell two apart
-        seen.add(host)
-        out["profiles"].append({"host": host, "title": (t.get("title") or "").strip() or host,
-                                "url": t.get("url") or ""})
-    return out
-
-def launch_browser():
-    """Open ZenPilot on the configured debug port, wait for that port to answer, then attach. Only
-    the port is a setting: the command is the same everywhere, so it is built from the port rather
-    than stored, and the two can no longer name different ports."""
-    b = load_settings().get("browser") or {}
-    port = browser_port(b)
-    url = "http://127.0.0.1:%d" % port
-    if sys.platform != "darwin":
-        return {"ok": False, "err": "opening the app for you is macOS-only; start your browser with "
-                                    "--remote-debugging-port=%d, then press Test connection" % port}
-    # `open -a` takes a bundle path as happily as a name, and a path is one we actually found.
-    try:
-        subprocess.Popen(zenpilot_launch_cmd(port, zenpilot_app()),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    except Exception as e:
-        return {"ok": False, "err": "could not open ZenPilot: %s" % e}
-    for _ in range(60):                       # give it up to a minute to open the port
-        try:
-            urllib.request.urlopen(url + "/json/version", timeout=2); break
-        except Exception: time.sleep(1)
-    else:
-        return {"ok": False, "err": "ZenPilot did not open a debug port at %s — another copy may "
-                                    "already be running without the flag" % url}
-    s = load_settings(); s.setdefault("browser", {})
-    s["browser"]["mode"] = "cdp"; s["browser"]["port"] = port; save_settings(s)
-    r = BROWSER.restart(); r["cdp_url"] = url
-    return r
 
 # ---------------------------------------------------------------- model client
 # The model path's retry policy, in the two numbers the user sets in Settings → Models → Context.
@@ -4062,7 +3587,15 @@ def est_tokens(messages):
     magnitude, and `len()` on a string is free."""
     total = 0
     for m in messages:
-        total += len(m["content"]) if isinstance(m.get("content"), str) else len(str(m.get("content") or ""))
+        c = m.get("content")
+        if isinstance(c, str): total += len(c)
+        elif isinstance(c, list):
+            # An image part is billed by its pixels, not by the base64 carrying it: counting those
+            # bytes would make one screenshot look like the whole window, and `fit_messages` would
+            # drop the ask it sits in. A flat figure per picture is the honest rough size.
+            total += sum(len(p.get("text") or "") for p in c if isinstance(p, dict))
+            total += 1000 * sum(1 for p in c if isinstance(p, dict) and p.get("type") == "image_url")
+        else: total += len(str(c or ""))
         tc = m.get("tool_calls")
         if tc: total += len(json.dumps(tc))
         total += 40                                   # the per-message keys/role/quotes overhead
@@ -4256,7 +3789,7 @@ TOOL_SCHEMAS = {
  "run_shell":  _fn("run_shell","Run a shell command in the shared sandbox and return its output.",
                    {"command":{"type":"string","description":"the shell command"},
                     "timeout":{"type":"integer","description":"seconds to allow before the command is killed; default 45, max 600 — pass a bigger one for an install or a test run"}}, ["command"]),
- "read_file":  _fn("read_file","Read a text file from the sandbox.", {"path":{"type":"string"}}, ["path"]),
+ "read_file":  _fn("read_file","Read a text file from the sandbox. A picture is looked at with vision and described back.", {"path":{"type":"string"}}, ["path"]),
  "write_file": _fn("write_file","Write text to a file in the sandbox (overwrites).",
                    {"path":{"type":"string"},"content":{"type":"string"}}, ["path","content"]),
  "list_files": _fn("list_files","List files in a sandbox directory.",
@@ -4264,8 +3797,9 @@ TOOL_SCHEMAS = {
  "generate_image": _fn("generate_image","Draw an image from a text prompt and save it in the sandbox. The picture is shown in the chat.",
                    {"prompt":{"type":"string","description":"what to draw, in English"},
                     "filename":{"type":"string","description":"optional, e.g. hero.png"}}, ["prompt"]),
- "browser_open": _fn("browser_open","Open a URL and return the page's url, title and visible text. Which sites open already signed in, and which open anonymously, is set out under “Browsing” in your instructions — this tool does what that says. Use it for public pages instead of curl.",
-                   {"url":{"type":"string"}}, ["url"]),
+ "browser_open": _fn("browser_open","Open a URL and return the page's url, title and visible text. Which sites open already signed in, and which open anonymously, is set out under “Browsing” in your instructions — this tool does what that says. When a site is listed for more than one account, pass `account` to choose which one drives the page; without it the first listed is used. Use it for public pages instead of curl.",
+                   {"url":{"type":"string"},
+                    "account":{"type":"string","description":"optional, the account name to use when the site is covered by more than one (see Browsing)"}}, ["url"]),
  "browser_read": _fn("browser_read","Return the current page's url, title and visible text.", {}, []),
  "browser_click": _fn("browser_click","Click an element by CSS selector on the current page.",
                    {"selector":{"type":"string"}}, ["selector"]),
@@ -5164,6 +4698,14 @@ def exec_tool(bid, name, args):
     if name == "read_file":
         p = _in_sandbox(args.get("path", ""))
         if not p or not os.path.isfile(p): return "(no such file)", []
+        # A picture read as UTF-8 is mojibake, not a picture. Ask the vision model about it instead,
+        # so a screenshot from an earlier turn is still something a later turn can look at.
+        if os.path.splitext(p)[1].lower() in IMG_EXT:
+            img = _image_data_url(p)
+            if not img: return "(the image is too large to look at — 5 MB is the most that can be sent)", []
+            bot = bot_by_id(load_bots(), bid) or {}
+            return "vision answer: " + vision("Describe this image in detail, including any text in it.",
+                                              img, fallback=bot.get("model", "")), []
         with open(p, encoding="utf-8", errors="replace") as f:
             return f.read(12000)[:6000], []
     if name == "write_file":
@@ -5212,6 +4754,7 @@ def exec_tool(bid, name, args):
         # the only writer of the attribute it is compared against.
         def bcall(fn, **kw): return BROWSER.call(fn, _owner=bid, **kw)
         if name == "browser_open":   return bcall("open", url=args.get("url", ""),
+                                                  account=(args.get("account") or "").strip() or None,
                                                   routes=getattr(_WORK, "routes", None)), []
         if name == "browser_save":
             sel = args.get("selector") or "img"
@@ -5332,9 +4875,10 @@ def _exec_parallel(bid, calls):
     files read, or three commands, cost three round-trips of wall-clock. Each worker is handed the
     turn's working folder, because that lives in a thread-local and a fresh thread would otherwise
     fall back to the shared sandbox."""
-    wd = work_dir(); base = getattr(_WORK, "base", None)
+    wd = work_dir(); base = getattr(_WORK, "base", None); up = getattr(_WORK, "uploads", None)
+    routes = getattr(_WORK, "routes", None)
     def one(call):
-        _WORK.dir = wd; _WORK.base = base
+        _WORK.dir = wd; _WORK.base = base; _WORK.uploads = up; _WORK.routes = routes
         _, name, args = call
         try: return exec_tool(bid, name, args)
         except Exception as e: return ("(the tool %s failed: %s)" % (name, e), [])
@@ -5497,7 +5041,7 @@ def _wrap_up(model, messages, tools, said, bid, used=(), budget=0, why="steps", 
                 % (reason, bid or "the bot", ", ".join(names), tail))
     return "(%s before %s could report.%s)" % (reason, bid or "the bot", tail)
 
-def run_agent(sid, bid, task, context, out, bots, settings, depth=0):
+def run_agent(sid, bid, task, context, out, bots, settings, depth=0, images=None):
     """One bot's turn, run in its own field and written to its own log.
 
     A room's members share the company's repo but never share a folder, and the detail of what
@@ -5508,7 +5052,7 @@ def run_agent(sid, bid, task, context, out, bots, settings, depth=0):
     _WORK.dir = bot_field_dir(bid)
     t0 = time.time()
     try:
-        yield from _agent_loop(sid, bid, task, context, out, bots, settings, depth)
+        yield from _agent_loop(sid, bid, task, context, out, bots, settings, depth, images)
     finally:
         # Every exit path — finish, stall, error, wrap-up, exception — is one turn, and this is the
         # only clock that spans all of them: the loop's own `t0` drives the step budget, not this.
@@ -5516,7 +5060,7 @@ def run_agent(sid, bid, task, context, out, bots, settings, depth=0):
         log_turn(sid, bid, task, out, depth)     # still this bot's field, so the log names it
         _WORK.dir = prev
 
-def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
+def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None):
     bot = bot_by_id(bots, bid)
     if not bot:
         # The choke point for every agent run (direct, delegated or in a room): a bot that is no
@@ -5607,7 +5151,11 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
         parts["Memory & context"] = parts.get("Memory & context", "") + ctx_text
     messages = [{"role": "system", "content": system}]
     if context: messages.append({"role": "system", "content": "Work already done by the team:\n" + context[-3000:]})
-    messages.append({"role": "user", "content": task})
+    # A picture rides in the user message as an image part, which is how the model gets to see it
+    # without a tool call. Delegated sub-agents are handed none: they would pay for it a second time.
+    ask = ([{"type": "text", "text": task}] +
+           [{"type": "image_url", "image_url": {"url": u}} for u in images]) if images else task
+    messages.append({"role": "user", "content": ask})
     if bot["id"] != "producer": yield {"type": "status", "state": "working"}
     ctx_cfg = settings.get("context") or {}
     budget = context_budget(model, ctx_cfg.get("limit") or 0)
@@ -5810,7 +5358,6 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth):
                     if not sb or sub == bid: result = "(unknown teammate)"
                     elif depth >= 3: result = "(delegation is too deep — call finish now.)"
                     elif sub in delegated: result = f"({sb['name']} already worked on this turn — call finish now.)"
-                    elif len(delegated) >= 3: result = "(delegation limit reached — call finish now.)"
                     else:
                         delegated.add(sub)
                         used.append("delegate:" + sub)
@@ -5972,7 +5519,7 @@ def _clean_quote(q):
     text = str(q.get("text") or "")[:2000]
     return {"who": who, "text": text} if text.strip() else None
 
-def _user_message(text, quote, fwd, who=None):
+def _user_message(text, quote, fwd, who=None, attachments=None):
     """The transcript's own record of what you sent: the text, plus the quote you attached to it and
     the forward mark, so reopening the chat draws back exactly what you sent rather than a plain
     line. Kept in the same shape a bot's message uses, so nothing else has to know the difference.
@@ -5981,6 +5528,7 @@ def _user_message(text, quote, fwd, who=None):
     if who: m["who"] = who
     if quote: m["quote"] = {"who": quote.get("who") or "", "text": (quote.get("text") or "")[:1000]}
     if fwd: m["fwd"] = True
+    if attachments: m["attachments"] = attachments
     return m
 
 def _task_with_quote(text, quote):
@@ -6005,7 +5553,8 @@ def _on_it(names):
     if len(names) == 1: return names[0] + " is on it."
     return ", ".join(names[:-1]) + " and " + names[-1] + " are on it."
 
-def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, who=None):
+def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, who=None,
+              attachments=None):
     if channel is None and solo is None:
         # A scoped id that resolves to neither a room nor a bot — a member's chat under a room that has
         # since been deleted, or a bot taken out of it. Returning with nothing opened a stream and closed
@@ -6026,7 +5575,8 @@ def _run_turn(sid, text, bots, settings, channel=None, solo=None, quote=None, fw
         STEER[sid] = collections.deque()      # alive for exactly this turn: it is what a steer lands in
         STEER_CLOSED.discard(sid)
         try:
-            yield from _run_turn_inner(sid, text, bots, settings, channel, solo, quote, fwd, learn, who)
+            yield from _run_turn_inner(sid, text, bots, settings, channel, solo, quote, fwd, learn, who,
+                                       attachments)
         finally:
             STEER.pop(sid, None)              # a steer that arrived too late is not stranded here
             STEER_CLOSED.discard(sid)
@@ -6059,16 +5609,27 @@ def _recent_ctx(sid, n=10, cap=600):
     msgs = [m for m in load(sid)["messages"] if m.get("role") in ("user", "assistant")][:-1]
     return "\n".join(f"{m.get('who') or m['role']}: {str(m.get('content') or '')[:cap]}" for m in msgs[-n:])
 
-def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, learn=None, who=None):
+def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=None, fwd=False, learn=None, who=None,
+                    attachments=None):
     set_work_dir(channel.get("folder") if channel else None)   # per-turn: a room's bots work in that room's repo
+    # What came with this message — and this chat's earlier ones, which stay in the same folder — is
+    # readable by this turn's file tools (see `_in_sandbox`). Set for every turn, not only one that
+    # carries a file, so a screenshot from an earlier message can still be opened.
+    _WORK.uploads = _upload_folder(sid)
     # The room's browser accounts ride with the turn, so a `browser_open` inside it routes through
     # this room's list without the bot being told an account name. None = use the machine-wide list.
     _WORK.routes = _room_routes(channel)
     ctx_saved = False        # set once a save has already carried the ctx chip, so `finally` need not repeat it
     try:
         st = load(sid)
-        if text: st["messages"].append(_user_message(text, quote, fwd, who)); save(sid, st)
-        task = _task_with_quote(text, quote)      # what the bot is handed: the reply, with its quote
+        if text or attachments:
+            st["messages"].append(_user_message(text, quote, fwd, who, attachments)); save(sid, st)
+        # what the bot is handed: the reply, with its quote, and the files that came with it
+        images, shown = [], set()
+        for a in attachments or []:
+            u = _image_data_url(a.get("path") or "", a.get("type") or "")
+            if u and len(images) < 4: images.append(u); shown.add(a.get("path") or "")
+        task = _task_with_quote(text, quote) + _attachments_note(attachments, shown)
         yield {"type": "status", "state": "thinking"}
         wd = work_dir()
         # A 1:1 chat runs in that bot's own field; a room runs in the company's repo, and each
@@ -6079,7 +5640,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
         if channel and solo is None:
             # Mentions are matched on what you typed, not on the quote: a quoted report that happens
             # to name a teammate is a reference, not an address, and must not re-route the room.
-            yield from _channel_turn(sid, task, channel, bots, settings, raw=text, jobs=learn)
+            yield from _channel_turn(sid, task, channel, bots, settings, raw=text, jobs=learn, images=images)
         else:
             bot = bot_by_id(bots, solo)
             if not bot:
@@ -6088,7 +5649,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
                 yield {"type": "error", "msg": "This chat's bot no longer exists — open a chat from the sidebar."}
                 return
             out = {}; seen_plan = False; engaged = []; ran = []
-            for ev in run_agent(sid, solo, task, _recent_ctx(sid), out, bots, settings):
+            for ev in run_agent(sid, solo, task, _recent_ctx(sid), out, bots, settings, images=images):
                 if ev.get("type") == "plan": seen_plan = True
                 elif ev.get("type") == "agent" and ev.get("state") == "start": engaged.append(ev.get("name"))
                 # A tool call arrives twice — once as it starts, once with its output — and only the
@@ -6142,6 +5703,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
             st = load(sid); st["ctx"] = rec; save(sid, st)
         _WORK.dir = None                                     # the next turn in this thread starts clean
         _WORK.base = None
+        _WORK.uploads = None
 
 def mentioned_members(text, members, bots):
     """The member ids `text` names with @, in member order. A mention is @name or @id, matched
@@ -6168,7 +5730,7 @@ def mentioned_members(text, members, bots):
             hits.append(m)
     return hits
 
-def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
+def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, images=None):
     """Channel with a responder mode: lead | auto | everyone. `raw` is what the user typed, without
     any quote attached — the text mentions are matched against. `jobs` collects the members' deferred
     reflection, which `_run_turn` runs once this room's lock is released."""
@@ -6250,7 +5812,7 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None):
         # fragment the next member could not act on — so the tail is wider and each line keeps more.
         ctx = "\n".join(f"{x.get('who') or x['role']}: {str(x.get('content') or '')[:600]}"
                         for x in load(sid)["messages"][-10:])
-        for ev in run_agent(sid, m, text, ctx, out, bots, settings):
+        for ev in run_agent(sid, m, text, ctx, out, bots, settings, images=images):
             t = ev.get("type")
             if t == "plan": continue               # we already emitted the plan
             bid = ev.get("agent") or m
@@ -6713,12 +6275,14 @@ class H(BaseHTTPRequestHandler):
         except Exception: return {}
     def _sid(self, body): return body.get("session") or body.get("bot") or "producer"
     def _bots_public(self, bots):
-        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar","genface")} for b in bots]
+        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar","avatar_closed","genface","genface_closed","preset")} for b in bots]
         # A record written before these keys existed still answers with them, so the client never
         # has to guess whether a missing key means "none" or "this bot is older than the feature".
         for x in out:
             x["outfit"] = x.get("outfit") or ""; x["accessory"] = x.get("accessory") or ""
-            x["avatar"] = x.get("avatar") or 0; x["genface"] = x.get("genface") or ""
+            x["avatar"] = x.get("avatar") or 0; x["avatar_closed"] = x.get("avatar_closed") or 0
+            x["genface"] = x.get("genface") or ""; x["genface_closed"] = x.get("genface_closed") or ""
+            x["preset"] = x.get("preset") or ""
         return out
 
     def _fail(self, e):
@@ -6850,21 +6414,16 @@ class H(BaseHTTPRequestHandler):
             return self._json({"bot": bid, "text": log_read(bid)})
         if u.path == "/api/computer":
             return self._json({"url": BROWSER.url, "title": BROWSER.title, "ok": BROWSER.ok, "err": BROWSER.err,
-                               "mode": BROWSER.mode, "attached": BROWSER.attached})
+                               "mode": BROWSER.mode})
         if u.path == "/api/browser":
+            # What the bots browse with, and whether the engine is up. The accounts themselves live
+            # on each room and are read from /api/browser/own.
             b = load_settings().get("browser") or {}
-            port = browser_port(b)
-            return self._json({"ok": True, "mode": b.get("mode", "own"),
-                               "port": port, "cdp_url": "http://127.0.0.1:%d" % port,
-                               "target_url": b.get("target_url", ""), "target_urls": BROWSER._targets(),
-                               "profile": b.get("profile", "default"), "accounts": b.get("accounts") or [],
+            return self._json({"ok": True, "mode": b.get("mode") or "profiles",
+                               "accounts": b.get("accounts") or [],
                                "headless": bool(b.get("headless", False)),
                                "channel": b.get("channel") or "auto", "channels": installed_channels(),
-                               "engine": BROWSER.engine,
-                               "running": BROWSER.ok, "attached": BROWSER.attached, "err": BROWSER.err,
-                               "hint": browser_hint(BROWSER.err)})
-        if u.path == "/api/browser/profiles":
-            return self._json(browser_profiles())
+                               "running": BROWSER.ok, "err": BROWSER.err})
         if u.path == "/api/browser/own":
             # `?room=` scopes the list to a room's own accounts, which is what its editor draws.
             rid = q.get("room", [""])[0]
@@ -6873,6 +6432,29 @@ class H(BaseHTTPRequestHandler):
                 if not ch: return self._json({"ok": False, "err": "unknown room"})
                 return self._json(browser_own_profiles(ch["browser"]))
             return self._json(browser_own_profiles())
+        if u.path.startswith("/api/upload/"):
+            # An attachment the user sent, drawn back in the transcript. Both halves of the URL are
+            # shape-checked before either becomes a path, so no request can reach outside the one
+            # folder its own chat wrote to.
+            parts = u.path[len("/api/upload/"):].split("/")
+            if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9._-]{1,200}", x) for x in parts):
+                return self.send_error(404)
+            p = os.path.join(SANDBOX, "_uploads", parts[0], parts[1])
+            if not os.path.isfile(p): return self.send_error(404)
+            try: blob = open(p, "rb").read()
+            except OSError: return self.send_error(404)
+            ctype = mimetypes.guess_type(p)[0] or "application/octet-stream"
+            self.send_response(200); self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(blob)))
+            # Inline only for what the page itself draws; everything else downloads under its own
+            # name rather than replacing the app with a PDF viewer or a stray HTML file.
+            disp = "inline" if ctype.startswith(("image/", "text/plain", "video/", "audio/")) else "attachment"
+            self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, parts[1].split("-", 1)[-1]))
+            # Same rule as an uploaded logo: a file served from our own origin must not run anything.
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.end_headers(); self.wfile.write(blob); return
         if u.path.startswith("/api/logo/"):
             # The channel is looked up by id first, so the URL never becomes a path: only a stored
             # channel's own logo can ever be served.
@@ -6909,15 +6491,33 @@ class H(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "private, max-age=300")
             self.end_headers(); self.wfile.write(blob); return
+        if u.path.startswith("/api/preset/"):
+            # A preset frame is an app asset, named by a known shape rather than by user input: the
+            # two parts are matched whole, so the URL can never become a path outside PRESET_DIR.
+            m = re.fullmatch(r"/api/preset/([a-z][a-z-]{0,30})/([a-z0-9-]{1,20})\.webp", u.path)
+            if not m: return self.send_error(404)
+            p = os.path.join(PRESET_DIR, m.group(1), m.group(2) + ".webp")
+            if not os.path.isfile(p): return self.send_error(404)
+            try: blob = open(p, "rb").read()
+            except OSError: return self.send_error(404)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/webp")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers(); self.wfile.write(blob); return
         if u.path.startswith("/api/avatar/"):
             # Same shape as the logo route: the bot is looked up by id first, so the URL never
-            # becomes a path and only a stored bot's own avatar can ever be served.
+            # becomes a path and only a stored bot's own avatar can ever be served. `?closed=1`
+            # picks the shut-eye frame; the id is still the bot id, not part of a file name.
             b = bot_by_id(load_bots(), u.path[len("/api/avatar/"):])
-            av = avatar_state(b) if b else {"path": ""}
-            if not av["path"]: return self.send_error(404)
-            try: blob = open(av["path"], "rb").read()
+            av = avatar_state(b) if b else {"path": "", "closed_path": ""}
+            p = (av.get("closed_path") or "") if q.get("closed", [""])[0] in ("1", "true") else av["path"]
+            if not p: return self.send_error(404)
+            try: blob = open(p, "rb").read()
             except OSError: return self.send_error(404)
-            ctype = LOGO_TYPE.get(os.path.splitext(av["path"])[1].lower(), "application/octet-stream")
+            ctype = LOGO_TYPE.get(os.path.splitext(p)[1].lower(), "application/octet-stream")
             self.send_response(200); self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(blob)))
             # Same reason as a logo: an uploaded SVG served from our own origin must not be able to
@@ -6990,8 +6590,12 @@ class H(BaseHTTPRequestHandler):
             sid = self._sid(body); text = body.get("text"); bots = load_bots(); settings = load_settings()
             ch, solo = resolve_session(sid, body.get("bot"), load_channels(), bots)
             turn = str(body.get("turn") or "")
+            # Attachments are written to disk before the turn starts, so the paths the bot is told
+            # about already exist by the time its first tool call runs.
+            atts = _save_uploads(sid, body.get("attachments"))
             return sse(self, _broadcast(sid, turn, _run_turn(sid, text, bots, settings, channel=ch, solo=solo,
-                                       quote=_clean_quote(body.get("quote")), fwd=bool(body.get("fwd")))))
+                                       quote=_clean_quote(body.get("quote")), fwd=bool(body.get("fwd")),
+                                       attachments=atts)))
         if u.path == "/api/history/truncate":
             # An edited or retried message replaces everything after it, so the transcript holds one
             # version of the conversation rather than every attempt ever made.
@@ -7167,15 +6771,15 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/avatar":
             bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
             if not b: return self._json({"ok": False, "error": "unknown bot"})
-            r = save_avatar(b["id"], body.get("data"))
+            r = set_avatar(b, body.get("data"))
             if r["ok"]:
-                av = avatar_state(b); b["avatar"] = av["v"]; save_bots(bots)
-                r.update({"avatar": av["v"], "avatar_src": av["source"]})
+                save_bots(bots)
+                r.update({"avatar": b["avatar"], "avatar_src": avatar_state(b)["source"]})
             return self._json(r)
         if u.path == "/api/avatar/remove":
             bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
             if not b: return self._json({"ok": False, "error": "unknown bot"})
-            remove_avatar(b["id"]); b["avatar"] = 0; save_bots(bots)
+            remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0; save_bots(bots)
             return self._json({"ok": True, "avatar": 0})
         if u.path == "/api/avatar/transform":
             bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
@@ -7185,10 +6789,20 @@ class H(BaseHTTPRequestHandler):
             data_url, used = gen_image(avatar_prompt(body.get("species"), body.get("color")),
                                        image=body.get("data") or "", timeout=180)
             if not data_url: return self._json({"ok": False, "error": used})
-            r = save_avatar(b["id"], data_url)
+            r = set_avatar(b, data_url)
             if not r["ok"]: return self._json(r)
-            av = avatar_state(b); b["avatar"] = av["v"]; save_bots(bots)
-            return self._json({"ok": True, "avatar": av["v"]})
+            # The shut-eye frame is drawn from the open one, so the blink lines up. Best effort:
+            # without it the picture simply does not blink.
+            try:
+                shut, _ = gen_image(face_closed_prompt(), image=data_url, timeout=180)
+                bid = _logo_id(b["id"])
+                if shut and bid:
+                    c = _save_image(AVATAR_DIR, bid + "-closed", shut, "avatar")
+                    if c.get("ok"): b["avatar_closed"] = avatar_state(b)["closed_v"]
+            except Exception:
+                pass
+            save_bots(bots)
+            return self._json({"ok": True, "avatar": b["avatar"], "avatar_closed": b["avatar_closed"]})
         if u.path == "/api/faces/source":
             r = _save_image(FACES_DIR, "src", body.get("data"), "image", cap=6 << 20)
             if not r.get("ok"): return self._json(r)
@@ -7222,14 +6836,28 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/faces/assign":
             bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
             if not b: return self._json({"ok": False, "error": "unknown bot"})
-            f = (body.get("file") or "").strip()
-            if f and f not in faces_batch()["files"]:
-                return self._json({"ok": False, "error": "that face is not in the set"})
-            set_genface(b, f); save_bots(bots)
-            return self._json({"ok": True, "genface": b["genface"]})
+            preset = (body.get("preset") or "").strip()
+            if preset:
+                if preset not in PRESET_IDS:
+                    return self._json({"ok": False, "error": "that preset does not exist"})
+                # Exactly one face source wins: a preset is a whole character, so the drawn face and
+                # the bot's own picture go, and the picture's file goes with them.
+                b["preset"] = preset
+                b["genface"] = ""; b["genface_closed"] = ""
+                if b.get("avatar"):
+                    remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
+            else:
+                f = (body.get("file") or "").strip()
+                if f and f not in faces_batch()["files"]:
+                    return self._json({"ok": False, "error": "that face is not in the set"})
+                set_genface(b, f)
+            save_bots(bots)
+            return self._json({"ok": True, "preset": b.get("preset") or "",
+                               "genface": b["genface"], "genface_closed": b["genface_closed"]})
         if u.path == "/api/faces/clear":
             bots = load_bots()
-            for b in bots: b["genface"] = ""
+            for b in bots:
+                b["genface"] = ""; b["genface_closed"] = ""; b["preset"] = ""
             save_bots(bots)
             # The introduced image stays: it is what the next set is drawn from, and the panel says so.
             _save_json(FACES_BATCH_PATH, {"source": faces_batch()["source"]})
@@ -7422,8 +7050,18 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True, "routines": rs})
         if u.path == "/api/browser/restart":
             return self._json(BROWSER.restart())
-        if u.path == "/api/browser/launch":
-            return self._json(launch_browser())
+        if u.path == "/api/browser/accounts":
+            # The Computer panel's account rows save here. A room's list is the room's, so it is
+            # written to the room; with no room named (a chat with one bot) it is the default list.
+            acc = _norm_accounts(body.get("accounts"))
+            rid = (body.get("room") or "").strip()
+            if rid:
+                chs = load_channels(); ch = channel_by_id(chs, rid)
+                if not ch: return self._json({"ok": False, "err": "unknown room"})
+                ch["browser"] = acc; save_channels(chs)
+                return self._json({"ok": True, "accounts": acc})
+            s = load_settings(); s.setdefault("browser", {})["accounts"] = acc; save_settings(s)
+            return self._json({"ok": True, "accounts": acc})
         if u.path == "/api/browser/own/open":
             return self._json(open_own_profile(body.get("name", ""), body.get("sites")))
         if u.path == "/api/computer/open":
@@ -7498,6 +7136,7 @@ class H(BaseHTTPRequestHandler):
 def boot(warm_browser=True):
     """Everything that has to happen once before the socket opens: a session for every bot and
     company on the roster, the routine scheduler, and the headless browser warm-up."""
+    _migrate_room_browser()
     for b in load_bots(): new_session(b["id"], bot=b["id"], title=b["name"])
     for c in load_channels(): new_session(c["id"], bot=None, title=c["name"])
     threading.Thread(target=scheduler, daemon=True).start()

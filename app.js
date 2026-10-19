@@ -160,14 +160,20 @@ function sideFace(color) { return { flat: AV[color] || AV.blue }; }
 /* What a bot is wearing, and the picture it has for a face: the things that are not its colour or
    its species. Kept in one place so every face the bot appears as — the sidebar row, the editor's
    preview, the dock, the computer panel — is dressed the same, the way `faceOf` keeps them all the
-   same species. `avatar` is a version number, not a URL, so a new picture busts the cache. */
+   same species. `avatar` is a version number, not a URL, so a new picture busts the cache. A
+   `preset` is a whole character whose frames replace the picture, so no image is passed with it. */
 const avatarUrl = b => b && b.avatar ? `/api/avatar/${encodeURIComponent(b.id)}?v=${b.avatar}` : "";
-/* A face from the Bot faces section: one file the image model drew for this bot, body and all. The
-   name is unique per batch, so the URL is its own cache key. A bot's own introduced picture is an
-   override and wins — the engine draws it as the face of a drawn body instead. */
+const avatarClosedUrl = b => b && b.avatar && b.avatar_closed
+  ? `/api/avatar/${encodeURIComponent(b.id)}?closed=1&v=${b.avatar_closed}` : "";
+/* A face from the Bot faces section: one file the image model drew for this bot. The name is unique
+   per batch, so the URL is its own cache key. It is the same thing as the bot's own picture — the
+   drawing is the face, not the body — and the record already keeps whichever was picked last. */
 const genfaceUrl = b => b && b.genface ? `/api/face/${encodeURIComponent(b.genface)}` : "";
+const genfaceClosedUrl = b => b && b.genface_closed ? `/api/face/${encodeURIComponent(b.genface_closed)}` : "";
 const lookOf = b => ({ outfit: (b && b.outfit) || "", accessory: (b && b.accessory) || "",
-  image: avatarUrl(b), whole: avatarUrl(b) ? "" : genfaceUrl(b) });
+  preset: (b && b.preset) || "",
+  image: (b && b.preset) ? "" : genfaceUrl(b) || avatarUrl(b),
+  imageClosed: (b && b.preset) ? "" : (genfaceUrl(b) ? genfaceClosedUrl(b) : avatarClosedUrl(b)) });
 /* The dock is the one big face, so it keeps Coucou's full grading — a soft body lit from the top —
    and that is also what carries the state: a flat fill has nowhere to put the working / searching
    tint, so a flat dock would stop telling you what the bot is doing. Only the colour changes here. */
@@ -365,7 +371,7 @@ const S = { bots: [], channels: [], models: [], settings: {}, skills: [], routin
      work is still on screen when you come back rather than looking lost. `queue` holds the tasks
      typed while *that same* chat's turn was already running, keyed by chat, so one chat's backlog
      never runs in another. */
-  turns: {}, queue: {}, ctxSess: null, sideMochi: {}, facePrev: null, compFace: null,
+  turns: {}, queue: {}, ctxSess: null, sideMochi: {}, chatMochi: {}, facePrev: null, compFace: null,
   /* The files panel's own place: the directory being shown, relative to the chat's repo root, the
      root itself (the absolute path a copy needs), the apps the "Open with" submenu offers, and which
      chat the directory belongs to — a path browsed in one repo is not a path in another. */
@@ -423,6 +429,9 @@ function dockFace() {
   S.dock.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null);
   S.dock.cv.dataset.species = S.dock.species;
   compDress();                                            // the computer panel's placeholder follows too
+  /* Its accounts follow the chat too, but only when the chat changed: `renderNav` calls this on every
+     redraw, and rebuilding the rows there would take the caret out of a name being typed. */
+  if ($("#comp").classList.contains("on") && accFor !== S.active) compAccounts();
 }
 function showTip(txt, holdMs = 0) { const tip = $("#dockTip"); if (!tip) return;
   tip.textContent = txt; tip.classList.add("on"); clearTimeout(tipTimer);
@@ -872,6 +881,11 @@ window.anzenBack = () => {
 };
 function renderChats() {
   const box = $("#chats"); if (!box) return;
+  for (const m of Object.values(S.chatMochi)) {           // the list is rebuilt — retire its faces
+    if (m._idleTimer) clearTimeout(m._idleTimer);
+    detach(m);
+  }
+  S.chatMochi = {};
   const q = (S.chatQuery || "").trim().toLowerCase();
   /* A chat scoped to a company is still a chat with one bot, so it is named for the bot — the
      company is a quiet qualifier beside it, never in place of it. The qualifier is shown only where
@@ -898,6 +912,16 @@ function renderChats() {
       <span class="cts">${esc(ago(c.ts))}</span>`;
     li.onclick = () => { if (c.id !== S.active) select(c.id); };
     kbd(li, li.onclick);
+    /* A direct chat is a conversation with one bot, so its row wears that bot's face — the same
+       live drawing the bot's own row does. It used to be a generic glyph, which meant changing a
+       bot's face changed nothing anywhere in the chat list. A room keeps its icon. */
+    const b = c.kind === "room" ? null : botOf(c.id);
+    if (b) {
+      const cv = document.createElement("canvas"); cv.className = "ck face";
+      cv.setAttribute("aria-hidden", "true");
+      li.querySelector(".ck").replaceWith(cv);
+      S.chatMochi[c.id] = attach(cv, "idle", { size: 26, species: faceOf(b), ...sideFace(b.color), ...lookOf(b) });
+    }
     box.appendChild(li);
   }
 }
@@ -1050,6 +1074,7 @@ async function select(id) {
   workingClear();
   closeModelMenu(); closeMention();
   S.reply = null; renderReply();      // a reply belongs to the chat it was started in
+  pending = []; attachSay = ""; renderAttach();   // ...and so do the files picked for it
   $$("#bots .bot, #chans .bot").forEach(x => x.classList.toggle("sel", x.dataset.id === id));
   const sb = botOf(id);
   $("#hName").textContent = (sb && sb.emoji ? sb.emoji + "  " : "") + NAME(id);
@@ -1153,7 +1178,7 @@ function render(messages, pending) {
        and none of the reasons. `sys` is the app talking too (a compression note). Both are drawn here
        exactly as drawTurnEvent draws the live card, so a saved note and a live one cannot differ. */
     else if (m.role === "notice" || m.role === "sys") addCard("sys", "", m.content, sink);
-    else addMsg(m.role, m.content, m.who, sink, { quote: m.quote, fwd: m.fwd, i, ts: m.ts, took: m.took }, S.active);
+    else addMsg(m.role, m.content, m.who, sink, { quote: m.quote, fwd: m.fwd, attachments: m.attachments, i, ts: m.ts, took: m.took }, S.active);
   });
   if (pending) addApproval(pending.cmd, pending.agent);
   /* A turn that is still running here has already drawn cards into this chat. Put them back in
@@ -1220,6 +1245,7 @@ function addMsg(role, text, who, to, meta, sid) {
   const d = el("div", "m " + (role === "user" ? "user" : "bot"));
   if (meta && meta.quote) d.appendChild(quoteBlock(meta.quote));
   if (meta && meta.fwd) d.appendChild(el("div", "fwd", "↪ Forwarded"));
+  if (meta && meta.attachments && meta.attachments.length) d.appendChild(attachBlock(meta.attachments));
   /* When it landed. A message redrawn from the transcript carries the server's own stamp; one drawn
      as it is sent is stamped now, which is the same moment to within the round-trip. */
   const when = stampAt(meta && meta.ts ? meta.ts * 1000 : Date.now());
@@ -1321,11 +1347,35 @@ async function retryMsg(i) {
   for (let k = i - 1; k >= 0; k--) if (S.messages[k] && S.messages[k].role === "user") { u = k; break; }
   if (u < 0) { alert("There is no message to ask again."); return; }
   const m = S.messages[u];
-  const opts = (m.quote || m.fwd) ? { quote: m.quote, fwd: m.fwd } : null;
+  /* A retried message keeps its files: the server still has them, so the record goes back as it
+     came and the bot is told the same paths it was told the first time. */
+  const opts = (m.quote || m.fwd || (m.attachments || []).length)
+    ? { quote: m.quote, fwd: m.fwd, attachments: m.attachments } : null;
   if (!await truncateAt(u)) return;
   pinned = true;                 // asking again puts you back at the live end of the chat
   render(S.messages, null);
   await deliver(S.active, m.content || "", opts);
+}
+/* The files that came with a message. A picture is drawn as the picture — a screenshot you sent is
+   something you want to see, not a row with its name in it — and anything else is a chip that
+   downloads under its own name. `url` is the server's copy; a message drawn the moment it is sent
+   has only the `data` URL it was read into, and the two are the same file. */
+function attachBlock(list) {
+  const b = el("div", "atts");
+  for (const a of list) {
+    const src = a.url || a.data;
+    const img = /^image\//.test(a.type || "") || /\.(png|jpe?g|gif|webp|avif)$/i.test(a.name || "");
+    if (img && src) {
+      const im = el("img"); im.src = src; im.alt = a.name || "attachment"; im.title = a.name || "";
+      b.appendChild(im);
+    } else {
+      const f = el("a", "afile"); f.href = src || "#"; f.download = a.name || ""; f.target = "_blank";
+      f.rel = "noopener"; f.title = "Download " + (a.name || "this file");
+      f.innerHTML = `<span>${esc(a.name || "file")}</span>` + (a.size ? `<span class="as">${kb(a.size)}</span>` : "");
+      b.appendChild(f);
+    }
+  }
+  return b;
 }
 /* The quoted message, drawn above the reply that answers it — the same two lines you get when you
    quote someone in any chat app, so the reply is readable on its own. */
@@ -1552,11 +1602,64 @@ async function deliver(sid, text, opts) {
   await runChat("/api/chat", { session: sid, bot: b ? b.id : undefined, text, ...o });
 }
 async function send() {
-  const text = $("#input").value.trim(); if (!text) return;
+  const text = $("#input").value.trim();
+  if (!text && !pending.length) return;
   closeMention();                                        // the picker is for the text just sent
   $("#input").value = ""; $("#input").style.height = "auto";
   const q = S.reply; S.reply = null; renderReply();      // the quote goes with this one message only
-  await deliver(S.active, text, q ? { quote: q } : null);
+  const atts = pending; pending = []; attachSay = ""; renderAttach();
+  const o = {};
+  if (q) o.quote = q;
+  if (atts.length) o.attachments = atts;
+  await deliver(S.active, text, (q || atts.length) ? o : null);
+}
+
+/* ---------------- attachments ---------------- */
+/* A file rides with the message as a data URL — the same shape the skill installer already takes, so
+   the server needs no second upload path and the client no second endpoint. It is held here until
+   Send, and the strip above the box is the one place to see it or drop it. */
+let pending = [], attachSay = "";
+/* One cap on the whole message, not per file: the server's body limit is on the body, and a file is
+   sent base64 (a third larger) inside the JSON. 20 MB of files is ~27 MB on the wire, comfortably
+   under it, and one number is one thing to explain. */
+const MAX_ATTACH = 20 * 1024 * 1024;
+const MAX_ATTACH_N = 10;
+const kb = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
+function renderAttach() {
+  const box = $("#attach"); if (!box) return;
+  box.hidden = !pending.length && !attachSay; box.innerHTML = "";
+  pending.forEach((a, i) => {
+    const c = el("div", "achip");
+    if ((a.type || "").startsWith("image/")) { const im = el("img"); im.src = a.data; im.alt = ""; c.appendChild(im); }
+    c.appendChild(el("span", "an", esc(a.name)));
+    c.appendChild(el("span", "as", kb(a.size)));
+    const x = el("button", "ax", "\u00D7");
+    x.title = "Remove this file"; x.setAttribute("aria-label", "Remove " + a.name);
+    x.onclick = () => { pending.splice(i, 1); renderAttach(); };
+    c.appendChild(x); box.appendChild(c);
+  });
+  if (attachSay) box.appendChild(el("div", "ahint", esc(attachSay)));
+}
+/* Read each file into the strip as it is picked. A file too big is named rather than silently left
+   out: the message still sends, and the one that did not make it is the one thing to say. */
+function addFiles(list) {
+  attachSay = "";
+  let total = pending.reduce((n, a) => n + (a.size || 0), 0);
+  for (const f of list || []) {
+    if (pending.length >= MAX_ATTACH_N) { attachSay = "Up to " + MAX_ATTACH_N + " files per message."; break; }
+    if (total + f.size > MAX_ATTACH) {
+      attachSay = f.name + " was not added — a message can carry up to " + kb(MAX_ATTACH) + " of files.";
+      continue;
+    }
+    total += f.size;
+    const r = new FileReader();
+    r.onload = () => {
+      pending.push({ name: f.name || "file", type: f.type || "", size: f.size, data: r.result });
+      renderAttach();
+    };
+    r.readAsDataURL(f);
+  }
+  renderAttach();
 }
 
 /* ---------------- quote and forward ---------------- */
@@ -1747,12 +1850,16 @@ function renderQueue() {
   box.appendChild(el("div", "qhead", q.length === 1 ? "1 task queued" : q.length + " tasks queued"));
   q.forEach(it => {
     const row = el("div", "qitem");
-    row.appendChild(el("span", "qtext", esc((it.opts && it.opts.fwd ? "↪ " : "") + it.text)));
+    const nf = (it.opts && it.opts.attachments || []).length;
+    row.appendChild(el("span", "qtext", esc((it.opts && it.opts.fwd ? "↪ " : "") + it.text
+      + (nf ? (it.text ? " " : "") + "(" + nf + (nf === 1 ? " file)" : " files)") : ""))));
     /* The row is what the click leaves on screen, so it says what the click did: the turn has it and
        hands it over at its next step. It deliberately does not say the message arrived — that is the
-       turn's own `steer` event to claim (see `steerNow`), and the wording must not claim it first. */
+       turn's own `steer` event to claim (see `steerNow`), and the wording must not claim it first.
+       A message with files is not offered a steer: a steer carries words only, so handing it over
+       early would drop them — it waits its turn, where the files go with it. */
     if (it.steering) row.appendChild(el("span", "qnote", `<span class="spin"></span> taken — handing over…`));
-    else {
+    else if (!nf) {
       const s = el("button", "qsteer", "Steer now");
       s.title = "Hand this to the running task now instead of waiting for it to finish";
       s.onclick = () => steerNow(it.id);
@@ -2369,6 +2476,7 @@ async function openComp() {
   // retired on close, like the settings preview, so a hidden panel costs no animation frames.
   if (!S.compFace) S.compFace = attach($("#compFace"), "idle", { size: 210, species: "mochi", ...sideFace("blue") });
   compDress();
+  compAccounts();
   await refreshComp();
   clearInterval(compTimer); compTimer = setInterval(refreshComp, 2500);
 }
@@ -2378,6 +2486,7 @@ async function openComp() {
 function closeComp(restoreFocus = true) {
   const c = $("#comp"); const wasOpen = c.classList.contains("on");
   c.classList.remove("on"); c.inert = true; document.body.classList.remove("overlay"); clearInterval(compTimer);
+  clearTimeout(accTimer);
   if (S.compFace) { detach(S.compFace); S.compFace = null; }
   if (restoreFocus && wasOpen && $("#btnComp").focus) $("#btnComp").focus();
 }
@@ -2413,6 +2522,129 @@ async function refreshComp(force) {
     // bot" — so it stands alone; "no screen yet" in front of it only said the same thing twice.
     $("#compMeta").textContent = d.err || "no screen yet — open a page below";
   }
+}
+/* The accounts belong to the chat's room, so they live in this panel rather than behind the room
+   editor: browsing is what the panel is about, and a bot needs no account name typed into the chat.
+   A chat with one bot edits the default list. A room with no list of its own means "use the default
+   list", so the panel shows those rows and the first edit adopts them into the room. */
+let accTimer = null, accFor = null;     // `accFor` is the chat the rows were drawn for
+function compAccounts() {
+  const box = $("#compAcc"); if (!box) return;
+  clearTimeout(accTimer);
+  accFor = S.active;
+  const ch = S.activeIsChannel ? chan(S.active) : null;
+  const room = ch ? ch.id : "";
+  /* Which list the rows are: the room's own once it has one, else the default list it falls back to.
+     Re-derived on every read, because the first edit in a room's panel is what gives it its own. */
+  const scope = () => ch && (ch.browser || []).length ? "?room=" + encodeURIComponent(ch.id) : "";
+  const rows = JSON.parse(JSON.stringify(ch && (ch.browser || []).length ? ch.browser
+                                                : ((S.settings.browser || {}).accounts || [])));
+  const say = $("#compAccSay");
+  $("#compAccHint").textContent = !ch
+    ? "A chat with one bot uses the default list. The same rows live on each room in its computer panel."
+    : (ch.browser || []).length
+      ? "These are " + ch.name + "'s accounts: a bot working in this room opens a site in the account that covers it, already signed in, and opens everything else in a blank browser."
+      : "This room has no accounts of its own, so it uses the default list below. Change a row here and the room gets its own copy of the list, which the other rooms do not share.";
+  const state = {};                   // account name -> the profile row the server reports
+  const CLOSE = "Remember to close the window — closing it is what saves the login, and a window left open has not written it yet.";
+  /* A row's three answers: where the account stands, what to do about it, and what its button says.
+     A button still reading "Sign in" on an account whose window is already open reads as a second
+     sign-in; "Open window" is what pressing it really does once the profile exists.
+     `owner` is the first row that claimed this browser profile: two rows that reduce to one folder
+     (the same name twice, or a case difference macOS resolves to one folder) are one browser, and
+     only the first is reported as the account — the second says whose it shares. */
+  const paint = (pf, owner) => {
+    if (owner) return { t: "Same browser as “" + owner + "”", btn: "Open window",
+      why: "Two rows that reduce to one folder are one browser, so they share its logins. Rename one if that is not what you meant." };
+    if (!pf || !pf.exists) return { t: "Not signed in yet", btn: "Sign in",
+      why: "Press Sign in, log in in the window that opens, then close the window. " + CLOSE };
+    if (pf.signed_in === true) return { t: "Signed in" + (pf.up ? " — window is open" : ""), btn: "Open window",
+      why: "This account's browser has the site's own sign-in cookie. " + CLOSE };
+    if (pf.up) return { t: "Window is open — log in there, then close it", btn: "Open window", why: CLOSE };
+    if (pf.signed_in === null) return { t: "Cannot confirm this site's login", btn: "Sign in",
+      why: "The app does not know which cookie this site sets on sign-in, so it cannot tell whether you are logged in. Open the window and check. " + CLOSE };
+    return { t: "Sign in again", btn: "Sign in",
+      why: "No sign-in cookie was found for this account. Press Sign in, log in, then close the window. " + CLOSE };
+  };
+  const read = async () => {
+    try {
+      const o = await (await fetch("/api/browser/own" + scope())).json();
+      for (const pf of o.profiles || [])
+        for (const n of (pf.names || [pf.name])) state[n] = pf;
+    } catch (e) {}
+  };
+  /* Every edit is saved at once — there is no Save button in a side panel. A blank name is not an
+     account, so it is left out of what is stored until it has one. */
+  const saved = async () => {
+    const r = await jpost("/api/browser/accounts", { room, accounts: rows.filter(a => (a.name || "").trim()) });
+    if (!r.ok) { say.textContent = "Could not save — " + (r.err || "unknown"); return; }
+    if (ch) ch.browser = r.accounts;
+    else S.settings.browser = Object.assign({}, S.settings.browser || {}, { accounts: r.accounts });
+    say.textContent = "";
+  };
+  const infos = [];                   // {name, owner, info, btn}, so the poll repaints and never redraws
+  const draw = async () => {
+    clearTimeout(accTimer);
+    await read();
+    box.innerHTML = ""; infos.length = 0;
+    const claimed = {};               // profile id -> the name of the first row that claimed it
+    rows.forEach((a, i) => {
+      const row = el("div");
+      row.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap";
+      const nm = el("input"); nm.value = a.name; nm.placeholder = "Account name";
+      nm.setAttribute("aria-label", "Account name");
+      nm.style.cssText = "width:140px";
+      const sites = el("input"); sites.value = a.sites;
+      sites.placeholder = "Sites the bots open — e.g. x.com"; sites.setAttribute("aria-label", "Sites this account covers");
+      sites.style.cssText = "flex:1;min-width:180px";
+      const si = el("button", "btn ghost sm", "Sign in");
+      const rm = el("button", "btn ghost sm", "\u00D7");
+      rm.title = "Remove this row. Its saved logins stay on disk under the old name.";
+      rm.setAttribute("aria-label", "Remove " + (a.name || "this account"));
+      /* The row's state is a sentence, and a screen reader must hear it change without the caret
+         jumping — polite, and tied to the row rather than announced as a stray paragraph. */
+      const info = el("span", "desc"); info.style.cssText = "flex:1 1 100%;margin:-2px 0 4px";
+      info.setAttribute("role", "status"); info.setAttribute("aria-live", "polite");
+      nm.onchange = () => { a.name = nm.value.trim(); saved(); };
+      sites.onchange = () => { a.sites = sites.value.trim(); saved(); };
+      si.onclick = async () => {
+        si.textContent = "Opening…"; si.disabled = true;
+        const res = await jpost("/api/browser/own/open", { name: a.name || "default", sites: a.sites });
+        si.disabled = false; si.textContent = "Sign in";
+        say.textContent = res.ok ? (res.out || "opened") : ("Could not open — " + (res.err || "unknown"));
+        draw();
+      };
+      rm.onclick = () => { rows.splice(i, 1); saved(); draw(); };
+      row.append(nm, sites, si, rm, info); box.appendChild(row);
+      const pf = state[a.name];
+      let owner = null;               // the first row that claimed this browser, when it is not this one
+      if (pf) { owner = claimed[pf.id] || null; claimed[pf.id] = claimed[pf.id] || a.name; }
+      const rec = { name: a.name, owner, info, btn: si };
+      paintRow(rec);
+      infos.push(rec);
+    });
+    if (!rows.length) box.appendChild(el("div", "hint", "No accounts — every site opens in a blank browser."));
+    const add = el("button", "btn ghost sm", "Add account");
+    add.onclick = () => { rows.push({ name: "", sites: "" }); draw(); };
+    box.appendChild(add);
+    if (box.isConnected && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
+  };
+  /* A sign-in happens in the other window, so nothing here would notice it. While a window is open,
+     keep the states fresh — the row turns to Signed in on its own. Text only, so it cannot steal
+     focus from someone typing a name or a site. */
+  const refresh = async () => {
+    clearTimeout(accTimer);
+    await read();
+    for (const r of infos) paintRow(r);
+    if (box.isConnected && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
+  };
+  /* Text, tooltip and button together: the line says where the account stands, the tooltip says what
+     to do about it, and the button says what pressing it will really do. */
+  function paintRow(rec) {
+    const p = paint(state[rec.name], rec.owner);
+    rec.info.textContent = p.t; rec.info.title = p.why; rec.btn.textContent = p.btn;
+  }
+  draw();
 }
 
 /* ---------------- files panel ---------------- */
@@ -2604,11 +2836,11 @@ function closeLink(restoreFocus = true) {
    you click. The order is the order you meet them: what the app runs on, what is in it, how it
    behaves. This is why there is no "Engines" any more: one tab held the AI endpoint, the browser and
    the phone, and nothing in the word said which of the three a given control belonged to. The AI side
-   and the browser are separate sections now, the way ZCode's own settings separate them. */
+   and the phone are separate sections now, the way ZCode's own settings separate them — and the
+   browser's accounts are not here at all: they belong to a room, so they sit in its computer panel. */
 const TABS = [
   ["general", "General", "settings", "Set up"],
   ["models", "AI model", "models", "Set up"],
-  ["browser", "Browser", "monitor", "Set up"],
   ["phone", "Phone", "phone", "Set up"],
   ["bots", "Bots", "bots", "Your workspace"],
   ["faces", "Bot faces", "faces", "Your workspace"],
@@ -2700,7 +2932,7 @@ function renderPanel() {
   const p = $("#setPanel"); p.innerHTML = "";
   if (S.facePrev) { detach(S.facePrev); S.facePrev = null; }   // the face preview dies with the panel
   p.setAttribute("aria-labelledby", "tab-" + curTab);
-  ({ general: tabGeneral, channels: tabChannels, bots: tabBots, faces: tabFaces, models: tabModels, browser: tabBrowser,
+  ({ general: tabGeneral, channels: tabChannels, bots: tabBots, faces: tabFaces, models: tabModels,
      phone: tabPhone, approvals: tabApprovals, memory: tabMemory, skills: tabSkills, plugins: tabPlugins,
      apps: tabApps, voice: tabVoice, appearance: tabAppearance, help: tabHelp }[curTab] || tabGeneral)(p);
 }
@@ -2894,51 +3126,6 @@ function browseFolder(start, onPick) {
   modal.querySelector('[data-a="use"]').onclick = () => { onPick(cur); close(); };
   load(cur);
 }
-/* ZenPilot keeps every profile you are signed into open as a <webview>. Rather than type each
-   site into the pin field by hand, list what is actually open and let the user tick what to reuse.
-   Every path that cannot work says why, in the modal, instead of failing silently. */
-async function importProfiles(onPick) {
-  const z = await (await fetch("/api/browser/profiles")).json();
-  const { modal, close } = openPick({
-    icon: "monitor", title: "Import ZenPilot profiles",
-    body: `<div class="desc" data-a="lede"></div><div class="blist" data-a="list"></div>`,
-    foot: `<button class="btn ghost" data-a="all">Select all</button><span class="grow"></span>
-    <button class="btn pri" data-a="use">Import selected</button>`,
-  });
-  const lede = modal.querySelector('[data-a="lede"]'), listEl = modal.querySelector('[data-a="list"]');
-  const all = modal.querySelector('[data-a="all"]'), use = modal.querySelector('[data-a="use"]');
-  const dead = html => { lede.innerHTML = html; listEl.remove(); use.remove(); all.remove(); };
-  const link = `<a href="${esc(z.get_url || "")}" target="_blank" rel="noopener">Get ZenPilot</a>`;
-  if (!z.installed)
-    return dead(`ZenPilot is not installed on this machine. ${link}, open a profile and sign in, then press
-      “Launch ZenPilot &amp; connect” in the Browser card.`);
-  if (!z.up)
-    return dead(`ZenPilot is installed, but nothing is answering at <code>${esc(z.cdp_url || "")}</code>.
-      Press “Launch ZenPilot &amp; connect” in the Browser card, then import.`);
-  const profs = z.profiles || [];
-  if (!profs.length)
-    return dead(`ZenPilot is running, but no profile window is open. Open a profile in ZenPilot, then import again.`);
-  lede.textContent = "Tick the profiles the bots should reuse. Each one pins that site, so a bot works in the window you are already signed into.";
-  const picked = new Set(profs.map(p => p.host));
-  const draw = () => {
-    listEl.innerHTML = "";
-    for (const p of profs) {
-      const on = picked.has(p.host);
-      const row = skBox(`<span class="ck"></span><span><b>${esc(p.host)}</b><span>${esc(p.title)}</span></span>`, on,
-        nv => { nv ? picked.add(p.host) : picked.delete(p.host); draw(); });
-      listEl.appendChild(row);
-    }
-    all.textContent = picked.size === profs.length ? "Clear" : "Select all";
-  };
-  draw();
-  all.onclick = () => { const wasAll = picked.size === profs.length; picked.clear();
-    if (!wasAll) profs.forEach(p => picked.add(p.host)); draw(); };
-  use.onclick = () => {
-    if (!picked.size) { lede.textContent = "Pick at least one profile to import."; return; }
-    onPick(profs.filter(p => picked.has(p.host)).map(p => p.host).join(", "));
-    close();
-  };
-}
 /* The channel's logo: an uploaded image wins, else whatever logo the repo already has, else the
    initials. The upload is keyed by channel id, so a channel has to exist before one can be added. */
 function logoField(p, c) {
@@ -3008,8 +3195,8 @@ function avatarField(p, b, redraw) {
     rm.style.display = b.avatar ? "" : "none";
     msg.style.color = bad ? "#ff6b6b" : "";
     msg.textContent = bad || (!has ? "Save the bot, then introduce an image."
-      : b.avatar ? "This picture is the bot's face. Its body, outfit, accessory and colour are drawn around it."
-      : b.genface ? "No picture — this bot shows its face from Bot faces. A picture here overrides that."
+      : b.avatar ? "This picture is the bot's face. It keeps its own motion — bobbing, tilting and blinking."
+      : b.genface ? "This bot's face comes from Bot faces. A picture here is the other way to give it one."
       : "No picture — the bot draws its own face.");
   };
   const send = async (url, body, busy) => {
@@ -3017,7 +3204,7 @@ function avatarField(p, b, redraw) {
     try {
       const r = await jpost(url, body);
       if (!r.ok) throw new Error(r.error || "that did not work");
-      b.avatar = r.avatar || 0;
+      b.avatar = r.avatar || 0; b.avatar_closed = r.avatar_closed || 0;
       await reloadConfig();
       redraw();
     } catch (e) { bad = String(e.message || e); }
@@ -3040,7 +3227,7 @@ function avatarField(p, b, redraw) {
   rm.onclick = () => send("/api/avatar/remove", { id: b.id }, "Removing…");
   row.append(add, rm); said.append(row, msg); wrap.append(prev, said, file);
   fld(p, "FACE PICTURE", wrap,
-      "An override for this one bot. Introduce an image and the image model redraws it as this bot's face, in place of the drawn eyes and mouth, which stay off so you never get two of them. It keeps blinking and looking around, and the body, outfit and accessory below are drawn around it. Bot faces, in the settings rail, draws a whole character for every bot instead.");
+      "A face for this one bot. Introduce an image and the image model redraws it as this bot's face; it keeps its own motion, and blinks. Bot faces, in the settings rail, is the other way to give bots a face — whichever you picked last wins.");
   draw();
 }
 
@@ -3074,76 +3261,6 @@ function editChannel(c) {
   fld(repoG, "REPO FOLDER", fwrap, "one repo per room, e.g. ~/code/my-app. Blank = a shared folder");
   repoG.appendChild(el("div", "hint", "Bots in this room run their shell and file tools inside this folder only, so repos never mix. Leave blank to use a shared folder."));
   p.appendChild(repoG);
-  /* The room's browser accounts. Same rows as Settings → Browser, but they belong to this room: a bot
-     working here routes through these, so nobody has to type an account name into the chat. An empty
-     list falls back to the machine-wide accounts, so a room that never set one behaves as before. */
-  const brG = el("div", "fgroup"); brG.appendChild(el("h4", "", "Browser"));
-  c.browser = c.browser || [];
-  const blist = el("div");
-  const bsay = el("div", "hint");
-  const bstate = {};                  // account name -> the profile row the server reports
-  let bTimer = null;
-  const bPaint = pf => !pf || !pf.exists ? "Not signed in yet"
-    : pf.signed_in === true ? "Signed in"
-    : pf.up ? "Window open — log in there, then close it" : "Sign in again";
-  const bRead = async () => {
-    if (!c.id) return;                // a room that is not saved yet has no stored list to read
-    try {
-      const o = await (await fetch("/api/browser/own?room=" + encodeURIComponent(c.id))).json();
-      for (const pf of o.profiles || [])
-        for (const n of (pf.names || [pf.name])) bstate[n] = pf;
-    } catch (e) {}
-  };
-  const bRows = [];                   // {name, info, btn}, so the poll repaints text and never a row
-  const bDraw = async () => {
-    clearTimeout(bTimer);
-    await bRead();
-    blist.innerHTML = ""; bRows.length = 0;
-    c.browser.forEach((a, i) => {
-      const row = el("div");
-      row.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap";
-      const nm = el("input"); nm.value = a.name; nm.placeholder = "Account name";
-      nm.style.cssText = "width:140px";
-      const sites = el("input"); sites.value = a.sites;
-      sites.placeholder = "Sites — e.g. x.com"; sites.style.cssText = "flex:1;min-width:180px";
-      const si = el("button", "btn ghost sm", "Sign in");
-      /* The same multiplication sign the other rows carry, not a dingbat glyph. */
-      const rm = el("button", "btn ghost sm", "\u00D7");
-      rm.title = "Remove this row. Its saved logins stay on disk under the old name.";
-      const info = el("span", "desc"); info.style.cssText = "flex:1 1 100%;margin:-2px 0 4px";
-      nm.onchange = () => a.name = nm.value.trim();
-      sites.onchange = () => a.sites = sites.value.trim();
-      si.onclick = async () => {
-        si.textContent = "Opening…"; si.disabled = true;
-        const res = await jpost("/api/browser/own/open", { name: a.name || "default", sites: a.sites });
-        si.disabled = false; si.textContent = "Sign in";
-        bsay.textContent = res.ok ? (res.out || "opened") : ("Could not open — " + (res.err || "unknown"));
-        bDraw();
-      };
-      rm.onclick = () => { c.browser.splice(i, 1); bDraw(); };
-      row.append(nm, sites, si, rm, info); blist.appendChild(row);
-      info.textContent = bPaint(bstate[a.name]);
-      bRows.push({ name: a.name, info, btn: si });
-    });
-    if (!c.browser.length) blist.appendChild(el("div", "hint", "No accounts — this room uses the machine-wide ones."));
-    if (blist.isConnected && Object.values(bstate).some(x => x.up)) bTimer = setTimeout(bRefresh, 3000);
-  };
-  /* A sign-in happens in the other window, so nothing here would notice it. While a window is open,
-     keep the states fresh — the row turns to Signed in on its own. Text only, so it cannot steal
-     focus from someone typing a name or a site. */
-  const bRefresh = async () => {
-    clearTimeout(bTimer);
-    await bRead();
-    for (const r of bRows) r.info.textContent = bPaint(bstate[r.name]);
-    if (blist.isConnected && Object.values(bstate).some(x => x.up)) bTimer = setTimeout(bRefresh, 3000);
-  };
-  const badd = el("button", "btn ghost sm", "Add account");
-  badd.onclick = () => { c.browser.push({ name: "", sites: "" }); bDraw(); };
-  fld(brG, "ACCOUNTS", blist, "a name and the sites it covers; press Sign in once, log in, then close the window");
-  brG.append(badd, bsay);
-  brG.appendChild(el("div", "hint", "Bots in this room open these sites in the account that covers them, already logged in — so you never have to name an account in the chat. Leave the list empty to use the machine-wide accounts in Settings → Browser."));
-  p.appendChild(brG);
-  bDraw();
   logoField(p, c);   // after the folder, so the logo it finds in that repo is already known
   const err = el("div", "hint"); err.style.color = "#ff6b6b";
   p.appendChild(err);
@@ -3188,16 +3305,16 @@ function tabBots(p) {
   row.append(add, imp); p.appendChild(row);
 }
 /* --- Bot faces --- */
-/* One image in, one whole mascot per bot out. It is a section of its own rather than a per-bot
-   control because the point is a set: one source drawn N ways, so a team still reads as a team.
-   The drawing is the whole character — head and body — and the engine draws the outfit and
-   accessory on top. A bot's own FACE PICTURE in its editor overrides its face here. */
+/* One image in, one face per bot out. It is a section of its own rather than a per-bot control
+   because the point is a set: one source drawn N ways, so a team still reads as a team. The drawing
+   is the face, not the body: the bot keeps its own motion, and nothing is dressed on top of it.
+   A bot's own FACE PICTURE in its editor is the other way to give it the same thing. */
 function tabFaces(p) {
-  h3(p, "Bot faces", "Introduce one image and the image model draws a whole mascot for every bot from it — head and body together, one different character each.");
-  const st = { source: "", files: [], bots: [], job: {} };
+  h3(p, "Bot faces", "Introduce one image and the image model draws a face for every bot from it — one different face each.");
+  const st = { source: "", files: [], bots: [], presets: [], job: {} };
   const card = el("div", "card");
-  card.innerHTML = `<div class="ct"><span class="ico">${svg("faces")}</span><div><b>One image, a team of characters</b>
-    <div class="sub">Every drawing is the same animal as your photo — the model never changes its species — and the outfit and accessory you picked for each bot are drawn on top. A bot can swap to another face from the same set. A bot's own FACE PICTURE still wins; picking a face here drops it.</div></div></div>`;
+  card.innerHTML = `<div class="ct"><span class="ico">${svg("faces")}</span><div><b>One image, a team of faces</b>
+    <div class="sub">Every drawing is the same animal as your photo — the model never changes its species — drawn as that bot's face, not its body. A bot can swap to another face from the same set, or go back to its own drawn bot. A bot's own FACE PICTURE in its editor is the other way to give it one; whichever you picked last wins.</div></div></div>`;
   const src = el("div", "lgprev");
   const msg = el("div", "hint");
   const row = el("div", "row");
@@ -3209,6 +3326,9 @@ function tabFaces(p) {
   row.append(pick, gen, clr);
   card.append(src, row, msg, file);
   p.appendChild(card);
+  /* The shipped characters, shown once as a reference row: the picker that actually assigns one is
+     the per-bot select below, so a bot never has two competing controls. */
+  const prow = el("div", "row"); prow.style.flexWrap = "wrap"; p.appendChild(prow);
   const grid = el("div", "bento"); p.appendChild(grid);
 
   const say = () => {
@@ -3225,34 +3345,68 @@ function tabFaces(p) {
   const drawSource = () => {
     src.innerHTML = st.source ? `<div class="mc img"><img src="/api/face/${encodeURIComponent(st.source)}" alt=""></div>` : "";
   };
+  const drawPresets = () => {
+    prow.innerHTML = "";
+    for (const pr of st.presets) {
+      const d = el("div", "card tcard");
+      d.innerHTML = `<div class="ct"><div class="mc img"><img src="/api/preset/${encodeURIComponent(pr.id)}/base.webp" alt=""></div>
+        <div class="min"><b>${esc(pr.label)}</b><div class="sub">Preset</div></div></div>`;
+      prow.appendChild(d);
+    }
+  };
   const drawTiles = () => {
     grid.innerHTML = "";
     for (const f of st.bots) {
       const b = S.bots.find(x => x.id === f.id) || f;
       const d = el("div", "card tcard");
-      const url = f.genface ? `/api/face/${encodeURIComponent(f.genface)}` : "";
-      /* A picture of its own wins over the set, in the client and in the engine — so a card that
-         showed "Drawn for it" while the sidebar wore a photo would be lying about the bot. Say
-         which one is on screen, and offer the one click that hands the bot back to the set. */
-      const own = !!f.avatar;
-      d.innerHTML = `<div class="ct">${url && !own ? `<div class="mc img"><img src="${url}" alt=""></div>` : avatar(f.name, b.color, "", b.emoji)}
-        <div class="min"><b>${esc(f.name)}</b><div class="sub">${own ? "Your own picture is showing instead" : url ? "Drawn for it" : "Its own drawn bot"}</div></div></div>`;
+      const url = f.genface ? `/api/face/${encodeURIComponent(f.genface)}`
+        : f.preset ? `/api/preset/${encodeURIComponent(f.preset)}/base.webp` : "";
+      /* A bot shows whichever face it was given last, so a card that showed a photo while the
+         sidebar wore a drawing would be lying about the bot. Say which one is on screen, and offer
+         the one click that hands the bot back to the set. */
+      const own = !!f.avatar && !f.genface && !f.preset;
+      const ownUrl = own ? `/api/avatar/${encodeURIComponent(f.id)}?v=${f.avatar}` : "";
+      d.innerHTML = `<div class="ct">${own ? `<div class="mc img"><img src="${ownUrl}" alt=""></div>`
+        : url ? `<div class="mc img"><img src="${url}" alt=""></div>` : avatar(f.name, b.color, "", b.emoji)}
+        <div class="min"><b>${esc(f.name)}</b><div class="sub">${own ? "Your own picture" : f.preset ? "Preset" : url ? "Drawn for it" : "Its own drawn bot"}</div></div></div>`;
       const body = el("div", "tc-body");
       const sel = el("select");
       sel.appendChild(new Option("Its own drawn bot", ""));
-      st.files.forEach((name, i) => {
-        const o = new Option("Face " + (i + 1), name);
-        if (name === f.genface) o.selected = true;
-        sel.appendChild(o);
-      });
-      sel.disabled = !st.files.length;
+      if (st.presets.length) {
+        const og = el("optgroup"); og.label = "Presets";
+        for (const pr of st.presets) {
+          const o = new Option(pr.label, "preset:" + pr.id);
+          if (pr.id === f.preset) o.selected = true;
+          og.appendChild(o);
+        }
+        sel.appendChild(og);
+      }
+      if (st.files.length) {
+        const og = el("optgroup"); og.label = "Drawn faces";
+        st.files.forEach((name, i) => {
+          const o = new Option("Face " + (i + 1), name);
+          if (name === f.genface) o.selected = true;
+          og.appendChild(o);
+        });
+        sel.appendChild(og);
+      }
+      sel.disabled = !st.files.length && !st.presets.length;
       const use = async file => {
         const r = await jpost("/api/faces/assign", { id: f.id, file });
         if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not change that face"; return; }
-        f.genface = r.genface || ""; f.avatar = 0;     // assigning a face drops the picture
+        f.genface = r.genface || ""; f.preset = ""; f.avatar = 0;   // assigning a face drops the others
         await reloadConfig(); drawTiles(); say();
       };
-      sel.onchange = () => use(sel.value);
+      const usePreset = async preset => {
+        const r = await jpost("/api/faces/assign", { id: f.id, preset });
+        if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not change that face"; return; }
+        f.preset = r.preset || ""; f.genface = ""; f.genface_closed = ""; f.avatar = 0;
+        await reloadConfig(); drawTiles(); say();
+      };
+      sel.onchange = () => {
+        if (sel.value.startsWith("preset:")) usePreset(sel.value.slice(7));
+        else use(sel.value);
+      };
       if (own) {
         const btn = el("button", "btn ghost sm", "Use this face");
         btn.type = "button"; btn.onclick = () => use(sel.value || st.files[0] || "");
@@ -3267,7 +3421,8 @@ function tabFaces(p) {
   const poll = async () => {
     const f = await get("/api/faces"); if (!f) return;
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
-    drawTiles(); say();
+    st.presets = f.presets || [];
+    drawPresets(); drawTiles(); say();
     if (st.job.running) return void setTimeout(poll, 2000);
     await reloadConfig();
     if (curTab === "faces") renderPanel();
@@ -3275,7 +3430,8 @@ function tabFaces(p) {
   const load = async () => {
     const f = await get("/api/faces"); if (!f) return;
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
-    drawSource(); drawTiles(); say();
+    st.presets = f.presets || [];
+    drawPresets(); drawSource(); drawTiles(); say();
     if (st.job.running) setTimeout(poll, 2000);
   };
   pick.onclick = () => file.click();
@@ -3294,9 +3450,8 @@ function tabFaces(p) {
   };
   gen.onclick = async () => {
     gen.disabled = true; msg.style.color = ""; msg.textContent = "Starting…";
-    /* The species comes from `faceOf`, the same derivation the engine draws with, so the model is
-       asked for the shape the bot would have had anyway. */
-    const targets = S.bots.map(b => ({ id: b.id, species: faceOf(b), color: b.color }));
+    /* One face per bot, drawn from the source; the list is the roster the batch is assigned to. */
+    const targets = S.bots.map(b => ({ id: b.id }));
     const r = await jpost("/api/faces/generate", { targets });
     if (!r.ok) { gen.disabled = false; msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not start"; return; }
     st.job = r.job || { running: true }; say(); setTimeout(poll, 2000);
@@ -3306,7 +3461,7 @@ function tabFaces(p) {
     const r = await jpost("/api/faces/clear", {});
     if (!r.ok) { msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not clear the set"; return; }
     await reloadConfig();
-    st.files = []; st.job = {}; st.bots.forEach(b => b.genface = "");
+    st.files = []; st.job = {}; st.bots.forEach(b => { b.genface = ""; b.genface_closed = ""; b.preset = ""; });
     drawTiles(); say();
   };
   load();
@@ -3622,309 +3777,6 @@ function tabModels(p) {
     };
   })();
 }
-/* --- Browser: which browser the bots drive --- */
-function tabBrowser(p) {
-  h3(p, "Browser", "Which browser the bots drive, and the logins it keeps for you.");
-  /* --- Browser: which browser the bots drive --- */
-  const brc = el("div", "card");
-  brc.innerHTML = `<div class="ct"><span class="ico">${svg("monitor")}</span><div><b>Browser</b>
-    <div class="sub">Where the bots browse. Pick one of the three ways below; the line under the box says what the one you picked does.</div></div></div>`;
-  const bmode = el("select"); bmode.style.marginTop = "10px";
-  for (const [v, t] of [["own", "Own browser (a fresh browser each time — no logins)"],
-                        ["profiles", "Own browser — saved profiles (sign in once, logins kept)"],
-                        ["cdp", "ZenPilot / any browser over CDP"]]) {
-    const o = el("option", "", esc(t)); o.value = v; bmode.appendChild(o);
-  }
-  /* The explanation follows the choice instead of covering all three at once. Three modes described in
-     one paragraph is how a settings screen turns into something nobody reads. */
-  const bmodehint = el("div", "desc");
-  bmodehint.style.cssText = "margin-top:4px;max-width:640px";
-  const setModeHint = () => {
-    bmodehint.textContent = {
-      own: "A fresh browser every time. Fast and private, but nothing is logged in — right for searching "
-         + "the web and reading public pages.",
-      profiles: "One browser per account, with its logins saved to disk. Add an account below, press Sign in, "
-              + "log in once in the window that opens, then close the window — closing is what saves the login.",
-      cdp: "Reuses the profiles already open in ZenPilot, over its debug port below.",
-    }[bmode.value] || "";
-  };
-  /* Which browser we actually launch. This exists because of a hard wall: Google will not sign
-     anyone in on the Chromium Playwright ships ("This browser or app may not be secure"), but it
-     signs in fine on a real Chrome installed on this machine. So the choice is offered, and the
-     options are only the browsers that are really here. */
-  const bchan = el("select"); bchan.style.marginTop = "8px";
-  const bchanhint = el("div", "desc");
-  bchanhint.style.cssText = "margin-top:4px;max-width:640px";
-  const bport = el("input"); bport.type = "number"; bport.min = "1"; bport.max = "65535";
-  bport.style.marginTop = "8px"; bport.style.width = "100%"; bport.placeholder = "9222";
-  const bphint = el("div", "desc");
-  const btarget = el("input"); btarget.style.marginTop = "8px"; btarget.style.width = "100%";
-  btarget.placeholder = "Profiles to keep on screen, comma-separated — e.g. gemini.google.com, openart.ai";
-  btarget.title = "Each site opens in its own profile anyway; this only decides which ones ZenPilot keeps on screen. Empty means the first one opened.";
-  /* One row per account, and the row *is* the whole feature: a name, the sites it handles, and the
-     window you sign in in. There is no separate syntax to learn — the box you type in is the box
-     that routes. */
-  const bacc = el("div"); bacc.style.marginTop = "10px";
-  const baccrows = el("div");
-  const baddacc = el("button", "btn ghost sm", "Add account"); baddacc.style.marginTop = "6px";
-  bacc.append(baccrows, baddacc);
-  const bhl = el("label", "desc");
-  bhl.style.cssText = "display:flex;gap:8px;align-items:flex-start;margin-top:10px";
-  const bhlcb = el("input"); bhlcb.type = "checkbox"; bhlcb.style.marginTop = "2px";
-  bhl.append(bhlcb, document.createTextNode(
-    "Run the bots' browsers without a window (headless). Signing in always opens a window."));
-  const bnote = el("div", "desc", "Checking…"); bnote.id = "browserNote";
-  const btest = el("button", "btn ghost sm", "Test connection");
-  const blaunch = el("button", "btn pri sm", "Launch ZenPilot & connect");
-  const bimp = el("button", "btn ghost sm", "Import profiles");
-  const brow = el("div", "row"); brow.style.marginTop = "10px"; brow.append(btest, blaunch, bimp);
-  const bzp = el("div", "zpwarn"); bzp.style.display = "none";
-  brc.append(bmode, bmodehint, bchan, bchanhint, bport, bphint, btarget, brow, bacc, bhl, bzp, bnote); p.appendChild(brc);
-  let zp = null;                       // the last /api/browser/profiles answer, for the banner + modal
-  let accounts = [];                   // the accounts list, kept locally so a row can be edited live
-  let rows = [];                       // {name, info, btn} per drawn row, so a refresh can repaint it
-  let drawTimer = null;                // the poll that watches for a sign-in landing in the other window
-  let drawBusy = false;                // one refresh in flight at a time, so a slow one cannot stack
-  let quiet = 0;                       // ticks since the last window closed, so a slow write still lands
-  // One number, used for both the launch and the connect, so the two can never disagree.
-  const portOf = () => { const n = parseInt(bport.value || "", 10); return (n >= 1 && n <= 65535) ? n : 9222; };
-  const endpoint = () => "http://127.0.0.1:" + portOf();
-  const setPortHint = () => { bphint.textContent = "DEBUG PORT — the bots connect to " + endpoint() +
-    ", and “Launch ZenPilot & connect” opens it on the same port."; };
-  (async () => {
-    const r = await (await fetch("/api/browser")).json();
-    bmode.value = ["cdp", "profiles"].includes(r.mode) ? r.mode : "own";
-    bport.value = String(r.port || 9222);
-    btarget.value = r.target_url || "";
-    bhlcb.checked = !!r.headless;
-    accounts = (r.accounts || []).map(a => ({ name: a.name || "", sites: a.sites || "" }));
-    /* Only browsers that are really installed are offered, plus "automatic" and the one we ship.
-       A choice that names a browser this machine does not have would be a lie in a dropdown. */
-    const chans = r.channels || [];
-    const chLabel = k => k === "bundled" ? "Playwright's Chromium"
-      : (chans.find(c => c.key === k) || {}).label || (chans[0] ? chans[0].label : "Playwright's Chromium");
-    for (const [v, t] of [["auto", "Automatic — " + (chans.length ? chans[0].label : "Playwright's Chromium")],
-                          ...chans.map(c => [c.key, c.label]),
-                          ["bundled", "Playwright's Chromium (fast, but Google blocks its sign-in)"]]) {
-      const o = el("option", "", esc(t)); o.value = v; bchan.appendChild(o);
-    }
-    bchan.value = ["auto", "bundled", ...chans.map(c => c.key)].includes(r.channel) ? r.channel : "auto";
-    const setChanHint = () => {
-      const bundled = bchan.value === "bundled" || (bchan.value === "auto" && !chans.length);
-      bchanhint.textContent = bundled
-        ? "Playwright's own Chromium — fast, but Google refuses to sign in on it (“This browser or app "
-          + "may not be secure”). Pick a real browser above if you need Google or Facebook logins."
-        : "Sign-ins open in " + chLabel(bchan.value) + " — a browser actually installed on this Mac, which "
-          + "is why Google will sign in here. Each account keeps its own logins in its own folder.";
-    };
-    const prof = () => bmode.value === "profiles";
-    const show = () => {
-      const cdp = bmode.value === "cdp", pr = prof();
-      setModeHint();
-      for (const e of [bchan, bchanhint]) e.style.display = cdp ? "none" : "";
-      for (const e of [bport, bphint, btarget, brow]) e.style.display = cdp ? "" : "none";
-      for (const e of [bacc, bhl]) e.style.display = pr ? "" : "none";
-      bzp.style.display = (cdp && zp && !zp.installed) ? "" : "none";
-      if (pr) drawAccounts();
-      else { clearTimeout(drawTimer); drawTimer = null; }   // the sign-in poll belongs to this card only
-    };
-    /* One plain sentence in the card; the raw error stays on hover so nothing is hidden. Called
-       again once the disk check lands, so a missing ZenPilot overrides the connect hint instead of
-       the two lines contradicting each other. */
-    /* One plain sentence in the card; the raw error stays on hover so nothing is hidden. Saved
-       profiles have nothing connected — each account's browser opens on demand — so saying
-       "connected" there would be a small lie the user has to work around. */
-    const say = o => o.mode === "profiles" ? "Ready — an account's browser opens the first time a bot visits one of its sites."
-                                           : ("Connected" + (o.attached ? " to an existing browser." : " with our own browser."));
-    const setNote = () => {
-      if (zp && !zp.installed && bmode.value === "cdp") { bnote.textContent = "ZenPilot is not installed — see below."; bnote.title = ""; }
-      else if (r.running) { bnote.textContent = say(r); bnote.title = ""; }
-      else { bnote.textContent = "Not running — " + (r.hint || r.err || "starting…"); bnote.title = r.err || ""; }
-    };
-    show(); setNote(); setPortHint(); setChanHint();
-    const why = o => {
-      bnote.textContent = o.ok ? say(o) : ("Could not connect — " + (o.hint || o.err || "unknown"));
-      bnote.title = o.ok ? "" : (o.err || "");
-    };
-    /* The mode is what the running browser was built as, so changing it has to be saved *and*
-       restarted — otherwise the card shows one mode while the bots are still driving the old one,
-       and a Sign in lands on a browser that is not a saved profile at all. */
-    bmode.onchange = async () => { show(); await save(); why(await jpost("/api/browser/restart", {})); };
-    /* The browser is picked when a window is launched, so an open one is still the old build —
-       saving and restarting drops it rather than leaving two browsers disagreeing. */
-    bchan.onchange = async () => { setChanHint(); await save(); why(await jpost("/api/browser/restart", {})); };
-    bport.oninput = setPortHint;                                 // the hint follows what you type
-    bport.onchange = () => { bport.value = String(portOf()); setPortHint(); };
-    const save = () => post("/api/settings", { settings: { browser: {
-      mode: bmode.value, port: portOf(), target_url: btarget.value.trim(),
-      accounts: accounts.filter(a => a.name).map(a => ({ name: a.name, sites: a.sites })),
-      headless: bhlcb.checked, channel: bchan.value } } });
-    /* Accounts are read fresh on every open, so a saved row takes effect on the bot's next step —
-       no restart. Headless is read when a profile's browser is launched, so that one restarts. */
-    bhlcb.onchange = async () => { await save(); why(await jpost("/api/browser/restart", {})); };
-    /* The list. A row is a name, the sites it handles, and the window you sign in in — so there is
-       no second place to write the routing, and no syntax to get wrong. */
-    /* What a row can honestly say, and what its button will do. "Signed in" is not "the folder
-       exists" — that only means a window was once opened — so it comes from the server, which looks
-       for the cookie the site sets when you really log in. Until then the row says what to do next
-       rather than guessing at what happened. Three things can be true: nothing was ever opened, a
-       login is saved, or a login is pending — and for the last of those, whether the window is still
-       up is the only other thing the user needs, because closing it is what saves the login. Whether
-       the app can *confirm* that site's login changes the explanation, not the instruction. */
-    const view = pf => !pf || !pf.exists
-      ? { btn: "Sign in", txt: "Not signed in yet",
-          why: "Press Sign in to open this account's first site in its own window." }
-      : pf.signed_in === true
-        ? { btn: "Open window", txt: pf.up ? "Signed in — window is open" : "Signed in",
-            why: "This account's logins are saved. The bots reuse this browser." }
-        : pf.up
-          ? { btn: "Open window", txt: "Window is open — sign in, then close it",
-              why: pf.signed_in === null
-                ? "This site leaves no sign-in cookie the app can read, so it will never confirm the login. Log in there and close the window — closing is what saves it."
-                : "The login is written to disk when the window closes; the row then says Signed in." }
-          : pf.signed_in === null
-            ? { btn: "Sign in", txt: "Cannot confirm this site's login",
-                why: "The app has no way to tell whether this site logged you in. Press Sign in, log in there, then close the window — closing is what saves the login." }
-            : { btn: "Sign in again", txt: "Opened, but no sign-in was saved",
-                why: "A window was opened but the site left no login behind. Press Sign in and log in again." };
-    /* A profile's identity is the folder its cookies live in, and the server reports every account
-       name that lands in the same one. Two rows sharing a folder share one browser, so the second
-       must not be shown the first one's login — it is named as a duplicate instead. Matching on the
-       folder is also what stops a row from claiming a login it never earned: a name nothing on disk
-       answers to has no profile to inherit a state from, so it reads "Not signed in yet". */
-    const statesOf = o => {
-      const st = {}, owner = new Map();
-      for (const pf of o.profiles || [])
-        for (const n of (pf.names || [pf.name])) { st[n] = pf; owner.set(n, pf.id); }
-      return { st, owner };
-    };
-    const clash = (other, same) => same
-      ? { btn: "Sign in", txt: "Both rows are one browser",
-          why: "Both rows are named “" + other + "”, and the name is what picks the browser — so they "
-             + "share one, with one set of logins. Put both sites in one row, or rename one of them." }
-      : { btn: "Sign in", txt: "Same browser as “" + other + "”",
-          why: "The name is what picks the browser, and this name means the same browser as “" + other
-             + "” — so this row cannot keep its own logins. Put both sites in one row, or give this "
-             + "row a different name." };
-    async function drawAccounts() {
-      clearTimeout(drawTimer); drawTimer = null; quiet = 0;
-      let o = {};
-      try { o = await (await fetch("/api/browser/own")).json(); } catch (e) {}
-      const { st, owner } = statesOf(o);
-      const taken = new Map();     // folder id -> the first row that claimed it, so a second can say so
-      baccrows.innerHTML = ""; rows = [];
-      const h = el("div", "desc", "Default accounts — one browser each, with its own saved logins. These are used " +
-        "by a chat with one bot, and by any room that has not set its own accounts; a room's own accounts are set " +
-        "in the room's editor. Name it, list the sites the bots should use it for, then press Sign in: log in " +
-        "once in the window that opens, then close the window — closing is what saves the login, and the row " +
-        "turns to Signed in. A site you do not list is read anonymously, so your logins are never handed to a " +
-        "site that is not yours.");
-      h.style.cssText = "margin-bottom:8px;max-width:640px";
-      baccrows.appendChild(h);
-      if (!accounts.length) {
-        baccrows.appendChild(el("div", "desc", "No accounts yet — “Add account”, then “Sign in”."));
-      }
-      accounts.forEach((a, i) => {
-        const row = el("div");
-        row.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap";
-        const nm = el("input"); nm.value = a.name; nm.placeholder = "Account name";
-        nm.style.cssText = "width:140px";
-        nm.title = "Renaming starts a fresh browser — the old name's saved logins stay in the old folder.";
-        const sites = el("input"); sites.value = a.sites;
-        sites.placeholder = "Sites the bots should use this account for — e.g. x.com";
-        sites.title = "The bots use this account for these sites. Sign in opens the first one. A site you do not list here is read anonymously.";
-        sites.style.cssText = "flex:1;min-width:220px";
-        const si = el("button", "btn ghost sm", "Sign in");
-        /* The same multiplication sign the panels' close buttons carry, not the U+2715 dingbat: this
-           is the one glyph in app.js outside the SVG icon set, and the dingbat is what the "no emoji
-           glyphs in the served script" check catches — a screen reader reads it aloud as "x". */
-        const rm = el("button", "btn ghost sm", "\u00D7");
-        rm.title = "Remove this row. Its saved logins stay on disk under the old name.";
-        const info = el("span", "desc");
-        /* Its own line under the row's controls. Inline, a long state ("Both rows are one browser")
-           wrapped to the *next* row's line and read as that row's — the state has to belong to the
-           row it is about, and a fixed place is what makes that true for every wording. */
-        info.style.cssText = "flex:1 1 100%;margin:-2px 0 4px";
-        /* Which profile this row is, as the folder: the server's id when it knows the name, else the
-           name itself — so a row nothing answers to stays unclaimed and reads as brand new. */
-        const key = owner.get(a.name) || a.name;
-        const dup = taken.get(key) || "";
-        if (key && !taken.has(key)) taken.set(key, a.name);
-        rows.push({ name: a.name, dup, info, btn: si });
-        const paint = pf => { const v = dup ? clash(dup, dup === a.name) : view(pf);
-          si.textContent = v.btn; info.textContent = v.txt; info.title = v.why; };
-        paint(st[a.name]);
-        const commit = () => { a.name = nm.value.trim(); a.sites = sites.value.trim(); save(); drawAccounts(); };
-        nm.onchange = commit; sites.onchange = commit;
-        si.onclick = async () => {
-          si.textContent = "Opening…"; si.disabled = true;
-          /* The row's own sites go with it: two rows can name the same account, and then the account
-             name alone cannot say which site this button was for — it would always answer with the
-             first row's site. The row that was clicked is the one that knows. */
-          const res = await jpost("/api/browser/own/open", { name: a.name || "default", sites: a.sites });
-          si.disabled = false;
-          bnote.textContent = res.ok ? (res.out || "opened") : ("Could not open — " + (res.err || "unknown"));
-          bnote.title = res.ok ? "" : (res.err || "");
-          drawAccounts();
-        };
-        rm.onclick = () => { accounts.splice(i, 1); save(); drawAccounts(); };
-        row.append(nm, sites, si, rm, info); baccrows.appendChild(row);
-      });
-      if ((o.profiles || []).some(p => p.up)) drawTimer = setTimeout(refreshStates, 3000);
-    }
-    /* A sign-in happens in the other window, so nothing here would ever notice it. While an account's
-       window is open, keep the states fresh — the row turns to Signed in on its own the moment the
-       login lands, instead of leaving the user to guess whether it worked. Only the text is repainted,
-       never the rows, so this cannot steal focus from someone typing a name or a site. Closing the last
-       window does not stop it straight away: the browser writes its cookies out as it goes, and a
-       tick that lands first would freeze the row on "sign in, then close it" for good. A few quiet
-       ticks give that write time to land. */
-    async function refreshStates() {
-      if (bmode.value !== "profiles") return;             // left the card; the poll stops with it
-      if (drawBusy) return; drawBusy = true;
-      let o = {};
-      try { o = await (await fetch("/api/browser/own")).json(); } catch (e) {}
-      finally { drawBusy = false; }
-      const { st } = statesOf(o);
-      for (const r of rows) {
-        const v = r.dup ? clash(r.dup, r.dup === r.name) : view(st[r.name]);
-        r.info.textContent = v.txt; r.info.title = v.why;
-        if (!r.btn.disabled) r.btn.textContent = v.btn;
-      }
-      if ((o.profiles || []).some(p => p.up)) { quiet = 0; drawTimer = setTimeout(refreshStates, 3000); }
-      else if (++quiet < 3) drawTimer = setTimeout(refreshStates, 3000);
-    }
-    baddacc.onclick = async () => {
-      accounts.push({ name: "", sites: "" }); await drawAccounts();
-      baccrows.lastElementChild?.querySelector("input")?.focus();
-    };
-    btest.onclick = async () => {
-      bnote.textContent = "Testing…"; bnote.title = "";
-      await save();
-      why(await jpost("/api/browser/restart", {}));
-    };
-    blaunch.onclick = async () => {
-      bnote.textContent = "Launching ZenPilot…"; bnote.title = "";
-      await save();
-      why(await jpost("/api/browser/launch", {}));
-    };
-    bimp.onclick = () => importProfiles(hosts => {
-      btarget.value = hosts;
-      save();
-      const n = hosts.split(",").length;
-      bnote.textContent = "Imported " + n + " profile" + (n === 1 ? "" : "s") + ". The bots reuse them from now on.";
-    });
-    /* The warning is drawn from a real look at the disk, and it names the fix + where to get it. */
-    try {
-      zp = await (await fetch("/api/browser/profiles")).json();
-      bzp.innerHTML = `<span class="zi">${svg("warn")}</span><div><b>ZenPilot is not installed on this machine.</b>
-        <div class="zsub">Looked in Applications and did not find it. Get ZenPilot, open a profile and sign in,
-        then press “Launch ZenPilot &amp; connect” — the bots reuse those logins, so nothing is logged in twice.</div>
-        <a class="btn ghost sm" data-a="zp-get" href="${esc(zp.get_url || "")}" target="_blank" rel="noopener">Get ZenPilot</a></div>`;
-      show(); setNote();
-    } catch (e) { /* the profiles check is a nicety; never break the card over it */ }
-  })();
-}
 /* --- Phone & tablet: the LAN listener the Android app talks to --- */
 function tabPhone(p) {
   h3(p, "Phone", "Reach this app from your phone — on your wifi, or from anywhere.");
@@ -4105,6 +3957,7 @@ function tabHelp(p) {
     "<b>×</b> takes it out of the queue. Nothing was sent, so nothing is undone.",
   ]);
   para(s, "A steered task is kept in the transcript like any message you type, so the record shows what turned the bot. Queueing and steering are per chat: a task queued in one chat never waits on, or steers into, another chat's turn.", "dim");
+  feat(s, "general", "Attaching a file", "The paperclip in the composer takes any file — text, an image, a PDF, a zip, a spreadsheet. You can also drop one onto the chat, or paste a screenshot straight into the box. The files sit above the composer until you press Send, each with an × to drop it; a message can carry up to 10 files, 20 MB in total. The bot is given each file's path, so it opens them with its own tools, and a picture is drawn back in the chat as the picture.");
 
   /* ---- header chips ---- */
   s = sec("header", "The chips in the header");
@@ -4163,9 +4016,9 @@ function tabHelp(p) {
 
   /* ---- bot faces ---- */
   s = sec("faces", "Bot faces");
-  para(s, "One image in, a whole team of characters out. <b>Introduce one image</b> and <b>Draw a face for each bot</b>, and the image model draws a complete mascot for every bot — head and body together, one different character each, in that bot's own species and colour. It takes a few minutes, and the bots fill in one at a time.");
-  para(s, "The drawing is the whole bot, so the outfit and accessory you picked in its editor are drawn on top of it. A bot can take any face from the same set from the list under its picture, or go back to its own drawn bot. <b>Clear the set</b> drops every bot's face and keeps the image you introduced.");
-  para(s, "This is the team-wide way. A bot's own <b>Face picture</b> in its editor overrides its face here, for that one bot.");
+  para(s, "One image in, a face for every bot out. <b>Introduce one image</b> and <b>Draw a face for each bot</b>, and the image model draws a face for every bot from it — one different face each, the same animal as your photo. It takes a few minutes, and the bots fill in one at a time.");
+  para(s, "The drawing is the face, not the body: it fills the bot's space and the bot keeps its own motion, so it still bobs, tilts and drifts. A bot can take any face from the same set from the list under its picture, or go back to its own drawn bot. <b>Clear the set</b> drops every bot's face and keeps the image you introduced.");
+  para(s, "A bot's own <b>Face picture</b> in its editor is the other way to give it a face; whichever you picked last wins.");
 
   /* ---- channels ---- */
   s = sec("channels", "Rooms");
@@ -4190,7 +4043,7 @@ function tabHelp(p) {
 
   /* ---- the browser ---- */
   s = sec("browser", "Browser");
-  feat(s, "monitor", "Browser", "Where the bots browse. <i>Own browser</i> runs a fresh browser each time — fast, but logged out. <i>Own browser — saved profiles</i> keeps one browser per account with its logins saved to disk: add an account, type the sites it should be used for, then click <b>Sign in</b> — it opens the first of those sites in that account's own window, and you log in once there and then <b>close the window</b> (closing is what saves the login). Every later run is already signed in, and only the sites you listed ever see that account's cookies; anything else is read anonymously. <b>Browser</b> is which browser those windows are: <i>Automatic</i> uses a Chrome really installed on this Mac, and that matters — Google refuses to sign anyone in on the Chromium we ship (“This browser or app may not be secure”), but signs in normally on a real Chrome, so leave it on Automatic unless you have a reason not to. <i>ZenPilot / any browser over CDP</i> reuses the profiles you are already signed into — give it the debug port and the button launches ZenPilot on the same port. <b>Import profiles</b> lists the profiles open in ZenPilot so you can tick the ones to reuse.");
+  feat(s, "monitor", "Browser accounts", "Where the bots browse, and with which logins. The accounts are set per room, in that room's <b>Computer</b> panel (the screen icon in the toolbar) — a bot working in a room opens a site in the account that covers it, already signed in, and opens everything else anonymously. Each row is a name and the sites it covers: click <b>Sign in</b> once, log in in the window that opens, then <b>close the window</b> — closing is what saves the login. A chat with a single bot uses the default list.");
 
   /* ---- memory ---- */
   s = sec("memory", "Memory");
@@ -4698,6 +4551,25 @@ $("#btnMenu").onclick = openDrawer;
 syncDrawer();     // a narrow screen starts with the drawer closed, so take it out of the tab order
 $("#backdrop").onclick = closeDrawer;
 $("#btnSend").onclick = send;
+$("#btnClip").onclick = () => $("#filePick").click();
+$("#filePick").onchange = e => { addFiles(e.target.files); e.target.value = ""; };
+/* A pasted screenshot is the commonest attachment there is, and it arrives as a file on the
+   clipboard rather than through the picker — so a paste with a file in it attaches instead of
+   typing a name for it. A paste of text alone is left to the box. */
+$("#input").addEventListener("paste", e => {
+  const fs = Array.from((e.clipboardData && e.clipboardData.files) || []);
+  if (!fs.length) return;
+  e.preventDefault(); addFiles(fs);
+});
+/* Dropping a file anywhere on the chat attaches it, the way dropping one on any chat window does.
+   Only a file drag is taken: dragging text or a link over the app is not an attachment, and
+   swallowing that drop would break selecting text into the box. */
+const isFileDrag = e => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"));
+$("#main").addEventListener("dragover", e => { if (isFileDrag(e)) e.preventDefault(); });
+$("#main").addEventListener("drop", e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault(); addFiles(e.dataTransfer.files);
+});
 $("#btnStop").onclick = stopTurn;
 $("#btnSettings").onclick = () => openSettings("general");
 $("#btnHelp").onclick = () => openSettings("help");

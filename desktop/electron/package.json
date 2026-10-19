@@ -41,6 +41,7 @@
           "sound.js",
           "sw.js",
           "manifest.webmanifest",
+          "faces/**/*.webp",
           "*.png",
           "*.ico"
         ]

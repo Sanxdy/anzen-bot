@@ -59,15 +59,16 @@ def main():
                           {"name": "FB Page", "sites": "facebook.com, localhost"},
                           {"name": "Not Signed In Yet", "sites": ""}],
                 mode="profiles", profile="default", headless=True)
-    check("accounts parse to host -> account name",
-          S._route_pairs() == {"x.com": "X Promo", "twitter.com": "X Promo", "127.0.0.1": "X Promo",
-                               "facebook.com": "FB Page", "localhost": "FB Page"},
+    check("accounts parse to host -> account names",
+          S._route_pairs() == {"x.com": ["X Promo"], "twitter.com": ["X Promo"],
+                               "127.0.0.1": ["X Promo"],
+                               "facebook.com": ["FB Page"], "localhost": ["FB Page"]},
           str(S._route_pairs()))
     check("a site written as a whole URL still routes",
-          S._route_pairs({"accounts": [{"name": "A", "sites": "https://x.com/home"}]}) == {"x.com": "A"})
+          S._route_pairs({"accounts": [{"name": "A", "sites": "https://x.com/home"}]}) == {"x.com": ["A"]})
     check("an account with no name is dropped, not guessed at",
           S._route_pairs({"accounts": [{"name": "", "sites": "x.com"}, {"name": "A", "sites": "y.com"}]})
-          == {"y.com": "A"})
+          == {"y.com": ["A"]})
     check("a sign-in lands on the account's own first site",
           S.account_site("X Promo") == "https://x.com", S.account_site("X Promo"))
     check("  ...and an account with no site has nowhere to land",
@@ -99,6 +100,43 @@ def main():
     check("a site nobody routed has no profile",
           b._route("https://example.com/") is None)
     check("an empty or scheme-less URL has no profile", b._route("") is None)
+
+    # ---- two accounts on one site: the bug this fixes ----
+    # FPL keeps one account per browser session, so two teams are two saved profiles — and both have
+    # to be addressable. The routing table used to be keyed by host alone, so the second account
+    # silently replaced the first and `browser_open` could never choose it.
+    set_browser(accounts=[{"name": "Gmail FPL", "sites": "fantasy.premierleague.com"},
+                          {"name": "Yahoo FPL", "sites": "fantasy.premierleague.com"}],
+                mode="profiles", headless=True)
+    check("both accounts on one site are kept, in setup order",
+          S._route_pairs()["fantasy.premierleague.com"] == ["Gmail FPL", "Yahoo FPL"],
+          str(S._route_pairs()))
+    check("the first account is the default, and the other can be named",
+          b._route("https://fantasy.premierleague.com/") == "Gmail FPL"
+          and b._route("https://fantasy.premierleague.com/", account="Yahoo FPL") == "Yahoo FPL")
+    check("an account that does not cover the site is never handed it",
+          b._route("https://fantasy.premierleague.com/", account="X Promo") is None)
+    mbrief = S.browser_brief()
+    check("the brief names every account on a shared site, and says how to choose",
+          "Gmail FPL for fantasy.premierleague.com" in mbrief
+          and "Yahoo FPL for fantasy.premierleague.com" in mbrief
+          and "`account`" in mbrief, mbrief)
+    # A room's accounts ride with the turn in a thread-local, and a parallel step runs its calls in
+    # fresh threads: without the copy a `browser_open` sharing a step fell back to the machine-wide
+    # table, so a room's own accounts were lost.
+    real_exec = S.exec_tool
+    S._WORK.routes = S._room_routes({"browser": [{"name": "Gmail FPL", "sites": "fantasy.premierleague.com"},
+                                                 {"name": "Yahoo FPL", "sites": "fantasy.premierleague.com"}]})
+    try:
+        S.exec_tool = lambda bid, name, args: (getattr(S._WORK, "routes", None), [])
+        seen = S._exec_parallel("b", [(None, "stub", {})])[0][0]
+    finally:
+        S.exec_tool = real_exec; S._WORK.routes = None
+    check("a parallel step's worker keeps the room's browser accounts",
+          seen == {"fantasy.premierleague.com": ["Gmail FPL", "Yahoo FPL"]}, str(seen))
+    set_browser(accounts=[{"name": "X Promo", "sites": "x.com, twitter.com, 127.0.0.1"},
+                          {"name": "FB Page", "sites": "facebook.com, localhost"},
+                          {"name": "Not Signed In Yet", "sites": ""}])
 
     # ---- the folder name is user text, so it must not be able to name a folder elsewhere ----
     base = os.path.abspath(os.path.join(tmp, "browser_profiles"))
@@ -198,6 +236,21 @@ def main():
     other_read = str(b.call("open", url=other))
     check("a second account is a separate browser, with its own cookies",
           "no-cookie" in other_read, other_read[:200])
+    # ...including when both accounts cover the SAME site. Two profiles are two persistent contexts,
+    # so the "one account per browser session" limit is per profile, not per machine: both teams stay
+    # up at once and each keeps its own cookies. X Promo already carries the probe cookie, FB Page has
+    # never visited this host, so the two answers can only come from two sessions.
+    set_browser(accounts=[{"name": "X Promo", "sites": "127.0.0.1"},
+                          {"name": "FB Page", "sites": "127.0.0.1"}])
+    x1 = str(b.call("open", url=site, account="X Promo"))
+    f1 = str(b.call("open", url=site, account="FB Page"))
+    check("two accounts on one site are each reachable, and each is its own session",
+          "anzen_probe=signed-in" in x1 and "no-cookie" in f1, x1[:120] + " | " + f1[:120])
+    check("  ...and both profiles are up at the same time",
+          {"X Promo", "FB Page"} <= b.open_profiles(), str(b.open_profiles()))
+    set_browser(accounts=[{"name": "X Promo", "sites": "x.com, twitter.com, 127.0.0.1"},
+                          {"name": "FB Page", "sites": "facebook.com, localhost"},
+                          {"name": "Not Signed In Yet", "sites": ""}])
     stop(b)
 
     # ---- the point: the cookie a page set is still there in the next run ----

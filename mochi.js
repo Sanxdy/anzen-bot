@@ -11,11 +11,11 @@
      WEAR     — what it wears on its head or face: glasses, hat, headset, crown.
      CURSOR   — every bot's eyes follow the pointer, from wherever it sits on screen.
    Plus the "scene" layer of props per state (desk, thought bubble, magnifier).
-   An introduced picture (`opts.image`) is the bot's *face*: it is drawn where the eyes and mouth
-   would be, and those are not drawn under it. Keyed against its own background, so it lands on the
-   bot rather than as a pasted-in square. Body, outfit, accessory and colour are drawn around it.
-   A generated whole-bot picture (`opts.whole`) is the character itself: ears, body and face all come
-   from the drawing, and only the outfit and accessory are drawn on top of it. */
+   An introduced picture (`opts.image`) is the bot itself: the drawing is its face, head and all, so
+   nothing else is drawn under it — no body, ears, eyes or mouth. It still bobs, tilts, scales and
+   drifts with the bot's motion, and blinks by cross-fading to a second drawing with the eyes shut
+   (`opts.imageClosed`). Keyed against its own white backdrop, so it lands on the page rather than as
+   a pasted-in square. */
 
 const MC = { INK: "#1A1412" };
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -109,6 +109,39 @@ export const EMOTIONS = {
 const EMO_KEYS = ["smile", "open", "brow", "eye", "wave"];
 /* What a bot idly feels when nothing is happening. Picked at random, held a few seconds. */
 const IDLE_MOODS = ["calm", "calm", "curious", "happy", "bored", "sleepy"];
+
+/* ---------------- face presets ----------------
+   A preset is a complete character: one WebP per animation state, head-aligned across frames, so
+   the engine only picks a frame and draws no body, eyes or mouth of its own. The clock is `ti`, the
+   idle clock, so a reduced-motion bot holds a still frame instead of mouthing silently. */
+export const PRESET_FRAMES = ["base", "closed", "m0", "m1", "m2", "m3",
+  "e-happy", "e-surprised", "e-confused", "e-annoyed", "e-bored", "e-sleepy",
+  "g-thumb", "g-wave", "g-think", "p1", "p2",
+  "work-a", "work-b", "work-closed", "work-happy"];
+const PRESET_STATE_FRAME = {
+  finished: "e-happy", thinking: "g-think", approval: "g-thumb", question: "e-surprised",
+  error: "e-annoyed", ratelimit: "e-annoyed", sleeping: "e-sleepy", bored: "e-bored",
+  dizzy: "e-confused",
+};
+/* Which frame a preset wears right now. `mouthOpen` is `emo.open`, the channel the app already
+   drives for a talking bot. A state with its own frame wins over it: those states' default emotions
+   open the mouth (thinking is "curious"), so the other order would never show the expression. */
+export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeLeft = 0) {
+  /* Working is a closed loop of three frames and its mouth never moves: the mouth cycle is a
+     talking tell, and a bot at its desk is not talking. */
+  if (state === "working") {
+    if (ti % 3.7 < 0.22) return "work-closed";                                    // blink
+    if (Math.floor(ti / 2.3) % 2 === 0 && ti % 2.3 < 0.5) return "work-happy";   // every other window
+    return Math.floor(ti / 0.22) % 2 ? "work-b" : "work-a";
+  }
+  if (pokeLeft > 0) return "p1";
+  const fixed = PRESET_STATE_FRAME[state];
+  if (fixed) return fixed;
+  if (mouthOpen > 0.05) return "m" + (Math.floor(ti / 0.13) % 4);
+  return eyesOpen < 0.5 ? "closed" : "base";
+}
+const presetUrl = (id, frame) => `/api/preset/${encodeURIComponent(id)}/${frame}.webp`;
+
 
 /* per-state config — colours, behaviour and the feeling that goes with it */
 export const STATES = {
@@ -234,10 +267,10 @@ export class MochiBot {
     this.sp = SPECIES[this.species];
     this.outfit = OUTFITS[opts.outfit] ? opts.outfit : "";
     this.accessory = ACCESSORIES[opts.accessory] ? opts.accessory : "";
-    this.image = opts.image || "";                   // an introduced picture: the bot's face
-    /* The face override wins over the generated whole bot, in the engine as well as in the client:
-       a bot with its own picture is drawn as a body with that face, not as the model's drawing. */
-    this.whole = this.image ? "" : (opts.whole || "");   // a generated picture: the whole character
+    this.image = opts.image || "";                   // the bot's face: drawn alone, filling the canvas
+    this.imageClosed = opts.imageClosed || "";       // the same face with its eyes shut, for the blink
+    this.preset = opts.preset || "";                 // a preset character: its frames replace the picture
+    if (this.preset) { this.image = ""; this.imageClosed = ""; }
     this.cv.width = this.size * this.dpr; this.cv.height = this.size * this.dpr;
     this.R = this.size * 0.326;                      // body radius; the unit every offset is quoted in
     this.yaw = 0; this.pitch = 0; this.tilt = 0; this.roll = 0; this.open = 1;
@@ -255,6 +288,8 @@ export class MochiBot {
     this._behaveAt = 5 + Math.random() * 6;
     this.tw = {}; this.locks = new Set();            // keyframe tweens, keyed by property
     this.emo = {}; for (const k of EMO_KEYS) this.emo[k] = EMOTIONS.calm[k];
+    this._pokeLeft = 0;                              // how long the poke frame still shows
+    if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
     this.setState(state, true);
   }
   /* ---- keyframe tweens (the Coucou anim() API) ---- */
@@ -331,12 +366,15 @@ export class MochiBot {
     const R = this.R;
     if ((prev === "sleeping" || prev === "bored") && s !== "sleeping" && s !== "bored")
       this.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);   // stretch on waking
+    /* A picture fills its box edge to edge, so a spin swings its corners out of the canvas and the
+       frame is cut on a hard diagonal. It hops instead — the same "something good happened" beat. */
+    const pic = !!(this.preset || this.image);
     switch (s) {
-      case "finished": this.doRoll(1, 950); break;
+      case "finished": if (pic) this.squash(); else this.doRoll(1, 950); break;
       case "error": this.anim("ox", [[0.08 * R, 50, Ease.out], [-0.08 * R, 70, Ease.inOut],
                                      [0.05 * R, 70, Ease.inOut], [0, 90, Ease.out]]); break;
       case "approval": this.anim("oy", [[-0.2 * R, 150, Ease.out], [0, 300, Ease.back]]); break;
-      case "dizzy": this.doRoll(2, 1300); break;
+      case "dizzy": if (pic) this.squash(); else this.doRoll(2, 1300); break;
       case "question": this.blink();
         this.anim("es", [[1.25, 120, Ease.out], [1, 500, Ease.inOut]]); break;
       default: if (prev !== "idle" || s !== "idle") this.blink();
@@ -353,8 +391,10 @@ export class MochiBot {
     if (look) {
       this.outfit = OUTFITS[look.outfit] ? look.outfit : "";
       this.accessory = ACCESSORIES[look.accessory] ? look.accessory : "";
-      this.image = look.image || "";
-      this.whole = this.image ? "" : (look.whole || "");
+      this.preset = look.preset || "";
+      this.image = this.preset ? "" : (look.image || "");
+      this.imageClosed = this.preset ? "" : (look.imageClosed || "");
+      if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
     }
   }
   /* The feeling on top of the state. Idle bots drift through their own moods. */
@@ -364,6 +404,7 @@ export class MochiBot {
     this._mood = e; this._moodAt = 3 + Math.random() * 5;
   }
   poke() {
+    this._pokeLeft = 0.45;                           // a preset shows its jolt frame for a moment
     this.squash();
     this.anim("oy", [[-0.34 * this.R, 120, Ease.out], [0.03 * this.R, 200, Ease.inOut], [0, 170, Ease.back]]);
     this.anim("yaw", [[(Math.random() < 0.5 ? -1 : 1) * 0.34, 130, Ease.out], [0, 320, Ease.inOut]]);
@@ -470,6 +511,7 @@ export class MochiBot {
       } else this._blinkAt = 2.2 + Math.random() * 3.2;
     }
     this._particles(dt);
+    if (this._pokeLeft > 0) this._pokeLeft = Math.max(0, this._pokeLeft - dt);
   }
   _particles(dt) {
     const c = this.cfg, e = this.emo;
@@ -496,73 +538,60 @@ export class MochiBot {
     if (this.tilt || this.roll) ctx.rotate(this.tilt + this.roll);
     ctx.scale(this.sx * (1 + (1 - this.sy) * 0.62), this.sy);
 
-    /* A generated whole-bot picture is the entire character, so none of the engine's own ears,
-       antenna, body, scan or face is drawn under it — they would show through the model's drawing.
-       Until it decodes the bot keeps its drawn body for that first frame, like an introduced face. */
-    const whole = this.whole ? textureFor(this.whole) : null;
-    const full = whole && whole.cv;
-    if (!full) {
+    /* A face picture *is* the bot: drawing the engine's body, ears, glow, outfit, accessory or eyes
+       under it would put a second character behind the first. Until it decodes there is no canvas,
+       and the bot keeps its drawn self for that first frame — the same fallback a bot with no
+       picture at all uses. */
+    /* A preset is the same idea with a frame per state: it is drawn in place of the picture, and a
+       frame that has not decoded (or does not ship) falls back to the base frame. */
+    const presetFace = this._presetFace();
+    const tex = presetFace ? null : textureFor(this.image);
+    const face = presetFace || (tex && tex.cv);
+    if (face) this._facePic(ctx, face);
+    else {
       if (this.sp.antenna) this._antenna(ctx, R, rx, ry);
       if (this.sp.ears !== "none") this._ears(ctx, R, rx, ry);
-    }
 
-    /* The glow is the silhouette's own, and a drawn character is not that silhouette: painted under
-       it, the shape shows as a grey oval the picture does not cover. The drawing already carries the
-       state through its own motion and the badge. */
-    if (this.glowA > 0.02 && !full) {
-      ctx.save(); ctx.shadowColor = this.cfg.glow;
-      ctx.shadowBlur = R * 0.9 * this.glowA; ctx.globalAlpha = 0.5 * this.glowA;
-      this._shape(ctx, rx, ry); ctx.fillStyle = this.cfg.glow; ctx.fill(); ctx.restore();
-    }
-    if (full) this._wholePic(ctx, full, rx, ry);
-    else if (this.flat) {      /* Coucou's small-bot body: one flat fill, and none of the gradient, tint, shadow rim or
+      if (this.glowA > 0.02) {
+        ctx.save(); ctx.shadowColor = this.cfg.glow;
+        ctx.shadowBlur = R * 0.9 * this.glowA; ctx.globalAlpha = 0.5 * this.glowA;
+        this._shape(ctx, rx, ry); ctx.fillStyle = this.cfg.glow; ctx.fill(); ctx.restore();
+      }
+      if (this.flat) {      /* Coucou's small-bot body: one flat fill, and none of the gradient, tint, shadow rim or
          highlight a big mascot gets. Those are what wash the colour out at 46px — and a state
          tint would also hide the bot's colour, which is the only thing the row is saying. The
          glow behind it still rides the state, so the row lights up without losing its colour. */
-      this._shape(ctx, rx, ry); ctx.fillStyle = this.flat; ctx.fill();
-    } else {
-      const g = ctx.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
-      g.addColorStop(0, this.bodyTop); g.addColorStop(1, this.bodyBottom);
-      this._shape(ctx, rx, ry); ctx.fillStyle = g; ctx.fill();
-      if (this.tint > 0.01) {
-        const tg = ctx.createLinearGradient(0, ry, 0, -ry);
-        tg.addColorStop(0, hexA(this.cfg.glow, 0.72 * this.tint)); tg.addColorStop(1, hexA(this.cfg.glow, 0));
-        this._shape(ctx, rx, ry); ctx.fillStyle = tg; ctx.fill();
+        this._shape(ctx, rx, ry); ctx.fillStyle = this.flat; ctx.fill();
+      } else {
+        const g = ctx.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
+        g.addColorStop(0, this.bodyTop); g.addColorStop(1, this.bodyBottom);
+        this._shape(ctx, rx, ry); ctx.fillStyle = g; ctx.fill();
+        if (this.tint > 0.01) {
+          const tg = ctx.createLinearGradient(0, ry, 0, -ry);
+          tg.addColorStop(0, hexA(this.cfg.glow, 0.72 * this.tint)); tg.addColorStop(1, hexA(this.cfg.glow, 0));
+          this._shape(ctx, rx, ry); ctx.fillStyle = tg; ctx.fill();
+        }
+        const sg = ctx.createRadialGradient(0, 0, R * 0.15, 0, 0, R * 1.25);
+        sg.addColorStop(0, "rgba(0,0,0,0)"); sg.addColorStop(0.6, "rgba(0,0,0,0)"); sg.addColorStop(1, "rgba(0,0,0,0.2)");
+        this._shape(ctx, rx, ry); ctx.fillStyle = sg; ctx.fill();
+        const hg = ctx.createRadialGradient(rx * 0.34, -ry * 0.46, 0, rx * 0.34, -ry * 0.46, R * 0.42);
+        hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
+        this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
       }
-      const sg = ctx.createRadialGradient(0, 0, R * 0.15, 0, 0, R * 1.25);
-      sg.addColorStop(0, "rgba(0,0,0,0)"); sg.addColorStop(0.6, "rgba(0,0,0,0)"); sg.addColorStop(1, "rgba(0,0,0,0.2)");
-      this._shape(ctx, rx, ry); ctx.fillStyle = sg; ctx.fill();
-      const hg = ctx.createRadialGradient(rx * 0.34, -ry * 0.46, 0, rx * 0.34, -ry * 0.46, R * 0.42);
-      hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
-      this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
+      if (this.cfg.scan) {
+        ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
+        const sx = this.scanX * rx;
+        const lg = ctx.createLinearGradient(sx - 10, 0, sx + 10, 0);
+        lg.addColorStop(0, "rgba(255,255,255,0)"); lg.addColorStop(0.5, "rgba(255,255,255,0.5)"); lg.addColorStop(1, "rgba(255,255,255,0)");
+        ctx.fillStyle = lg; ctx.fillRect(sx - 10, -ry, 20, ry * 2); ctx.restore();
+      }
+      this._outfit(ctx, R, rx, ry);
+      this._eyes(ctx, R, rx, ry); this._mouth(ctx, R, rx, ry);
+      this._accessory(ctx, R, rx, ry);
     }
-    if (!full && this.cfg.scan) {
-      ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
-      const sx = this.scanX * rx;
-      const lg = ctx.createLinearGradient(sx - 10, 0, sx + 10, 0);
-      lg.addColorStop(0, "rgba(255,255,255,0)"); lg.addColorStop(0.5, "rgba(255,255,255,0.5)"); lg.addColorStop(1, "rgba(255,255,255,0)");
-      ctx.fillStyle = lg; ctx.fillRect(sx - 10, -ry, 20, ry * 2); ctx.restore();
-    }
-    /* A garment is written for a head-and-torso bot: on a full-body drawing the band lands on the
-       face. Moved down to the drawing's own torso — below the head, inside the arms — a scarf reads
-       as a scarf again. */
-    const fr = full ? this._wholeFrame : { rx, ry, dy: 0, rx2: rx, ry2: ry };
-    ctx.save(); ctx.translate(0, fr.dy);
-    this._outfit(ctx, R, fr.rx2, fr.ry2);
-    ctx.restore();
-    /* An introduced picture is the face, and the drawn eyes and mouth are *not* under it: the model
-       is asked for a face, so a drawn eye on top of its own would be two eyes. Until the picture has
-       decoded there is no canvas to draw, and the bot keeps its own face for that first frame rather
-       than showing a hole — which is also what a bot with no picture at all does. */
-    if (!full) {
-      const tex = textureFor(this.image);
-      if (tex && tex.cv) this._facePic(ctx, tex.cv, R, rx, ry);
-      else { this._eyes(ctx, R, rx, ry); this._mouth(ctx, R, rx, ry); }
-    }
-    this._accessory(ctx, R, fr.rx, fr.ry);
     ctx.restore();
 
-    this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry);
+    this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry, !!presetFace);
     if (this.badgeS > 0.02) this._badge(ctx, cx + this.ox, cy + this.oy, R);
     this._parts(ctx, cx + this.ox, cy + this.oy);
     ctx.restore();
@@ -635,36 +664,35 @@ export class MochiBot {
     return { mouthY, mouthTop, eyeMinY, eyeMaxY,
              knee: Math.max(R * 0.12, (eyeMaxY - eyeMinY) * 0.14) };
   }
-  /* Where the face goes: the box the eyes and mouth occupy, which is what an introduced picture
-     replaces. Read off `_faceGeom`, so it follows the species' own eye row and the current mood the
-     same way the drawn face does. Square, because the picture is, and inset from the silhouette so
-     the bot's colour still frames it. */
-  _faceBox(R, rx, ry) {
-    const G = this._faceGeom(R, rx, ry);
-    const top = G.eyeMinY - R * 0.16, h = (G.mouthY + R * 0.30) - top;
-    const w = Math.min(rx * 1.34, h * 1.10);
-    return { x: -w / 2, y: top, w, h };
+  /* The preset frame for this instant, or the base frame while the chosen one is still decoding or
+     does not exist. Null until even the base lands, so the bot keeps its drawn self for that first
+     frame instead of flashing an empty canvas. */
+  _presetFace() {
+    if (!this.preset) return null;
+    const want = presetFrame(this.state, this.ti, this.emo.open, this.open, this._pokeLeft);
+    for (const f of [want, "base"]) {
+      const t = presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
+      if (t && t.cv) return t.cv;
+    }
+    return null;
   }
-  /* The introduced picture, drawn as the face. It looks around and blinks with the bot — the same
-     yaw, pitch and `open` the drawn eyes use — so a still picture reads as alive rather than as a
-     sticker. The blink is a squash about the box's centre: the one thing a picture of a face can do
-     that reads as an eye closing. Clipped to the silhouette, like the face it stands in for. */
-  _facePic(ctx, cv, R, rx, ry) {
-    const B = this._faceBox(R, rx, ry);
-    const sq = 0.88 + 0.12 * clamp(this.open, 0, 1), h = B.h * sq;
-    ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
-    ctx.drawImage(cv, B.x + this.yaw * B.w * 0.05, B.y + (B.h - h) / 2 + this.pitch * B.h * 0.04, B.w, h);
-    ctx.restore();
-  }
-  /* The generated whole-bot picture, drawn as the character. Fitted to the silhouette's box with its
-     aspect kept: a head-and-body drawing is taller than the squircle, and stretching it to the box
-     would give the bot a fat head. The bob, tilt and squash of the engine still move it. */
-  _wholePic(ctx, cv, rx, ry) {
-    const w = rx * 2.30, h = ry * 2.30;
-    const s = Math.min(w / cv.width, h / cv.height);
-    this._wholeFrame = { rx: cv.width * s / 2, ry: cv.height * s / 2,
-      dy: cv.height * s * 0.13, rx2: cv.width * s * 0.30, ry2: cv.height * s * 0.30 };
-    ctx.drawImage(cv, -cv.width * s / 2, -cv.height * s / 2, cv.width * s, cv.height * s);
+  /* The face picture, drawn alone and filling the canvas with its aspect kept. A picture with a
+     shut-eye frame blinks by cross-fading to it — the same `open` channel the drawn eyes use, so the
+     fade lands on the same frame a blink would. With no second frame nothing is drawn over it: a
+     squash to fake a blink read as the whole head being pressed. */
+  _facePic(ctx, cv) {
+    const box = this.size * 0.96, s = Math.min(box / cv.width, box / cv.height);
+    const w = cv.width * s, h = cv.height * s;
+    ctx.drawImage(cv, -w / 2, -h / 2, w, h);
+    const shut = this.imageClosed ? textureFor(this.imageClosed) : null;
+    if (shut && shut.cv) {
+      const a = clamp((1 - this.open) / 0.45, 0, 1);
+      if (a > 0) {
+        ctx.save(); ctx.globalAlpha = a;
+        ctx.drawImage(shut.cv, -w / 2, -h / 2, w, h);
+        ctx.restore();
+      }
+    }
   }
   /* Where an eye actually lands, after the cylinder projection and the band limit. Both the
      renderer and the tests go through here, so the guarantee lives in one place. */
@@ -922,14 +950,19 @@ export class MochiBot {
     ctx.restore();
   }
   /* ---------- scene props ---------- */
-  _props(ctx, cx, cy, R, rx, ry) {
+  _props(ctx, cx, cy, R, rx, ry, preset) {
     const c = this.cfg;
     ctx.save(); ctx.translate(cx, cy);
-    if (c.bubble) this._bubble(ctx, R, rx, ry);
-    if (c.mag)    this._mag(ctx, R, rx, ry);
-    if (c.hand)   this._hand(ctx, R, rx, ry);
+    /* A preset's frame is the whole scene: its work frames already have the laptop, its gestures
+       already have the hand, and its head fills the box, so a thought bubble would land on the
+       face. Its frames carry the state on their own. */
+    if (!preset) {
+      if (c.bubble) this._bubble(ctx, R, rx, ry);
+      if (c.mag)    this._mag(ctx, R, rx, ry);
+      if (c.hand)   this._hand(ctx, R, rx, ry);
+      if (c.desk)   this._desk(ctx, R, rx, ry);
+    }
     if (c.zz)     this._zz(ctx, R, rx, ry);
-    if (c.desk)   this._desk(ctx, R, rx, ry);
     ctx.restore();
   }
   _bubble(ctx, R, rx, ry) {
@@ -1014,7 +1047,11 @@ export class MochiBot {
   }
   _badge(ctx, cx, cy, R) {
     const kind = this.cfg.badge, col = this.cfg.glow, s = this.badgeS;
-    ctx.save(); ctx.translate(cx - R * 0.72, cy - R * 0.72); ctx.scale(s, s); ctx.fillStyle = col;
+    /* -0.72R is just outside a drawn body; a preset's head fills the box, so the same offset puts the
+       badge on its cheek. Sit in the canvas corner instead, inset by a share of the box so the glyph
+       (a fixed size in pixels) still clears the edge on a 46px sidebar row. */
+    const k = this.preset ? this.size / 2 - Math.max(6, this.size * 0.09) : R * 0.72;
+    ctx.save(); ctx.translate(cx - k, cy - k); ctx.scale(s, s); ctx.fillStyle = col;
     const now = this.ti;
     if (kind === "dots") for (let i = 0; i < 3; i++) {
       ctx.globalAlpha = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(now * 5.7 - i * 1.1));
@@ -1033,6 +1070,10 @@ export class MochiBot {
     ctx.restore();
   }
   _parts(ctx, cx, cy) {
+    /* The offsets below are quoted in pixels for the drawn body, which leaves a margin round itself.
+       A preset head fills the box, so any of them lands on hair or cheek — and its frames already
+       carry the expression, so it gets none of them. */
+    if (this.preset) return;
     for (const p of this.parts) {
       ctx.save(); ctx.globalAlpha = clamp(p.a, 0, 1); ctx.translate(cx + p.x, cy + p.y);
       if (p.k === "star") { ctx.fillStyle = "#F7B32B"; star(ctx, 7 * p.s); }
@@ -1122,8 +1163,8 @@ function hexA(hex, a) {
    plain white backdrop and a white rectangle inside the head reads as a pasted-in photo rather than
    as the bot's face. The key is only applied when the four corners agree with each other — on a busy
    background a corner average is a colour that appears nowhere, and keying on it would punch holes
-   through the subject. Holes that are punched show the bot's own colour underneath, which is why the
-   body is filled before the picture is drawn. */
+   through the subject. A hole that is punched shows the page through the bot, which is why the
+   model is asked for an ink outline: the flood fill stops at it. */
 const TEX = new Map();
 const TEX_PX = 256;
 export function textureFor(url) {
@@ -1170,6 +1211,21 @@ export function textureFor(url) {
           if (y > 0) stack.push(q - TEX_PX);
           if (y < M) stack.push(q + TEX_PX);
         }
+        /* The fill stops at the first pixel that is not backdrop, which leaves the antialiased edge
+           of the ink outline as a ring of pale grey — a dotted halo on a dark page. Those pixels are
+           the outline blended with the white backdrop, so they are unmixed rather than dropped:
+           alpha is how far the pixel is from white, and the colour is what is underneath. */
+        const clear = o => p[o + 3] < 24;
+        for (let y = 0; y <= M; y++) for (let x = 0; x <= M; x++) {
+          const o = (y * TEX_PX + x) * 4;
+          if (clear(o)) continue;
+          if (!((x > 0 && clear(o - 4)) || (x < M && clear(o + 4)) ||
+                (y > 0 && clear(o - TEX_PX * 4)) || (y < M && clear(o + TEX_PX * 4)))) continue;
+          const a = 1 - Math.min(p[o], p[o + 1], p[o + 2]) / 255;
+          if (a < 0.04) { p[o + 3] = 0; continue; }
+          for (let k = 0; k < 3; k++) p[o + k] = Math.max(0, Math.min(255, (p[o + k] - (1 - a) * 255) / a));
+          p[o + 3] = Math.round(255 * a);
+        }
         c.putImageData(d, 0, 0);
       }
       /* The subject, not the square: once the backdrop is keyed out, what is left sits in its own
@@ -1188,7 +1244,66 @@ export function textureFor(url) {
       } else rec.cv = cv;
     } catch (e) { /* a canvas we cannot read back: keep the picture exactly as it came */ }
   };
-  img.src = url;
+  /* In the desktop app the page comes from disk, where `/api/…` is not an address the browser can
+     reach. `bridge.js` rewrites the API images it can see in the page, but this one is a detached
+     Image the page never holds — so it is fetched over the app's own channel first. A browser, or
+     the dev server, has no bridge and keeps the plain URL. */
+  if (/^\/api\//.test(url) && window.anzen) {
+    /* `textureFor` is called from the draw loop, so a failed fetch must not be retried per frame —
+       one retry, then the bot draws without the picture until its URL changes. The blob is revoked
+       once decoded: the pixels live on in `rec.cv`, and the blob would otherwise be held for the
+       life of the page. */
+    const grab = left => fetch(url).then(r => r.blob())
+      .then(b => {
+        const u = URL.createObjectURL(b), was = img.onload;
+        img.onload = e => { was(e); URL.revokeObjectURL(u); };
+        img.src = u;
+      })
+      .catch(() => { if (left > 1) setTimeout(() => grab(left - 1), 2000); });
+    grab(2);
+  } else img.src = url;
+  return rec;
+}
+
+/* ---------------- preset frames: a character's own pictures ----------------
+   These already carry real alpha, so nothing is keyed out: the white-backdrop fill above would push
+   every antialiased edge toward white and leave a halo. Decoded once per character, not per bot: a
+   roster wearing the same preset shares one set. The size is bucketed to what the canvas can show,
+   because 21 frames held at full resolution is 22 MB per character and a 46px sidebar row cannot
+   spend it. The whole square is kept, not a tight crop: the frames are head-aligned, and a crop
+   would shift the head. */
+const PTEX = new Map();
+export const presetTextureFor = (url, px = 512) => {
+  if (!url) return null;
+  px = Math.min(512, 2 ** Math.ceil(Math.log2(Math.max(32, px))));
+  const key = url + "|" + px;
+  if (PTEX.has(key)) return PTEX.get(key);
+  const rec = { cv: null };
+  PTEX.set(key, rec);
+  if (typeof document === "undefined") return rec;   // no canvas (a test, or a headless pass)
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const cv = document.createElement("canvas"); cv.width = cv.height = px;
+      const c = cv.getContext("2d");
+      const s = Math.max(px / img.width, px / img.height);
+      const w = img.width * s, h = img.height * s;
+      c.drawImage(img, (px - w) / 2, (px - h) / 2, w, h);
+      rec.cv = cv;
+    } catch (e) { /* a canvas we cannot draw into: the drawn bot stands in */ }
+  };
+  /* Same channel as `textureFor`: the desktop page comes from disk, where `/api/…` is not an
+     address an <img> can reach. */
+  if (/^\/api\//.test(url) && window.anzen) {
+    const grab = left => fetch(url).then(r => r.blob())
+      .then(b => {
+        const u = URL.createObjectURL(b), was = img.onload;
+        img.onload = e => { was(e); URL.revokeObjectURL(u); };
+        img.src = u;
+      })
+      .catch(() => { if (left > 1) setTimeout(() => grab(left - 1), 2000); });
+    grab(2);
+  } else img.src = url;
   return rec;
 }
 

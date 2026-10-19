@@ -789,44 +789,6 @@ ok("a landing the router could not answer is asked exactly once",
 ok("...and the turn still names the work it did", "run_shell" in land3, land3)
 S._stalls.clear()
 
-print("--- the CDP reader is bounded too: a trickled frame cannot pin the browser thread ---")
-# The same trap one file over. The browser thread is single, so a peer that trickles a frame pins it and
-# every later browser call silently becomes "(browser timeout)". The turn itself is bounded by
-# `Browser.call`, but the thread is not — this is what bounds the frame.
-import threading as _th
-_ws_srv = socket.socket(); _ws_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-_ws_srv.bind(("127.0.0.1", 0)); _ws_srv.listen(1)
-_ws_port = _ws_srv.getsockname()[1]
-def _trickler():
-    c, _ = _ws_srv.accept()
-    try:
-        buf = b""
-        while b"\r\n\r\n" not in buf:                 # the upgrade request
-            d = c.recv(4096)
-            if not d: return
-            buf += d
-        c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
-        c.sendall(bytes([0x81, 100]))                 # fin+text, unmasked, payload length 100
-        for _ in range(30):                           # trickle 30 of the 100 bytes, then hang up: the
-            c.sendall(b"x"); time.sleep(0.2)          # frame never completes, which is what used to
-        c.close()                                     # block — forever, on the old per-read timeout
-    except Exception:
-        pass
-_th.Thread(target=_trickler, daemon=True).start()
-ws = S._WS("ws://127.0.0.1:%d/devtools/page/1" % _ws_port, timeout=5)
-t0 = time.time()
-try:
-    ws.recv(deadline=time.time() + STALL); raised = None
-except Exception as e:
-    raised = e
-took = time.time() - t0
-ok("a frame that never completes ends the call instead of the thread",
-   raised is not None and took < 2.5 * STALL, "raised=%r took=%.1fs" % (raised, took))
-ok("...and it is a timeout, which the caller already treats as a dead browser",
-   isinstance(raised, (TimeoutError, socket.timeout)), raised)
-try: ws.close()
-except Exception: pass
-
 print()
 print("  %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

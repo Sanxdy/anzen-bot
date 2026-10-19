@@ -19,9 +19,21 @@
 
 [![Eleven cats drawn from one photo](docs/bot-faces.png)](docs/bot-faces.mp4)
 
-*One photo in, one complete mascot per bot out — and every drawing is the same animal as the photo. [Watch the 52-second recording](docs/bot-faces.mp4).*
+*One photo in, one face per bot out — and every drawing is the same animal as the photo. [Watch the 52-second recording](docs/bot-faces.mp4).*
 
 The prompt never names a species: it asks the model to redraw the subject and keep it. Telling it `Species: owl` drew a cat as an owl — [before and after, same photo and model](docs/bot-faces-why.png).
+
+The drawing is the face, not the body: head and hair only, nothing drawn behind it, filling the bot's space. The bot keeps its own motion — it bobs, tilts, sways and drifts with its gaze — and blinks, because each face comes with a second drawing of the same head with its eyes shut.
+
+A bot's own **Face picture** in its editor is the other way to give it a face. Both are kept — picking a face from the set drops the picture, and introducing a picture drops the set's face — so whichever you chose last is the one you see.
+
+### Bot faces: seven characters already drawn
+
+![Seven presets, five states each](docs/bot-faces-presets.png)
+
+*The seven shipped presets — Woman, Woman (auburn), Woman (teal), Man, Man (brown), Man (blond) and Cat — each with 21 frames of its own: blinks, four mouth shapes, six expressions, three gestures, and four working frames at a laptop. [Watch the recording](docs/bot-faces-presets.mp4).*
+
+A preset is a whole character, not a single picture: one frame per state, all cut out and aligned on the same head, so the bot keeps its size and its position when the state changes and when you swap one preset for another. Pick one per bot in **Settings → Bot faces**, or leave the bot as its own drawn mascot.
 
 ---
 
@@ -61,6 +73,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 * **Rooms** — a shared team chat with its own transcript, members and responder rule.
 * **Bots as contacts** — each with its own model, approval level, memory, skills, tools, voice and animated face.
 * **Bot faces** — introduce one image and the image model draws a whole mascot for every bot from it, one different character each, all the same animal as the photo, with the outfit and accessory drawn on top. [Watch the 52-second demo](docs/bot-faces.mp4) · [the eleven cats it drew](docs/bot-faces.png)
+* **Face presets** — seven complete characters ship with the app (three women, three men and a cat), 21 frames each: blinks, mouth shapes, expressions, gestures and a working frame with a laptop. [See all seven](docs/bot-faces-presets.png) · [watch it run](docs/bot-faces-presets.mp4)
 * **One repo per room** — pin a room to a folder and its bots work only inside it, so projects never mix.
 * **Scoped 1:1 chats** — talking to a bot from inside a room runs it in that room's repo.
 * **`@` mentions** — pick a room member from a filtered dropdown instead of remembering who is in it.

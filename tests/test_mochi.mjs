@@ -355,21 +355,24 @@ console.log("\n-- colour grading --");
   /* Coucou paints a small bot as one flat fill of its colour; only the big mascot gets the
      gradient body, state tint, shadow rim and white highlight. `flat` is how a sidebar face
      asks for the small-bot treatment, so record every fill and gradient and check both. */
-  const recCtx = (log) => {
+  const recCtx = (log, imgs) => {
     const store = {};
     return new Proxy(store, {
       get(t, k) {
         if (k in t) return t[k];
         if (k === "createLinearGradient") return () => { const g = { addColorStop() {}, grad: "lin" }; return g; };
         if (k === "createRadialGradient") return () => { const g = { addColorStop() {}, grad: "rad" }; return g; };
-        if (k === "drawImage") return () => log.push("img");
+        if (k === "drawImage") return (cv, x, y, w, h) => {
+          log.push("img");
+          if (imgs) imgs.push({ a: store.globalAlpha == null ? 1 : store.globalAlpha, x, y, w, h });
+        };
         return () => {};
       },
       set(t, k, v) { t[k] = v; if (k === "fillStyle" || k === "strokeStyle") log.push(typeof v === "object" && v ? v.grad : v); return true; },
     });
   };
-  const recCanvas = (log) => ({ width: 0, height: 0, clientWidth: 46, clientHeight: 46,
-    getContext: () => recCtx(log), getBoundingClientRect: () => ({ left: 0, top: 0, width: 46, height: 46 }) });
+  const recCanvas = (log, imgs) => ({ width: 0, height: 0, clientWidth: 46, clientHeight: 46,
+    getContext: () => recCtx(log, imgs), getBoundingClientRect: () => ({ left: 0, top: 0, width: 46, height: 46 }) });
 
   const FLAT = "#7C5CFF";
   const flatLog = [];
@@ -469,26 +472,56 @@ console.log("\n-- colour grading --");
   }) }) };
   const pic = "/api/avatar/face-test?v=1";
   ok("a picture decodes into a texture", !!(textureFor(pic) || {}).cv);
+  /* In the desktop app the page is loaded from disk, so `/api/…` is not an address an <img> can
+     reach — the picture has to come through the app's own channel (`window.anzen`). Setting `src`
+     straight to the URL is what made every face silently fall back to the plain drawn bot inside
+     the app while looking perfect in a browser. */
+  const realFetch = globalThis.fetch, realCreate = URL.createObjectURL, realRevoke = URL.revokeObjectURL;
+  globalThis.window.anzen = {};
+  const fetched = [];
+  globalThis.fetch = u => { fetched.push(u); return Promise.resolve({ blob: () => Promise.resolve({}) }); };
+  URL.createObjectURL = () => "blob:app-face";
+  URL.revokeObjectURL = () => {};
+  const appPic = "/api/face/f-app-1.png";
+  const appRec = textureFor(appPic);
+  await new Promise(r => setTimeout(r, 0));
+  ok("inside the app a picture is fetched over its own channel, not set on img.src",
+     fetched.includes(appPic), JSON.stringify(fetched));
+  ok("...and it decodes from that blob", !!appRec.cv);
+  delete globalThis.window.anzen;
+  globalThis.fetch = realFetch; URL.createObjectURL = realCreate; URL.revokeObjectURL = realRevoke;
   const INK = "#1A1412";                               // the eyes and mouth are drawn in exactly this
   const withPic = wears({ image: pic, outfit: "scarf", accessory: "crown" });
-  ok("a picture is painted on the head", withPic.includes("img"), JSON.stringify(withPic.slice(0, 10)));
-  ok("the drawn eyes and mouth are not under a picture (one face, not two)",
-     !withPic.includes(INK), JSON.stringify(withPic.filter(v => v === INK).slice(0, 4)));
-  ok("the body, outfit and accessory are still drawn around a picture",
-     withPic.some(inkish), JSON.stringify(withPic.filter(v => v).slice(0, 8)));
+  ok("a face picture is painted", withPic.includes("img"), JSON.stringify(withPic.slice(0, 10)));
+  /* The drawing is the face, not the body: nothing of the engine's own character may show behind it —
+     no silhouette, ears, outfit, accessory or drawn eyes. */
+  ok("a face picture is drawn alone: no body, ears or drawn face under it",
+     !withPic.includes(INK) && !withPic.includes("#EDEDEF") && !withPic.includes("#C4C5CA"),
+     JSON.stringify(withPic.slice(0, 10)));
+  ok("nothing is dressed on a face picture", !withPic.some(inkish), JSON.stringify(withPic.slice(0, 8)));
   ok("without a picture the bot still draws its own face", wears({}).includes(INK));
-  /* ---- a generated whole bot is the character ----
-     The Bot faces section asks the model for a complete mascot, so the drawing *is* the body and the
-     face: none of the engine's own body, ears or eyes may be drawn under it, or they show through.
-     The outfit and accessory still go on top, which is what the section promises. */
-  const wholeUrl = "/api/face/f-1-1.png";
-  const whole = wears({ whole: wholeUrl, outfit: "scarf", accessory: "crown" });
-  ok("a whole-bot picture is painted", whole.includes("img"));
-  ok("no drawn face under a whole bot", !whole.includes(INK));
-  ok("no drawn body under a whole bot", !whole.includes("#EDEDEF") && !whole.includes("#C4C5CA"));
-  ok("the outfit and accessory are drawn on top of a whole bot", whole.some(inkish));
-  ok("a bot's own picture overrides the generated whole bot",
-     mk({ image: pic, whole: wholeUrl }).whole === "" && mk({ whole: wholeUrl }).whole === wholeUrl);
+  /* ---- the blink is a second drawing, cross-faded over the first ----
+     The engine's `open` channel drives the fade, so a blink lands on the same frame the drawn eyes
+     would. A picture with no second drawing simply does not blink — squashing it to fake one read as
+     the whole head being pressed. */
+  const shutPic = "/api/avatar/face-test-closed?v=1";
+  ok("a shut-eye picture URL is remembered on the bot", mk({ imageClosed: shutPic }).imageClosed === shutPic);
+  ok("a shut-eye frame decodes into a texture", !!(textureFor(shutPic) || {}).cv);
+  const blinkLog = [], blinkImgs = [];
+  const bb = new MochiBot(recCanvas(blinkLog, blinkImgs), "idle", { species: "mochi", size: 160,
+    image: pic, imageClosed: shutPic });
+  bb.open = 1; bb.draw();
+  const openFrames = blinkImgs.length;
+  bb.open = 0.06; bb.draw();
+  ok("a picture with a shut-eye frame cross-fades to it when the eyes close",
+     openFrames === 1 && blinkImgs.length === 3 && blinkImgs[2].a > 0.9, JSON.stringify(blinkImgs));
+  const plainImgs = [];
+  const pb = new MochiBot(recCanvas([], plainImgs), "idle", { species: "mochi", size: 160, image: pic });
+  pb.open = 1; pb.draw();
+  const tall = plainImgs[0].h;
+  pb.open = 0.06; pb.draw();
+  ok("a picture with no shut-eye frame is not squashed to fake a blink",
+     plainImgs.length === 2 && Math.abs(plainImgs[1].h - tall) < 0.01, JSON.stringify(plainImgs));
   /* ---- the backdrop is keyed from the edge inwards ----
      A cream cat on a white backdrop is still a cat. The key used to remove every pixel close to the
      corner colour, which ate the subject: this photo is a cream disc inside a dark outline on pure
@@ -509,11 +542,8 @@ console.log("\n-- colour grading --");
   ok("a pale subject inside its own outline survives the key", alphaAt(128, 128) === 255);
   globalThis.document = realDoc; globalThis.Image = realImg;
   ok("skin() re-dresses a live bot",
-     (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u" });
-       return b.outfit === "tie" && b.accessory === "crown" && b.image === "u"; })());
-  ok("skin() with a whole bot keeps the drawing and drops the face override",
-     (() => { const b = mk({ image: "u" }); b.skin("mochi", null, { whole: wholeUrl });
-       return b.whole === wholeUrl && b.image === ""; })());
+     (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u", imageClosed: "v" });
+       return b.outfit === "tie" && b.accessory === "crown" && b.image === "u" && b.imageClosed === "v"; })());
   ok("skin() with no look keeps what the bot is wearing",
      (() => { const b = mk({ outfit: "tie", accessory: "crown" }); b.skin("cat", { flat: FLAT });
        return b.outfit === "tie" && b.accessory === "crown"; })());

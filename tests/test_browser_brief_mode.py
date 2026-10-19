@@ -45,9 +45,17 @@ check("own mode says no account is set up", "no account is set up" in o, o)
 check("  ...and never names Zen Pilot", "Zen Pilot" not in o, o)
 check("  ...and carries the same 'the app owns the browsers' line", own_line in o, o)
 
-# cdp mode — unchanged. The Zen Pilot wording is the truth there and must stay.
-c = brief(mode="cdp", accounts=[])
-check("cdp mode keeps the Zen Pilot wording it always had", "Zen Pilot" in c, c)
+# The retired mode. A save that still says "cdp" (or "zenpilot") must come back as saved profiles, and
+# the fields only that mode used must not survive to confuse anything that reads them.
+import json
+with open(S.SET_PATH, "w") as f:
+    json.dump({"browser": {"mode": "cdp", "port": 9222, "target_url": "https://x.com",
+                           "profile": "default", "cdp_url": "http://127.0.0.1:9222",
+                           "launch_cmd": "open -a 'Zen Pilot'", "accounts": []}}, f)
+mig = S._load_settings_raw()["browser"]
+check("a saved cdp mode is moved to saved profiles", mig["mode"] == "profiles", mig)
+check("  ...and the fields only it used are retired",
+      not [k for k in ("port", "target_url", "profile", "cdp_url", "launch_cmd") if k in mig], mig)
 
 # The two static strings a bot also reads: the tool doc and the browser_open tool description.
 check("the tool doc never names Zen Pilot (it rides in every prompt)",
@@ -75,7 +83,26 @@ check("a room's account rows keep only a name and sites, trimmed",
 check("a room with no accounts falls back to the machine-wide list",
       S._room_routes({"browser": []}) is None)
 check("a room with accounts routes its own sites",
-      S._room_routes(room) == {"threads.com": "Threads me"}, S._room_routes(room))
+      S._room_routes(room) == {"threads.com": ["Threads me"]}, S._room_routes(room))
+
+# The accounts used to be one machine-wide list in Settings → Browser, a tab that is gone. Every room
+# must adopt that list once, or the setup the user already made would exist only as a fallback they
+# cannot see or edit from the room.
+S.save_channels([{"id": "promo", "name": "Promo"},
+                 {"id": "mine", "name": "Mine", "browser": [{"name": "Own", "sites": "own.com"}]}])
+S._migrate_room_browser()
+seeded = {c["id"]: c["browser"] for c in S.load_channels()}
+check("a room with no accounts adopts the machine-wide list on boot",
+      seeded["promo"] == [{"name": "Global X", "sites": "x.com"}], seeded)
+check("  ...while a room that set its own keeps them",
+      seeded["mine"] == [{"name": "Own", "sites": "own.com"}], seeded)
+chs = S.load_channels()
+for c in chs:
+    if c["id"] == "promo": c["browser"] = []
+S.save_channels(chs)
+S._migrate_room_browser()
+check("  ...and a list the user emptied later is not refilled on the next boot",
+      S.load_channels()[0]["browser"] == [], S.load_channels()[0]["browser"])
 
 B = S.BROWSER; rt = S._room_routes(room)
 check("the browser routes a room's site through the room's table",
@@ -103,6 +130,10 @@ seen.clear()
 S.exec_tool("producer", "browser_open", {"url": "https://threads.com/"})
 check("  ...and a chat outside a room carries none, so the machine-wide list answers",
       seen.get("routes") is None, seen)
+seen.clear()
+S.exec_tool("producer", "browser_open", {"url": "https://threads.com/", "account": "Threads me"})
+check("  ...and the account a bot names rides with the call",
+      seen.get("account") == "Threads me", seen)
 S.BROWSER.call = real_call
 
 # The wiring, not just the function: a turn running in a room must actually be handed the room's
