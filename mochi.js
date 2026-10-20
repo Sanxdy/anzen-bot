@@ -353,6 +353,9 @@ export class MochiBot {
       else this.anim("yaw", [[0.40, 420, Ease.inOut], [-0.40, 700, Ease.inOut], [0, 460, Ease.inOut]]);
     } else if (r < 0.28) this.blink();
     else if (r < 0.54) this.anim("tilt", [[0.11, 260, Ease.out], [0.11, 520, Ease.lin], [0, 300, Ease.inOut]]);
+    /* A portrait has no body to squash or hop. It blinks, or tilts its head — the two things a
+       face actually does when it fidgets. */
+    else if (this.preset || this.image) this.blink();
     else if (r < 0.8) this.squash();
     else this.anim("oy", [[-0.16 * R, 150, Ease.out], [0.02 * R, 180, Ease.inOut], [0, 220, Ease.back]]);
   }
@@ -364,17 +367,24 @@ export class MochiBot {
     if (instant) { this.tint = this.cfg.tint; this.glowA = this.cfg.tint > 0 ? 1 : 0.5; return; }
     if (prev === s) return;
     const R = this.R;
-    if ((prev === "sleeping" || prev === "bored") && s !== "sleeping" && s !== "bored")
-      this.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);   // stretch on waking
     /* A picture fills its box edge to edge, so a spin swings its corners out of the canvas and the
-       frame is cut on a hard diagonal. It hops instead — the same "something good happened" beat. */
+       frame is cut on a hard diagonal; and it cannot be squashed or hopped like a blob. A head can
+       nod and shake, and those it does. `finished` and `approval` get no motion at all: their own
+       frames are the beat, and a portrait that lunged when the news landed would read as a bounce. */
     const pic = !!(this.preset || this.image);
+    if (!pic && (prev === "sleeping" || prev === "bored") && s !== "sleeping" && s !== "bored")
+      this.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);   // stretch on waking
     switch (s) {
-      case "finished": if (pic) this.squash(); else this.doRoll(1, 950); break;
+      case "finished":
+        if (!pic) this.doRoll(1, 950); break;
       case "error": this.anim("ox", [[0.08 * R, 50, Ease.out], [-0.08 * R, 70, Ease.inOut],
                                      [0.05 * R, 70, Ease.inOut], [0, 90, Ease.out]]); break;
-      case "approval": this.anim("oy", [[-0.2 * R, 150, Ease.out], [0, 300, Ease.back]]); break;
-      case "dizzy": if (pic) this.squash(); else this.doRoll(2, 1300); break;
+      case "approval":
+        if (!pic) this.anim("oy", [[-0.2 * R, 150, Ease.out], [0, 300, Ease.back]]); break;
+      case "dizzy":
+        if (pic) this.anim("tilt", [[-0.10, 220, Ease.inOut], [0.10, 320, Ease.inOut],
+                                    [-0.06, 320, Ease.inOut], [0, 320, Ease.inOut]]);
+        else this.doRoll(2, 1300); break;
       case "question": this.blink();
         this.anim("es", [[1.25, 120, Ease.out], [1, 500, Ease.inOut]]); break;
       default: if (prev !== "idle" || s !== "idle") this.blink();
@@ -460,23 +470,30 @@ export class MochiBot {
     if (!this.locks.has("yaw"))   this.yaw   += (this._targetYaw   - this.yaw)   * kLook;
     if (!this.locks.has("pitch")) this.pitch += (this._targetPitch - this.pitch) * kLook;
     if (!this.locks.has("tilt"))  this.tilt  += ((c.shake ? Math.sin(ti * 34) * 0.06 : 0) - this.tilt) * kGen;
-    /* --- the species' own idle motion, in body-radius units so it scales with the face --- */
+    /* --- the species' own idle motion, in body-radius units so it scales with the face ---
+       A bot wearing a face is a portrait, not a body: hopping, floating or bouncing one translates
+       a whole photograph up and down, and nothing alive does that. It breathes instead — the chest
+       rises and falls, slowly, and nothing else moves. */
     let oyT = 0, syT = 1, sxT = 1, oxT = 0;
-    switch (sp.idle) {
-      case "hop":     oyT = -Math.abs(Math.sin(ti * 2.6)) * R * 0.135; syT = 1 - Math.abs(Math.sin(ti * 2.6)) * 0.06; break;
-      case "sway":    oxT = Math.sin(ti * 1.3) * R * 0.062; oyT = Math.sin(ti * 1.3) * R * 0.027; break;
-      case "float":   oyT = Math.sin(ti * 1.05) * R * 0.096; break;
-      case "jitter":  oxT = Math.sin(ti * 9) * R * 0.017; oyT = Math.sin(ti * 7.3) * R * 0.013; break;
-      case "jiggle":  syT = 1 + Math.sin(ti * 4.4) * 0.045; sxT = 1 - Math.sin(ti * 4.4) * 0.035; break;
-      case "wobble":  syT = 1 + Math.sin(ti * 2.1) * 0.055; sxT = 1 - Math.sin(ti * 2.1) * 0.045; break;
-      case "breathe": syT = 1 + Math.sin(ti * 1.6) * 0.035; break;
-      case "spin":    oyT = Math.sin(ti * 1.7) * R * 0.058; break;
-      default:        oyT = Math.sin(ti * 1.5) * R * 0.042; break;                 // bob
+    const faceBot = !!(this.preset || this.image);
+    if (faceBot) syT = 1 + Math.sin(ti * 1.25) * 0.012;
+    else {
+      switch (sp.idle) {
+        case "hop":     oyT = -Math.abs(Math.sin(ti * 2.6)) * R * 0.135; syT = 1 - Math.abs(Math.sin(ti * 2.6)) * 0.06; break;
+        case "sway":    oxT = Math.sin(ti * 1.3) * R * 0.062; oyT = Math.sin(ti * 1.3) * R * 0.027; break;
+        case "float":   oyT = Math.sin(ti * 1.05) * R * 0.096; break;
+        case "jitter":  oxT = Math.sin(ti * 9) * R * 0.017; oyT = Math.sin(ti * 7.3) * R * 0.013; break;
+        case "jiggle":  syT = 1 + Math.sin(ti * 4.4) * 0.045; sxT = 1 - Math.sin(ti * 4.4) * 0.035; break;
+        case "wobble":  syT = 1 + Math.sin(ti * 2.1) * 0.055; sxT = 1 - Math.sin(ti * 2.1) * 0.045; break;
+        case "breathe": syT = 1 + Math.sin(ti * 1.6) * 0.035; break;
+        case "spin":    oyT = Math.sin(ti * 1.7) * R * 0.058; break;
+        default:        oyT = Math.sin(ti * 1.5) * R * 0.042; break;                 // bob
+      }
+      if (c.bounce) oyT += -Math.abs(Math.sin(ti * 5.2)) * R * 0.172;
+      else if (c.bob) oyT += Math.sin(ti * 1.5) * R * 0.027;
+      else if (c.desk) oyT += Math.sin(ti * 2.2) * R * 0.023;
+      if (c.breathe) syT += Math.sin(ti * 1.8) * 0.022;
     }
-    if (c.bounce) oyT += -Math.abs(Math.sin(ti * 5.2)) * R * 0.172;
-    else if (c.bob) oyT += Math.sin(ti * 1.5) * R * 0.027;
-    else if (c.desk) oyT += Math.sin(ti * 2.2) * R * 0.023;
-    if (c.breathe) syT += Math.sin(ti * 1.8) * 0.022;
     if (!this.locks.has("oy")) this.oy += (oyT - this.oy) * kGen;
     if (!this.locks.has("sy")) this.sy += (syT - this.sy) * kGen;
     if (!this.locks.has("sx")) this.sx += (sxT - this.sx) * kGen;
@@ -533,11 +550,6 @@ export class MochiBot {
        silhouette then fills its box instead of floating in it. */
     const k = 0.92;
     ctx.save(); ctx.translate(S / 2 * (1 - k), S / 2 * (1 - k)); ctx.scale(k, k);
-    ctx.save();
-    ctx.translate(cx + this.ox, cy + this.oy);
-    if (this.tilt || this.roll) ctx.rotate(this.tilt + this.roll);
-    ctx.scale(this.sx * (1 + (1 - this.sy) * 0.62), this.sy);
-
     /* A face picture *is* the bot: drawing the engine's body, ears, glow, outfit, accessory or eyes
        under it would put a second character behind the first. Until it decodes there is no canvas,
        and the bot keeps its drawn self for that first frame — the same fallback a bot with no
@@ -547,6 +559,18 @@ export class MochiBot {
     const presetFace = this._presetFace();
     const tex = presetFace ? null : textureFor(this.image);
     const face = presetFace || (tex && tex.cv);
+    ctx.save();
+    ctx.translate(cx + this.ox, cy + this.oy);
+    if (this.tilt || this.roll) ctx.rotate(this.tilt + this.roll);
+    /* A body is a blob, so it squashes around its middle. A portrait must not: scaling a picture
+       about its centre lifts the shoulders and drops the chin, and the whole image reads as
+       bouncing. It scales from the bottom instead, so the chest rises and the shoulders stay put —
+       the way breathing actually looks. */
+    if (face) {
+      const h = this._faceBox(face).h;
+      ctx.translate(0, h / 2); ctx.scale(this.sx, this.sy); ctx.translate(0, -h / 2);
+    } else ctx.scale(this.sx * (1 + (1 - this.sy) * 0.62), this.sy);
+
     if (face) this._facePic(ctx, face);
     else {
       if (this.sp.antenna) this._antenna(ctx, R, rx, ry);
@@ -680,9 +704,14 @@ export class MochiBot {
      shut-eye frame blinks by cross-fading to it — the same `open` channel the drawn eyes use, so the
      fade lands on the same frame a blink would. With no second frame nothing is drawn over it: a
      squash to fake a blink read as the whole head being pressed. */
-  _facePic(ctx, cv) {
+  /* The face's drawn size, in the bot's own units. The breathing scale pivots on the bottom of this
+     box and `_facePic` draws into it, so the pivot and the picture can never disagree. */
+  _faceBox(cv) {
     const box = this.size * 0.96, s = Math.min(box / cv.width, box / cv.height);
-    const w = cv.width * s, h = cv.height * s;
+    return { w: cv.width * s, h: cv.height * s };
+  }
+  _facePic(ctx, cv) {
+    const { w, h } = this._faceBox(cv);
     ctx.drawImage(cv, -w / 2, -h / 2, w, h);
     const shut = this.imageClosed ? textureFor(this.imageClosed) : null;
     if (shut && shut.cv) {

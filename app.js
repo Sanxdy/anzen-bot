@@ -2846,6 +2846,7 @@ const TABS = [
   ["faces", "Bot faces", "faces", "Your workspace"],
   ["channels", "Rooms", "channels", "Your workspace"],
   ["apps", "Connected apps", "apps", "Your workspace"],
+  ["lucent", "Lucent", "globe", "Your workspace"],
   ["skills", "Skills", "skills", "Your workspace"],
   ["plugins", "Plugins", "plugins", "Your workspace"],
   ["memory", "Memory", "memory", "Your workspace"],
@@ -2934,7 +2935,7 @@ function renderPanel() {
   p.setAttribute("aria-labelledby", "tab-" + curTab);
   ({ general: tabGeneral, channels: tabChannels, bots: tabBots, faces: tabFaces, models: tabModels,
      phone: tabPhone, approvals: tabApprovals, memory: tabMemory, skills: tabSkills, plugins: tabPlugins,
-     apps: tabApps, voice: tabVoice, appearance: tabAppearance, help: tabHelp }[curTab] || tabGeneral)(p);
+     apps: tabApps, lucent: tabLucent, voice: tabVoice, appearance: tabAppearance, help: tabHelp }[curTab] || tabGeneral)(p);
 }
 function h3(p, title, hint) { p.appendChild(el("h3", "", esc(title))); if (hint) p.appendChild(el("p", "hint", hint)); }
 function fld(p, label, node, desc) {
@@ -3309,6 +3310,7 @@ function tabBots(p) {
    because the point is a set: one source drawn N ways, so a team still reads as a team. The drawing
    is the face, not the body: the bot keeps its own motion, and nothing is dressed on top of it.
    A bot's own FACE PICTURE in its editor is the other way to give it the same thing. */
+const SPECIES_GROUPS = [["woman", "Women"], ["man", "Men"], ["cat", "Cats"]];
 function tabFaces(p) {
   h3(p, "Bot faces", "Introduce one image and the image model draws a face for every bot from it — one different face each.");
   const st = { source: "", files: [], bots: [], presets: [], job: {} };
@@ -3326,9 +3328,32 @@ function tabFaces(p) {
   row.append(pick, gen, clr);
   card.append(src, row, msg, file);
   p.appendChild(card);
-  /* The shipped characters, shown once as a reference row: the picker that actually assigns one is
-     the per-bot select below, so a bot never has two competing controls. */
-  const prow = el("div", "row"); prow.style.flexWrap = "wrap"; p.appendChild(prow);
+  /* A whole room at once. Changing thirty-five bots one select at a time is the work this section
+     exists to avoid, and a room is the unit people think in: one team, one look. */
+  const shuffleCard = el("div", "card");
+  shuffleCard.innerHTML = `<div class="ct"><span class="ico">${svg("faces")}</span><div><b>Shuffle a room</b>
+    <div class="sub">Give every bot in a room a preset of its own, in one click. Bots already given a face of their own keep it unless you untick the box.</div></div></div>`;
+  const keepRow = el("label", "row"); keepRow.style.cssText = "gap:8px;align-items:center;margin:10px 0";
+  const keepBox = el("input"); keepBox.type = "checkbox"; keepBox.checked = true;
+  keepRow.append(keepBox, el("span", "", "Keep hand-picked faces"));
+  const roomRow = el("div", "row"); roomRow.style.flexWrap = "wrap";
+  shuffleCard.append(keepRow, roomRow);
+  const shuffleMsg = el("div", "hint"); shuffleCard.append(shuffleMsg);
+  p.appendChild(shuffleCard);
+  /* The roster is a reference, not a control — the picker that assigns a face is the per-bot
+     dropdown below, so a bot never has two competing controls. Thirty-five thumbnails in a grid is
+     a wall to scroll past, and the thing being chosen is a whole character, so one dropdown and one
+     large preview beside it says the same thing in two rows. */
+  const pickCard = el("div", "card");
+  pickCard.innerHTML = `<div class="ct"><span class="ico">${svg("faces")}</span><div><b>Look through the characters</b>
+    <div class="sub">Thirty-five characters ship with the app, each with 21 frames of its own. Pick one to see it large; to give it to a bot, use that bot's own dropdown below.</div></div></div>`;
+  const pickRow = el("div", "facepick");
+  const pickSel = el("select");
+  pickSel.setAttribute("aria-label", "Preview a character");
+  const prev = el("div", "faceprev");
+  pickRow.append(pickSel, prev);
+  pickCard.appendChild(pickRow);
+  p.appendChild(pickCard);
   const grid = el("div", "bento"); p.appendChild(grid);
 
   const say = () => {
@@ -3345,13 +3370,49 @@ function tabFaces(p) {
   const drawSource = () => {
     src.innerHTML = st.source ? `<div class="mc img"><img src="/api/face/${encodeURIComponent(st.source)}" alt=""></div>` : "";
   };
+  const showPick = () => {
+    const pr = st.presets.find(x => x.id === pickSel.value);
+    prev.innerHTML = pr ? `<div class="mc img"><img src="/api/preset/${encodeURIComponent(pr.id)}/base.webp" alt=""></div>
+      <div class="min"><b>${esc(pr.label)}</b><div class="sub">21 frames of its own</div></div>` : "";
+  };
+  /* The dropdown is rebuilt on every poll, so the choice in it is put back rather than reset — a
+     list that jumps back to the first name under the pointer is worse than no list. */
   const drawPresets = () => {
-    prow.innerHTML = "";
-    for (const pr of st.presets) {
-      const d = el("div", "card tcard");
-      d.innerHTML = `<div class="ct"><div class="mc img"><img src="/api/preset/${encodeURIComponent(pr.id)}/base.webp" alt=""></div>
-        <div class="min"><b>${esc(pr.label)}</b><div class="sub">Preset</div></div></div>`;
-      prow.appendChild(d);
+    const keep = pickSel.value;
+    pickSel.innerHTML = "";
+    for (const [sp, title] of SPECIES_GROUPS) {
+      const group = st.presets.filter(pr => (pr.species || "") === sp);
+      if (!group.length) continue;
+      const og = el("optgroup"); og.label = `${title} — ${group.length}`;
+      for (const pr of group) og.appendChild(new Option(pr.label, pr.id));
+      pickSel.appendChild(og);
+    }
+    if (st.presets.some(pr => pr.id === keep)) pickSel.value = keep;
+    showPick();
+  };
+  pickSel.onchange = showPick;
+  /* A room is only offered if it has members; a button that does nothing is worse than no button. */
+  const drawRooms = () => {
+    roomRow.innerHTML = "";
+    const rooms = (S.channels || []).filter(c => (c.members || []).length);
+    if (!rooms.length) { shuffleMsg.textContent = "No room has members yet."; return; }
+    for (const c of rooms) {
+      const b = el("button", "btn ghost sm", `${c.name} · ${c.members.length}`);
+      b.type = "button";
+      b.onclick = async () => {
+        b.disabled = true; shuffleMsg.style.color = ""; shuffleMsg.textContent = "Shuffling…";
+        const r = await jpost("/api/faces/shuffle", { channel: c.id, keep: keepBox.checked });
+        b.disabled = false;
+        if (!r.ok) { shuffleMsg.style.color = "#ff6b6b"; shuffleMsg.textContent = r.error || "could not shuffle that room"; return; }
+        shuffleMsg.textContent = r.changed
+          ? `${r.changed} bot${r.changed === 1 ? "" : "s"} in ${c.name} got a new face${r.kept ? `; ${r.kept} kept the face you gave them` : ""}.`
+          : `Everyone in ${c.name} already has a face of their own.`;
+        await reloadConfig();
+        const f = await get("/api/faces");
+        if (f) { st.bots = f.bots || []; st.presets = f.presets || []; }
+        drawPresets(); drawTiles();
+      };
+      roomRow.appendChild(b);
     }
   };
   const drawTiles = () => {
@@ -3373,13 +3434,17 @@ function tabFaces(p) {
       const sel = el("select");
       sel.appendChild(new Option("Its own drawn bot", ""));
       if (st.presets.length) {
-        const og = el("optgroup"); og.label = "Presets";
-        for (const pr of st.presets) {
-          const o = new Option(pr.label, "preset:" + pr.id);
-          if (pr.id === f.preset) o.selected = true;
-          og.appendChild(o);
+        for (const [sp, title] of SPECIES_GROUPS) {
+          const group = st.presets.filter(pr => (pr.species || "") === sp);
+          if (!group.length) continue;
+          const og = el("optgroup"); og.label = title;
+          for (const pr of group) {
+            const o = new Option(pr.label, "preset:" + pr.id);
+            if (pr.id === f.preset) o.selected = true;
+            og.appendChild(o);
+          }
+          sel.appendChild(og);
         }
-        sel.appendChild(og);
       }
       if (st.files.length) {
         const og = el("optgroup"); og.label = "Drawn faces";
@@ -3422,7 +3487,7 @@ function tabFaces(p) {
     const f = await get("/api/faces"); if (!f) return;
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
     st.presets = f.presets || [];
-    drawPresets(); drawTiles(); say();
+    drawPresets(); drawTiles(); drawRooms(); say();
     if (st.job.running) return void setTimeout(poll, 2000);
     await reloadConfig();
     if (curTab === "faces") renderPanel();
@@ -3431,7 +3496,7 @@ function tabFaces(p) {
     const f = await get("/api/faces"); if (!f) return;
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
     st.presets = f.presets || [];
-    drawPresets(); drawSource(); drawTiles(); say();
+    drawPresets(); drawSource(); drawTiles(); drawRooms(); say();
     if (st.job.running) setTimeout(poll, 2000);
   };
   pick.onclick = () => file.click();
@@ -4486,6 +4551,46 @@ function tabApps(p) {
     }
   };
   draw().catch(() => {});   // a failed config read must not surface as an unhandled rejection
+}
+/* --- Lucent --- */
+/* Nothing here opens a Lucent screen: the bridge talks to its API with a token. This tab hands
+   the bridge the one thing it cannot read for itself — an admin login — so a fresh install
+   connects without an environment variable. The password is used to mint a token and dropped. */
+function tabLucent(p) {
+  h3(p, "Lucent", "Send the team to a Lucent workspace: a project per room, a task per delegation, and a task assigned to a bot wakes it up.");
+  const wrap = el("div"); p.appendChild(wrap);
+  let msg = "";
+  const draw = async () => {
+    const st = await get("/api/lucent") || {};
+    wrap.innerHTML = "";
+    const d = el("div", "card");
+    d.innerHTML = `<div class="ct"><span class="ico">${svg("globe")}</span><div><b>Lucent workspace</b>
+      <div class="sub">${st.on ? esc(st.email || st.url) : "not connected"}</div></div>
+      <div class="rt"><span class="tag ${st.on ? "ok" : "off"}">${st.on ? "on" : "off"}</span></div></div>`;
+    const url = el("input"); url.placeholder = "https://lucent.example.com";
+    if (st.url) url.value = st.url;
+    const email = el("input"); email.style.marginTop = "8px"; email.placeholder = "admin email";
+    if (st.email) email.value = st.email;
+    const pw = el("input"); pw.type = "password"; pw.style.marginTop = "8px";
+    pw.placeholder = st.on ? "admin password — only needed if the token is revoked" : "admin password";
+    const row = el("div", "row"); row.style.marginTop = "10px";
+    const save = el("button", "btn pri sm", st.on ? "Save" : "Connect");
+    const note = el("div", "desc", msg || (st.on
+      ? `${st.bots} bot${st.bots === 1 ? "" : "s"} on Lucent, ${st.projects} project${st.projects === 1 ? "" : "s"}.`
+      : "The account must be a workspace admin: the bridge creates a team and a member per bot."));
+    if (st.last_error) note.textContent += " " + st.last_error;
+    save.onclick = async () => {
+      msg = "Connecting…"; note.textContent = msg;
+      const r = await jpost("/api/lucent", { url: url.value.trim(), email: email.value.trim(), password: pw.value });
+      msg = r.ok ? "Connected. " + r.bots + " bots, " + r.projects + " project" + (r.projects === 1 ? "" : "s") + "."
+                 : "Could not connect: " + (r.error || "unknown");
+      await draw();
+    };
+    row.append(save);
+    d.append(url, email, pw, row, note);
+    wrap.appendChild(d);
+  };
+  draw().catch(() => {});
 }
 /* --- Voice --- */
 function tabVoice(p) {

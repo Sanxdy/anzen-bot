@@ -24,6 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path: sys.path.insert(0, HERE)
 try: from relay import anzen_relay as link
 except Exception: link = None
+# The Lucent bridge. Guarded like the relay: the app is whole without it, and a build that
+# did not copy the module must start rather than fail on an import.
+try: import lucent
+except Exception: lucent = None
 VERSION = "1.0.0"
 DATA = os.environ.get("DATA_DIR", os.path.join(HERE, "data"))
 SANDBOX = os.environ.get("SANDBOX_DIR", os.path.join(HERE, "sandbox"))
@@ -1198,10 +1202,46 @@ FACES_DIR = os.path.join(DATA, "faces")
 # files rather than per-user data, so they sit beside the shell — a preset is never uploaded, edited
 # or pruned, and a bot record only names it.
 PRESET_DIR = os.path.join(SHELL, "faces")
-PRESETS = [{"id": "woman", "label": "Woman"}, {"id": "woman-auburn", "label": "Woman (auburn)"},
-           {"id": "woman-teal", "label": "Woman (teal)"}, {"id": "man", "label": "Man"},
-           {"id": "man-brown", "label": "Man (brown)"}, {"id": "man-blond", "label": "Man (blond)"},
-           {"id": "cat", "label": "Cat"}]
+# `species` is the only grouping the client needs: 35 characters in one flat list is a wall, and
+# the picker shows them as Women / Men / Cats. It is read-only presentation data, so it lives here
+# with the labels rather than in the bot record.
+PRESETS = [
+    {"id": "woman", "label": "Woman", "species": "woman"},
+    {"id": "woman-auburn", "label": "Woman (auburn)", "species": "woman"},
+    {"id": "woman-teal", "label": "Woman (teal)", "species": "woman"},
+    {"id": "woman-platinum", "label": "Woman (platinum)", "species": "woman"},
+    {"id": "woman-honey", "label": "Woman (honey)", "species": "woman"},
+    {"id": "woman-red", "label": "Woman (red)", "species": "woman"},
+    {"id": "woman-silver", "label": "Woman (silver)", "species": "woman"},
+    {"id": "woman-jet", "label": "Woman (jet)", "species": "woman"},
+    {"id": "woman-chestnut", "label": "Woman (chestnut)", "species": "woman"},
+    {"id": "woman-rose", "label": "Woman (rose)", "species": "woman"},
+    {"id": "woman-dark", "label": "Woman (dark curls)", "species": "woman"},
+    {"id": "woman-white", "label": "Woman (white)", "species": "woman"},
+    {"id": "woman-caramel", "label": "Woman (caramel)", "species": "woman"},
+    {"id": "woman-blueblack", "label": "Woman (blue-black)", "species": "woman"},
+    {"id": "woman-ginger", "label": "Woman (ginger)", "species": "woman"},
+    {"id": "man", "label": "Man", "species": "man"},
+    {"id": "man-brown", "label": "Man (brown)", "species": "man"},
+    {"id": "man-blond", "label": "Man (blond)", "species": "man"},
+    {"id": "man-copper", "label": "Man (copper)", "species": "man"},
+    {"id": "man-silver", "label": "Man (silver)", "species": "man"},
+    {"id": "man-buzz", "label": "Man (buzz)", "species": "man"},
+    {"id": "man-auburn", "label": "Man (auburn)", "species": "man"},
+    {"id": "man-grey", "label": "Man (grey)", "species": "man"},
+    {"id": "man-honey", "label": "Man (honey)", "species": "man"},
+    {"id": "man-dreads", "label": "Man (dreads)", "species": "man"},
+    {"id": "man-white", "label": "Man (white)", "species": "man"},
+    {"id": "man-chestnut", "label": "Man (chestnut)", "species": "man"},
+    {"id": "man-redbeard", "label": "Man (red beard)", "species": "man"},
+    {"id": "man-slick", "label": "Man (slick)", "species": "man"},
+    {"id": "man-bald", "label": "Man (bald)", "species": "man"},
+    {"id": "cat", "label": "Cat", "species": "cat"},
+    {"id": "cat-black", "label": "Cat (black)", "species": "cat"},
+    {"id": "cat-grey", "label": "Cat (grey)", "species": "cat"},
+    {"id": "cat-calico", "label": "Cat (calico)", "species": "cat"},
+    {"id": "cat-tuxedo", "label": "Cat (tuxedo)", "species": "cat"},
+]
 PRESET_IDS = {p["id"] for p in PRESETS}
 FACES_BATCH_PATH = os.path.join(FACES_DIR, "batch.json")
 FACE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1282,6 +1322,34 @@ def set_genface(b, f):
     b["genface_closed"] = closed
     if b["genface"] and b.get("avatar"):
         remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
+
+def shuffle_room_faces(cid, keep=True):
+    """Give every member of a room a preset of its own, in one pass.
+
+    The point is a room that reads as a set without clicking through the roster: distinct presets
+    for as long as there are presets to go round, then a fresh cycle. `keep` leaves alone any bot
+    whose face was chosen by hand — a drawn face or the bot's own picture — because a shuffle is
+    meant to save work, not to throw away a choice."""
+    chs = load_channels()
+    c = channel_by_id(chs, cid)
+    if not c: return None
+    bots = load_bots()
+    by_id = {b["id"]: b for b in bots}
+    members = [by_id[m] for m in (c.get("members") or []) if m in by_id]
+    if not members: return {"ok": True, "changed": 0, "kept": 0, "bots": []}
+    deck = [p["id"] for p in PRESETS]
+    random.shuffle(deck)
+    changed, kept, out = 0, 0, []
+    for i, b in enumerate(members):
+        if keep and (b.get("genface") or b.get("avatar")):
+            kept += 1; out.append(b["id"]); continue
+        b["preset"] = deck[i % len(deck)]
+        b["genface"] = ""; b["genface_closed"] = ""
+        if b.get("avatar"):
+            remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
+        changed += 1; out.append(b["id"])
+    save_bots(bots)
+    return {"ok": True, "changed": changed, "kept": kept, "bots": out}
 
 def _faces_prune(keep=()):
     """Drop drawings no bot can reach any more. `keep` is the set that just landed. A shut-eye frame
@@ -3827,12 +3895,29 @@ TOOL_SCHEMAS = {
                              "format — because that report is all you get: a teammate asked loosely for "
                              "\"3 posts with 30+ replies\" hands back a paragraph about having looked.",
                    {"role":{"type":"string"},"task":{"type":"string"}}, ["role","task"]),
+ "lucent_api": _fn("lucent_api","Call the team's Lucent workspace as yourself: your own account, so tasks you file are "
+                   "assigned to you and comments you write are signed by you. Paths are relative to /api.\n"
+                   "Tasks: GET tasks?assignee=me&status=todo|in_progress|in_review|done&project_id=  |  "
+                   "POST tasks {title, description, status, priority, project_id, assignee_id, due_date, estimate}  |  "
+                   "PATCH tasks/<id> {any of those, position}  |  DELETE tasks/<id>  |  "
+                   "POST tasks/<id>/subtasks {title}  |  PATCH subtasks/<id> {done}  |  DELETE subtasks/<id>  |  "
+                   "POST tasks/<id>/comments {body}.\n"
+                   "Projects: POST projects {name, description, status, color, due_date, lead_id}  |  "
+                   "PATCH projects/<id>  |  DELETE projects/<id>.\n"
+                   "Elsewhere: POST events {title, starts_at, duration_min, location, kind}  |  DELETE events/<id>  |  "
+                   "POST focus {task_id, minutes}  |  POST notifications/read {ids?}  |  PATCH profile  |  "
+                   "PATCH settings  |  GET insights?range=7|30|90  |  GET export.csv  |  GET bootstrap (the whole "
+                   "workspace, large)  |  GET auth/me.",
+                   {"method":{"type":"string","description":"GET, POST, PATCH or DELETE"},
+                    "path":{"type":"string","description":"e.g. tasks, tasks/<id>/comments, insights?range=30"},
+                    "body":{"type":"object","description":"the JSON body for a write"}},
+                   ["method","path"]),
  "finish":     _fn("finish","Finish your turn with a short, concrete report of what you did.",
                    {"summary":{"type":"string"}}, ["summary"]),
 }
 ALL_TOOLS = ["run_shell","read_file","write_file","list_files","generate_image","browser_open","browser_read","browser_click",
-             "browser_type","browser_press","browser_back","browser_eval","browser_see","browser_save","memory_update","use_skill","delegate","finish"]
-DEFAULT_TOOLS = {b["id"]: (ALL_TOOLS if b["id"] != "producer" else ["delegate","memory_update","use_skill","finish"]) for b in DEFAULT_BOTS}
+             "browser_type","browser_press","browser_back","browser_eval","browser_see","browser_save","memory_update","use_skill","delegate","lucent_api","finish"]
+DEFAULT_TOOLS = {b["id"]: (ALL_TOOLS if b["id"] != "producer" else ["delegate","lucent_api","memory_update","use_skill","finish"]) for b in DEFAULT_BOTS}
 
 # Plan-only mode: the bot investigates with read-only tools and reports a plan, then stops. Nothing
 # that changes the world is offered, so "plan" cannot quietly turn into "do" — the user approves the
@@ -4691,6 +4776,9 @@ def exec_tool(bid, name, args):
             return f"({cid} is not connected — connect it in Settings > Connected apps)", []
         out = conn_webhook(args, s2) if name == "webhook_post" else conn_api(cid, args, s2)
         return out, []
+    if name == "lucent_api":
+        if not lucent: return "(the Lucent bridge is not installed in this build)", []
+        return lucent.api_tool(bid, args.get("method", "GET"), args.get("path", ""), args.get("body")), []
     if name == "run_shell":
         err = _shell_args_error(args)
         if err: return err, []
@@ -5833,6 +5921,9 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
                 room_said.append({"role": "route", "who": "Room",
                                   "content": "→ " + (ev.get("name") or bid) + (": " + hand[:160] if hand else ""),
                                   "ts": time.time()})
+                # The same hand-off is a task in Lucent, assigned to the bot it names. Queued,
+                # never sent from here: the turn must not wait on another service.
+                if lucent: lucent.on_delegate(channel["id"], ev.get("id") or bid, hand)
             # A bot's words are the room's business: the channel *is* the conversation, and what each
             # one says is what makes it read as one instead of a wall of closing reports. So they are
             # *not* addressed away with `to` — the room draws them, through the one plain yield below.
@@ -5858,6 +5949,8 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
         # would write the closing line into the transcript twice. When no line of its reached the room
         # (a step that emitted no `agent_text`), the report is the only record of what it said and lands.
         room_says(bot_by_id(bots, m)["name"], out.get("text"), out.get("took"))
+        # ...and the same report is the comment that closes that bot's task.
+        if lucent and out.get("text"): lucent.on_report(channel["id"], m, out["text"])
         if room_said:
             st = load(sid); st["messages"].extend(room_said); save(sid, st); del room_said[:]
         did.append((m, out))
@@ -6347,6 +6440,8 @@ class H(BaseHTTPRequestHandler):
             return self._file("index.html")
         if u.path == "/api/lan": return self._json(lan_state())
         if u.path == "/api/relay": return self._json(relay_state())
+        # Read-only: the bridge has no screen, and this is what tells you it is alive.
+        if u.path == "/api/lucent": return self._json(lucent.status() if lucent else {"on": False})
         # Who else is looking at these chats. Held open for as long as the client stays, so it sits
         # here among the one-shot endpoints rather than with them in spirit.
         if u.path == "/api/watch": return watch_stream(self)
@@ -6854,6 +6949,10 @@ class H(BaseHTTPRequestHandler):
             save_bots(bots)
             return self._json({"ok": True, "preset": b.get("preset") or "",
                                "genface": b["genface"], "genface_closed": b["genface_closed"]})
+        if u.path == "/api/faces/shuffle":
+            r = shuffle_room_faces((body.get("channel") or "").strip(), body.get("keep", True) is not False)
+            if r is None: return self._json({"ok": False, "error": "unknown room"})
+            return self._json(r)
         if u.path == "/api/faces/clear":
             bots = load_bots()
             for b in bots:
@@ -6913,6 +7012,9 @@ class H(BaseHTTPRequestHandler):
             if not bid: return self._json({"ok": False, "err": "which bot?"}, 400)   # mem_path slugs the id
             if body.get("text") is not None: mem_write(bid, body["text"])
             return self._json({"ok": True})
+        if u.path == "/api/lucent":
+            if not lucent: return self._json({"ok": False, "error": "the Lucent bridge is not installed in this build"}, 400)
+            return self._json(lucent.save_config(body.get("url"), body.get("email"), body.get("password")))
         if u.path == "/api/settings":
             s = load_settings(); patch = body.get("settings") or {}
             for k, v in patch.items():
@@ -7140,6 +7242,10 @@ def boot(warm_browser=True):
     for b in load_bots(): new_session(b["id"], bot=b["id"], title=b["name"])
     for c in load_channels(): new_session(c["id"], bot=None, title=c["name"])
     threading.Thread(target=scheduler, daemon=True).start()
+    if lucent:
+        lucent.configure(DATA, FACES_DIR, PRESET_DIR, AVATAR_DIR, load_bots, load_channels,
+                         save_channels, load_settings, _run_turn)
+        lucent.start()                            # no-ops unless LUCENT_URL or data/lucent.json is set
     warm_mcp()                                    # connect MCP servers now, off the first turn's path
     if warm_browser and os.environ.get("BROWSER_WARMUP", "1") != "0":
         threading.Thread(target=BROWSER.start, daemon=True).start()  # warm up the headless browser in the background
@@ -7284,6 +7390,10 @@ class Srv(ThreadingHTTPServer):
     browser just closed on 127.0.0.1, and one lost race must not leave the switch stuck."""
     daemon_threads = True
     block_on_close = False
+    # A page that shows a roster asks for every face at once, and the stock backlog of 5 drops the
+    # rest: the kernel resets those connections and the browser paints broken images. The threads
+    # are cheap and idle, so the queue is wide enough for the largest burst the client can make.
+    request_queue_size = 256
     def __init__(self, addr, handler, family=socket.AF_INET):
         # `ThreadingHTTPServer` builds an AF_INET socket in its own `__init__`, so the family has to
         # be in place before that runs. A Unix socket is the same server on a different kind of

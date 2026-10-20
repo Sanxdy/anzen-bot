@@ -299,6 +299,14 @@
      letterboxed rather than cropped — a logo is not a photo. */
   .mc.img{padding:4px;overflow:hidden}
   .mc.img img{width:100%;height:100%;object-fit:contain;display:block}
+  /* The preset browser: one dropdown, one large preview beside it. Thirty-five thumbnails in a grid
+     is a wall to scroll past, and what is being chosen is a whole character, so one of them is worth
+     the room to see properly. */
+  .facepick{display:flex;gap:16px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  /* The global field rule is `select{width:100%}`, which would push the preview onto its own line. */
+  .facepick select{width:230px;min-width:230px;flex:0 0 230px}
+  .faceprev{display:flex;gap:14px;align-items:center;flex:1;min-width:0}
+  .faceprev .mc{flex:0 0 132px;width:132px;height:132px;border-radius:18px}
   .logofld{display:flex;gap:12px;align-items:flex-start}
   .lgprev .mc{flex:0 0 46px}
   .lgsaid{min-width:0}
@@ -707,8 +715,15 @@
   /* The settings dialog is the one modal whose nav is a list that grows: fourteen sections under three
      group headings no longer fit the shared 640px, so the last two (Appearance, Help) fell below the
      fold with nothing to say they were there. Taller here, and the rail tightened to match, so the
-     whole map is on screen at once instead of behind a scroll you have to guess at. */
-  #scrim .modal{height:min(700px,90vh)}
+     whole map is on screen at once instead of behind a scroll you have to guess at.
+     It is also resizable from its corner: 940x700 is a guess that is too small on a large screen and
+     the roster is a long list. Native resize, so there is no drag code of our own to keep. */
+  #scrim .modal{height:min(700px,90vh);resize:both;overflow:hidden;
+    min-width:min(700px,100%);min-height:min(440px,100%);
+    max-width:calc(100vw - 44px);max-height:calc(100vh - 44px)}
+  /* The native grip is nearly invisible on a dark card, so it is drawn as a hatch in the corner. */
+  #scrim .modal::-webkit-resizer{background:
+    repeating-linear-gradient(-45deg,var(--line2) 0 1.5px,transparent 1.5px 5px) right 5px bottom 5px/13px 13px no-repeat}
   .mbody{display:flex;min-height:0;flex:1}
   .mtabs{width:196px;flex:0 0 196px;border-right:1px solid var(--line);padding:8px;overflow-y:auto;background:var(--bg2)}
   .mtab{display:flex;align-items:center;gap:9px;padding:7px 11px;border-radius:10px;cursor:pointer;color:var(--dim);font-size:calc(13.5px * var(--fs));font-weight:600}
@@ -1174,6 +1189,8 @@
     #dockTip{bottom:106px;right:14px}
     .scrim{padding:0}
     .modal{width:100%;max-height:100%;height:100%;border-radius:0;border:0}
+    /* A full-screen dialog on a phone is already as big as it gets. */
+    #scrim .modal{resize:none;min-width:0;min-height:0}
     .mbody{flex-direction:column}
     .mtabs{width:100%;flex:0 0 auto;display:flex;flex-wrap:wrap;gap:6px;border-right:0;border-bottom:1px solid var(--line);padding:8px}
     .mtab{white-space:nowrap;padding:7px 10px;font-size:calc(12px * var(--fs))}

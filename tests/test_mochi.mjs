@@ -288,6 +288,57 @@ console.log("\n-- squash, blink, roll --");
   ok("dizzy rolls twice as far", maxRoll > Math.PI * 3.9, String(maxRoll.toFixed(2)));
 }
 
+console.log("\n-- a face is a portrait, not a body --");
+{
+  /* The picture must never be translated by the idle motion: moving a photograph up and down is a
+     bounce, not a breath. Breathing is a slow vertical scale — and it stays under 2%, so it reads as
+     a chest rising rather than the head inflating. */
+  for (const opts of [{ preset: "woman" }, { preset: "cat", species: "bunny" }]) {
+    const b = mk(opts);
+    let maxOy = 0, maxOx = 0, minSy = 1, maxSy = 1;
+    for (let i = 0; i < 400; i++) {
+      b.tick(0.05);
+      maxOy = Math.max(maxOy, Math.abs(b.oy)); maxOx = Math.max(maxOx, Math.abs(b.ox));
+      minSy = Math.min(minSy, b.sy); maxSy = Math.max(maxSy, b.sy);
+    }
+    const tag = opts.species ? ` (${opts.species}, a hopping species)` : "";
+    ok("a face never translates on its own" + tag, maxOy < 1e-6 && maxOx < 1e-6,
+       `oy:${maxOy} ox:${maxOx}`);
+    ok("a face breathes gently" + tag, minSy < 0.995 && maxSy > 1.005 && maxSy - minSy < 0.03,
+       `sy:${minSy.toFixed(4)}..${maxSy.toFixed(4)}`);
+  }
+  /* Breathing is one cycle in 4-6 seconds. Faster than that is a pulse. */
+  const b = mk({ preset: "woman" });
+  let crossings = 0, prev = null;
+  for (let i = 0; i < 300; i++) {
+    b.tick(0.05);
+    const d = b.sy - 1;
+    if (prev !== null && Math.sign(d) !== Math.sign(prev) && Math.abs(d) > 1e-4) crossings++;
+    prev = d;
+  }
+  ok("a breath takes 4-6s", crossings >= 4 && crossings <= 7, String(crossings) + " turns in 15s");
+  /* `approval` and `finished` bounce and roll a body on purpose. A face must sit still through
+     both — its own frame is the beat. The bot starts idle and is moved, because a bot constructed
+     already in the state skips the transition and would prove nothing. */
+  for (const st of ["approval", "finished"]) {
+    const a = mk({ preset: "woman" });
+    for (let i = 0; i < 10; i++) a.tick(0.02);         // settle the idle motion first
+    a.setState(st);
+    let maxOy = 0, maxOx = 0;
+    for (let i = 0; i < 200; i++) { a.tick(0.02); maxOy = Math.max(maxOy, Math.abs(a.oy)); maxOx = Math.max(maxOx, Math.abs(a.ox)); }
+    ok(`a face does not lunge on ${st}`, maxOy < 1e-6 && maxOx < 1e-6, `oy:${maxOy} ox:${maxOx}`);
+  }
+  /* A dizzy head wobbles — that is a head movement, not a translated picture. */
+  {
+    const a = mk({ preset: "woman" });
+    a.setState("dizzy");
+    let maxTilt = 0;
+    for (let i = 0; i < 120; i++) { a.tick(0.02); maxTilt = Math.max(maxTilt, Math.abs(a.tilt)); }
+    ok("a dizzy face wobbles its head instead of rolling", maxTilt > 0.05 && Math.abs(a.roll) < 1e-6,
+       `tilt:${maxTilt.toFixed(3)} roll:${a.roll}`);
+  }
+}
+
 console.log("\n-- response speed --");
 {
   /* The complaint that started this: the old engine converged in ~0.24s, which reads as

@@ -23,17 +23,17 @@
 
 The prompt never names a species: it asks the model to redraw the subject and keep it. Telling it `Species: owl` drew a cat as an owl — [before and after, same photo and model](docs/bot-faces-why.png).
 
-The drawing is the face, not the body: head and hair only, nothing drawn behind it, filling the bot's space. The bot keeps its own motion — it bobs, tilts, sways and drifts with its gaze — and blinks, because each face comes with a second drawing of the same head with its eyes shut.
+The drawing is the face, not the body: head and hair only, nothing drawn behind it, filling the bot's space. A face is a portrait, so it moves like one — it breathes from the chest, turns and tilts its head, and blinks, because each face comes with a second drawing of the same head with its eyes shut. It never bobs or bounces: translating a photograph up and down is not something anything alive does.
 
 A bot's own **Face picture** in its editor is the other way to give it a face. Both are kept — picking a face from the set drops the picture, and introducing a picture drops the set's face — so whichever you chose last is the one you see.
 
-### Bot faces: seven characters already drawn
+### Bot faces: thirty-five characters already drawn
 
-![Seven presets, five states each](docs/bot-faces-presets.png)
+![Thirty-five presets, five states each](docs/bot-faces-presets.png)
 
-*The seven shipped presets — Woman, Woman (auburn), Woman (teal), Man, Man (brown), Man (blond) and Cat — each with 21 frames of its own: blinks, four mouth shapes, six expressions, three gestures, and four working frames at a laptop. [Watch the recording](docs/bot-faces-presets.mp4).*
+*The thirty-five shipped presets — fifteen women, fifteen men and five cats, each a different character — every one with 21 frames of its own: blinks, four mouth shapes, six expressions, three gestures, and four working frames at a laptop. [Watch the recording](docs/bot-faces-presets.mp4).*
 
-A preset is a whole character, not a single picture: one frame per state, all cut out and aligned on the same head, so the bot keeps its size and its position when the state changes and when you swap one preset for another. Pick one per bot in **Settings → Bot faces**, or leave the bot as its own drawn mascot.
+A preset is a whole character, not a single picture: one frame per state, all cut out and aligned on the same head, so the bot keeps its size and its position when the state changes and when you swap one preset for another. Pick one per bot in **Settings → Bot faces**, shuffle a whole room in one click, or leave the bot as its own drawn mascot.
 
 ---
 
@@ -73,7 +73,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 * **Rooms** — a shared team chat with its own transcript, members and responder rule.
 * **Bots as contacts** — each with its own model, approval level, memory, skills, tools, voice and animated face.
 * **Bot faces** — introduce one image and the image model draws a whole mascot for every bot from it, one different character each, all the same animal as the photo, with the outfit and accessory drawn on top. [Watch the 52-second demo](docs/bot-faces.mp4) · [the eleven cats it drew](docs/bot-faces.png)
-* **Face presets** — seven complete characters ship with the app (three women, three men and a cat), 21 frames each: blinks, mouth shapes, expressions, gestures and a working frame with a laptop. [See all seven](docs/bot-faces-presets.png) · [watch it run](docs/bot-faces-presets.mp4)
+* **Face presets** — thirty-five complete characters ship with the app (fifteen women, fifteen men and five cats), 21 frames each: blinks, mouth shapes, expressions, gestures and a working frame with a laptop. [See all thirty-five](docs/bot-faces-presets.png) · [watch it run](docs/bot-faces-presets.mp4)
 * **One repo per room** — pin a room to a folder and its bots work only inside it, so projects never mix.
 * **Scoped 1:1 chats** — talking to a bot from inside a room runs it in that room's repo.
 * **`@` mentions** — pick a room member from a filtered dropdown instead of remembering who is in it.
@@ -95,6 +95,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 **Extend it**
 * **MCP plugins** — add any MCP server and its tools become real tools for every bot.
 * **Connected apps** — GitHub, Slack, Notion, Linear, Gmail, Drive, Calendar and Webhooks.
+* **Lucent workspace** — each bot is a real Lucent member with its own API token: rooms map to projects, a delegation becomes a task, a report becomes a comment, and a `todo` task assigned to a bot wakes it and runs the work. Bots also get a `lucent_api` tool, so they can use every Lucent route as themselves. [API and setup](docs/lucent-api.md)
 
 **Chat**
 * Markdown replies rendered properly, with raw HTML escaped.
@@ -143,6 +144,15 @@ Follow these steps to run a local copy.
 5. Open <http://127.0.0.1:8093>.
 
 `run.sh` does the same with sensible defaults. On first run the server writes `data/config.json` from those variables, so edit it afterwards to change the router, key or models.
+
+*Optional, to put the team on a [Lucent](https://lucent.vortex-freq.web.id) board:* open **Settings → Lucent** and give it the address, an admin's email and that admin's password. In the desktop app that is the only step — there is no environment variable to set.
+```bash
+# The same thing for a headless server, if you prefer the environment:
+export LUCENT_URL="https://lucent.vortex-freq.web.id"
+export LUCENT_EMAIL="you@example.com"     # an existing Lucent admin, optional
+export LUCENT_PASSWORD="..."              # its password, optional
+```
+The bridge runs in the backend and needs no clicks: it creates a member per bot (name, title as role, the room it works in as team, its face) and one project per room, and mints a token per bot. A bot's team is the first room that lists it — set `lucent_team` on the bot record to put it somewhere else. A team left empty by a bot that moved is removed, so the Team page stays as small as the rooms. Every call is `Authorization: Bearer` — no cookies, no browser, no UI. With no credentials it registers `anzen@bots.anzen.local` itself; the tokens live in `data/lucent.json` (0600) and the state is visible at `GET /api/lucent`. Tokens never expire, and the admin's password is never written to disk — the bridge only needs it again if the token is revoked. Lucent must have the token-auth patch from [docs/lucent-api.md](docs/lucent-api.md). It polls every 20 seconds.
 
 It also writes `data/bots.json` and `data/channels.json`, seeding **one room called Company with five bots already on the team** — Producer (Chief of Staff), Researcher, Builder, QA and Ops — so a fresh install opens on a working team instead of an empty sidebar. From then on they are ordinary records: rename them, re-brief them, add your own, or delete them.
 
