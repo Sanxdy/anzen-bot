@@ -11,9 +11,11 @@
 
 ## 📷 Demo
 
-![Anzen-bot](docs/demo.png)
+[![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.png)](docs/demo.mp4)
 
 *The default install: one room called Company, five bots already on the team.*
+
+[Watch the 51-second demo](docs/demo.mp4) — a real turn, recorded from the app with no edits: you ask for a CSV importer, the Producer splits it into two steps, Builder and QA report back into the room, and every step lands on the Lucent board with a short title, a due date and an estimate. Voice-over and music are generated locally, like everything else.
 
 ### Bot faces: one image → a whole team
 
