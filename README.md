@@ -11,17 +11,17 @@
 
 ## 📷 Demo
 
-[![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.png)](docs/demo.mp4)
+[![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.png)](https://sanxdy.github.io/anzen-bot/demo.mp4)
 
 *The default install: one room called Company, five bots already on the team.*
 
-[Watch the 51-second demo](docs/demo.mp4) — a real turn, recorded from the app with no edits: you ask for a CSV importer, the Producer splits it into two steps, Builder and QA report back into the room, and every step lands on the Lucent board with a short title, a due date and an estimate. Voice-over and music are generated locally, like everything else.
+[Watch the 51-second demo](https://sanxdy.github.io/anzen-bot/demo.mp4) — a real turn, recorded from the app with no edits: you ask for a CSV importer, the Producer splits it into two steps, Builder and QA report back into the room, and every step lands on the Lucent board with a short title, a due date and an estimate. Voice-over and music are generated locally, like everything else.
 
 ### Bot faces: one image → a whole team
 
-[![Eleven cats drawn from one photo](docs/bot-faces.png)](docs/bot-faces.mp4)
+[![Eleven cats drawn from one photo](docs/bot-faces.png)](https://sanxdy.github.io/anzen-bot/bot-faces.mp4)
 
-*One photo in, one face per bot out — and every drawing is the same animal as the photo. [Watch the 52-second recording](docs/bot-faces.mp4).*
+*One photo in, one face per bot out — and every drawing is the same animal as the photo. [Watch the 52-second recording](https://sanxdy.github.io/anzen-bot/bot-faces.mp4).*
 
 The prompt never names a species: it asks the model to redraw the subject and keep it. Telling it `Species: owl` drew a cat as an owl — [before and after, same photo and model](docs/bot-faces-why.png).
 
@@ -33,7 +33,7 @@ A bot's own **Face picture** in its editor is the other way to give it a face. B
 
 ![Thirty-five presets, five states each](docs/bot-faces-presets.png)
 
-*The thirty-five shipped presets — fifteen women, fifteen men and five cats, each a different character — every one with 21 frames of its own: blinks, four mouth shapes, six expressions, three gestures, and four working frames at a laptop. [Watch the recording](docs/bot-faces-presets.mp4).*
+*The thirty-five shipped presets — fifteen women, fifteen men and five cats, each a different character — every one with 21 frames of its own: blinks, four mouth shapes, six expressions, three gestures, and four working frames at a laptop. [Watch the recording](https://sanxdy.github.io/anzen-bot/bot-faces-presets.mp4).*
 
 A preset is a whole character, not a single picture: one frame per state, all cut out and aligned on the same head, so the bot keeps its size and its position when the state changes and when you swap one preset for another. Pick one per bot in **Settings → Bot faces**, shuffle a whole room in one click, or leave the bot as its own drawn mascot.
 
@@ -74,8 +74,8 @@ It is built for people who want agentic AI without handing a vendor their machin
 **Bots and rooms**
 * **Rooms** — a shared team chat with its own transcript, members and responder rule.
 * **Bots as contacts** — each with its own model, approval level, memory, skills, tools, voice and animated face.
-* **Bot faces** — introduce one image and the image model draws a whole mascot for every bot from it, one different character each, all the same animal as the photo, with the outfit and accessory drawn on top. [Watch the 52-second demo](docs/bot-faces.mp4) · [the eleven cats it drew](docs/bot-faces.png)
-* **Face presets** — thirty-five complete characters ship with the app (fifteen women, fifteen men and five cats), 21 frames each: blinks, mouth shapes, expressions, gestures and a working frame with a laptop. [See all thirty-five](docs/bot-faces-presets.png) · [watch it run](docs/bot-faces-presets.mp4)
+* **Bot faces** — introduce one image and the image model draws a whole mascot for every bot from it, one different character each, all the same animal as the photo, with the outfit and accessory drawn on top. [Watch the 52-second demo](https://sanxdy.github.io/anzen-bot/bot-faces.mp4) · [the eleven cats it drew](docs/bot-faces.png)
+* **Face presets** — thirty-five complete characters ship with the app (fifteen women, fifteen men and five cats), 21 frames each: blinks, mouth shapes, expressions, gestures and a working frame with a laptop. [See all thirty-five](docs/bot-faces-presets.png) · [watch it run](https://sanxdy.github.io/anzen-bot/bot-faces-presets.mp4)
 * **One repo per room** — pin a room to a folder and its bots work only inside it, so projects never mix.
 * **Scoped 1:1 chats** — talking to a bot from inside a room runs it in that room's repo.
 * **`@` mentions** — pick a room member from a filtered dropdown instead of remembering who is in it.
