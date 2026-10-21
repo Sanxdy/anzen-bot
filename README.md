@@ -11,11 +11,11 @@
 
 ## 📷 Demo
 
-[![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.png)](https://sanxdy.github.io/anzen-bot/demo.mp4)
+[![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.gif)](https://sanxdy.github.io/anzen-bot/demo.mp4)
 
-*The default install: one room called Company, five bots already on the team.*
+*A real turn, recorded from the app with no edits: you ask for a CSV importer, the Producer splits it into two steps, Builder and QA report back into the room, and every step lands on the Lucent board with a short title, a due date and an estimate.*
 
-[Watch the 51-second demo](https://sanxdy.github.io/anzen-bot/demo.mp4) — a real turn, recorded from the app with no edits: you ask for a CSV importer, the Producer splits it into two steps, Builder and QA report back into the room, and every step lands on the Lucent board with a short title, a due date and an estimate. Voice-over and music are generated locally, like everything else.
+The GIF is silent — GitHub does not play video in a README. [Watch the 51-second film with voice-over and music](https://sanxdy.github.io/anzen-bot/demo.mp4); both were generated on this machine, like everything else here.
 
 ### Bot faces: one image → a whole team
 
