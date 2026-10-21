@@ -11,6 +11,8 @@
 
 ## 📷 Demo
 
+<video src="https://sanxdy.github.io/anzen-bot/demo.mp4" poster="https://sanxdy.github.io/anzen-bot/demo.png" autoplay muted loop playsinline width="100%"></video>
+
 [![Anzen-bot — a turn through the room, from the plan to the tasks](docs/demo.png)](https://sanxdy.github.io/anzen-bot/demo.mp4)
 
 *The default install: one room called Company, five bots already on the team.*
