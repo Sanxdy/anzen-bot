@@ -191,8 +191,27 @@ console.log("\n-- poke --");
   b.poke();
   ok("a poke makes it excited", b.emotion === "excited");
   ok("a poke throws hearts", b.parts.length >= 3, String(b.parts.length));
+  ok("a first poke is the jolt", b._pokeFrame === "p1", b._pokeFrame);
   let threw = null; try { run(b, 30); } catch (e) { threw = e.message; }
   ok("the poke animation plays out", !threw, threw || "");
+
+  /* Poke it a few times in a row and it stops being charmed by it. Three visible steps, not one:
+     the frame set ships the jolt and the arms-crossed glare, and `e-annoyed` is the step between. */
+  const c = mk();
+  c.poke(); c.t += 0.6;
+  const hearts = c.parts.length;
+  c.poke();
+  ok("a second poke in a row is irritated", c._pokeFrame === "e-annoyed", c._pokeFrame);
+  ok("an irritated poke throws no hearts", c.parts.length === hearts, String(c.parts.length));
+  c.t += 0.6; c.poke();
+  ok("a third poke in a row is the exasperated frame", c._pokeFrame === "p2", c._pokeFrame);
+  ok("an annoyed bot is angry, not excited", c.emotion === "angry", c.emotion);
+  c.t += 0.6; c.poke();
+  ok("a fourth poke stays at the exasperated frame", c._pokeFrame === "p2", c._pokeFrame);
+
+  const d = mk();
+  d.poke(); d.t += 6; d.poke();
+  ok("the count lapses, so a poke much later is a jolt again", d._pokeFrame === "p1", d._pokeFrame);
 }
 
 console.log("\n-- easing --");
@@ -336,6 +355,16 @@ console.log("\n-- a face is a portrait, not a body --");
     for (let i = 0; i < 120; i++) { a.tick(0.02); maxTilt = Math.max(maxTilt, Math.abs(a.tilt)); }
     ok("a dizzy face wobbles its head instead of rolling", maxTilt > 0.05 && Math.abs(a.roll) < 1e-6,
        `tilt:${maxTilt.toFixed(3)} roll:${a.roll}`);
+  }
+  /* A poke is the one interaction the user starts, and it must not break the portrait rule either:
+     the picture recoils by tilting, never by leaving its shoulders. */
+  for (const [label, pokes] of [["a jolt", 1], ["an annoyed shake", 3]]) {
+    const a = mk({ preset: "woman" });
+    let maxOy = 0, maxTilt = 0;
+    for (let i = 0; i < pokes; i++) { a.poke(); a.t += 0.5; }
+    for (let i = 0; i < 120; i++) { a.tick(0.02); maxOy = Math.max(maxOy, Math.abs(a.oy)); maxTilt = Math.max(maxTilt, Math.abs(a.tilt)); }
+    ok(`a poked face ${label} tilts and never leaves the ground`, maxOy < 1e-6 && maxTilt > 0.02,
+       `oy:${maxOy} tilt:${maxTilt.toFixed(3)}`);
   }
 }
 
@@ -595,9 +624,13 @@ console.log("\n-- colour grading --");
   ok("skin() re-dresses a live bot",
      (() => { const b = mk({}); b.skin("mochi", null, { outfit: "tie", accessory: "crown", image: "u", imageClosed: "v" });
        return b.outfit === "tie" && b.accessory === "crown" && b.image === "u" && b.imageClosed === "v"; })());
-  ok("skin() with no look keeps what the bot is wearing",
-     (() => { const b = mk({ outfit: "tie", accessory: "crown" }); b.skin("cat", { flat: FLAT });
-       return b.outfit === "tie" && b.accessory === "crown"; })());
+  /* Switching to a room re-skins the dock with no look at all. Anything the last bot was wearing —
+     and above all its preset — has to go, or the corner keeps showing a bot you are not talking to. */
+  ok("skin() with no look strips the previous bot's face",
+     (() => { const b = mk({ preset: "woman", outfit: "tie", accessory: "crown" });
+       b.skin("mochi", null, null);
+       return b.preset === "" && b.image === "" && b.imageClosed === "" &&
+              b.outfit === "" && b.accessory === ""; })());
 }
 
 console.log("\n" + pass + " passed, " + fail + " failed\n");

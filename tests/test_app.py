@@ -345,8 +345,8 @@ def main():
         tabs = pg.eval_on_selector_all("#setTabs .mtab .lbl", "els=>els.map(e=>e.textContent)")
         check("settings has 15 tabs", len(tabs) == 15, str(tabs))
         check("settings tabs cover the full surface",
-              all(t in tabs for t in ["General","AI model","Browser","Phone","Bots","Bot faces","Rooms",
-                                      "Connected apps","Skills","Plugins","Memory","Approvals",
+              all(t in tabs for t in ["General","AI model","Phone","Bots","Bot faces","Rooms",
+                                      "Connected apps","Lucent","Skills","Plugins","Memory","Approvals",
                                       "Voice","Appearance","Help"]), str(tabs))
         err0 = len(errors)
         for i in range(len(tabs)):
@@ -2002,6 +2002,18 @@ def main():
         anim = pg.evaluate("""async()=>{const cv=document.querySelector('#chans .sub .subbot canvas.sidebot, #bots .subbot canvas.sidebot');
             const a=cv.toDataURL(); await new Promise(r=>setTimeout(r,400)); return a!==cv.toDataURL();}""")
         check("the faces are animated, not stiff", anim)
+        # Coming back to an idle window re-reads the config, and the lists rebuild from scratch. The
+        # face must be the same node it was: a new canvas restarts the drawing and the row blinks.
+        idle = pg.evaluate("""async()=>{
+            const all=()=>[...document.querySelectorAll('#chans canvas.sidebot, #bots canvas.sidebot, #chats canvas.ck.face')];
+            const before=all(); before.forEach((c,i)=>{ c.__idleTag=i; });
+            await window.anzenWake();
+            await new Promise(r=>setTimeout(r,800));
+            const after=all();
+            return {n:before.length, same:after.filter(c=>c.__idleTag!==undefined).length,
+                    gone:before.filter(c=>!c.isConnected).length};}""")
+        check("a face on screen is not re-drawn after an idle wake",
+              idle["n"] > 0 and idle["same"] == idle["n"] and idle["gone"] == 0, str(idle))
         # Coucou's colour grading: a small face is ONE flat fill of the bot's colour, so the single
         # most common opaque pixel is exactly that colour and covers a big share of the face. The
         # gradient body it replaced had no colour that dominated — that is the pastel wash.

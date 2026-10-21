@@ -122,9 +122,12 @@ def main():
         chans[:] = c
 
     turns = []
+    during = []               # whether the pickup flag was set while the turn ran
 
     def run_turn(sid, text, bs, settings, channel=None, solo=None, who=None):
         turns.append({"sid": sid, "text": text, "solo": solo, "who": who})
+        during.append(getattr(lucent._PICKUP, "on", False))
+        lucent.on_work("company", solo or "x", "this must not become a second task")
         yield {"type": "status", "state": "thinking"}
         yield {"type": "final", "text": "Built it. Tests pass."}
 
@@ -196,8 +199,10 @@ def main():
     check("one project per room", st["projects"].get("company") == "p-company", st["projects"])
     check("the room records its project", chans[0].get("lucent_project") == "p-company", chans[0])
 
-    # --- a delegation becomes a task, the report closes it ---------------------------------
-    lucent.on_delegate("company", "builder", "Write the parser and test it")
+    # --- a bot turn becomes a task, the report closes it -----------------------------------
+    long = ("Write the parser for the invoice feed. Then test it against the March export and "
+            "post the numbers to the finance room before Friday.")
+    lucent.on_work("company", "builder", long)
     lucent._handle(lucent._Q.get_nowait())
     created = [r for r in Fake.requests if r["method"] == "POST" and r["path"] == "/api/tasks"]
     check("the delegation filed one task", len(created) == 1, created)
@@ -206,6 +211,27 @@ def main():
           and created[0]["body"]["status"] == "in_progress", created[:1])
     check("filed with the delegate's own token",
           created and created[0]["auth"] == "Bearer tok-builder@bots.anzen.local", created[:1])
+    check("the title is a short summary of the request",
+          created and created[0]["body"]["title"] == "Write the parser for the invoice feed", created[:1])
+    check("...and the description keeps the request whole",
+          created and created[0]["body"]["description"] == long, created[:1])
+
+    # A title is a label, never a paragraph: cut at a word boundary, capped at TITLE_MAX, and
+    # something rather than nothing when the request has no words at all.
+    check("a long title is cut at a word",
+          len(lucent._short("alpha " * 30)) <= lucent.TITLE_MAX
+          and lucent._short("alpha " * 30).endswith("alpha"), lucent._short("alpha " * 30))
+    check("a title with no spaces is cut hard", lucent._short("x" * 200) == "x" * lucent.TITLE_MAX)
+    check("an empty title still labels something", lucent._short("   ") == "Task")
+    check("a summary is the first sentence", lucent._summary("Do the thing. Then more.") == "Do the thing")
+    check("a one-sentence request is summarised whole", lucent._summary("short job") == "short job")
+
+    # The board brief rides in the bot's prompt — except on a turn that already is a task.
+    check("the prompt carries the board rules", "%d" % lucent.TITLE_MAX in lucent.brief()
+          and "due_date" in lucent.brief(), lucent.brief())
+    lucent._PICKUP.on = True
+    check("a picked-up task is not told to file one", lucent.brief() == "")
+    lucent._PICKUP.on = False
 
     lucent.on_report("company", "builder", "Done, tests pass.")
     lucent._handle(lucent._Q.get_nowait())
@@ -214,6 +240,16 @@ def main():
           any(r["method"] == "PATCH" and r["path"] == "/api/tasks/t-1"
               and r["body"].get("status") == "done" for r in Fake.requests))
 
+    # A chat with one bot outside any room is work too, so it is a task — with no project,
+    # because there is no room to map one from.
+    Fake.requests.clear()
+    lucent.on_work("chat", "loner", "answer the phone")
+    lucent._handle(lucent._Q.get_nowait())
+    created = [r for r in Fake.requests if r["method"] == "POST" and r["path"] == "/api/tasks"]
+    check("a 1:1 chat files a task as well", len(created) == 1, created)
+    check("...with no project when the bot is in no room",
+          created and "project_id" not in created[0]["body"], created[:1])
+
     # --- a task created in Lucent runs a turn ---------------------------------------------
     Fake.todo = [{"id": "h-1", "title": "Rename the files", "description": "by date",
                   "assignee_id": "u-builder", "created_by": "u-maya"}]
@@ -221,6 +257,8 @@ def main():
     check("one turn ran for the task", len(turns) == 1, turns)
     check("the turn ran as the bot in its room", turns and turns[0]["sid"] == "company/builder"
           and turns[0]["solo"] == "builder", turns[:1])
+    check("a task-started turn does not file a second task",
+          during == [True] and lucent._Q.empty(), (during, lucent._Q.qsize()))
     check("the turn's report was commented back",
           Fake.count("POST", "/api/tasks/h-1/comments") == 1, Fake.requests)
     check("the picked-up task was closed",
@@ -237,7 +275,7 @@ def main():
 
     # --- failures are recorded, not raised ------------------------------------------------
     Fake.fail_tasks = True
-    lucent.on_delegate("company", "builder", "this one fails")
+    lucent.on_work("company", "builder", "this one fails")
     try:
         lucent._handle(lucent._Q.get_nowait())
         raised = False
@@ -256,6 +294,25 @@ def main():
     check("workspace management is refused", Fake.requests == [] and "not open" in out, out)
     out = lucent.api_tool("builder", "GET", "/api/reset", None)
     check("reset is refused", "not open" in out, out)
+    # A bot that writes its whole request into a title has it cut here, so the board stays a
+    # list of labels whatever the model sends.
+    Fake.requests.clear()
+    lucent.api_tool("builder", "POST", "/api/tasks", {"title": "y" * 200, "description": "the request"})
+    posted = [r for r in Fake.requests if r["path"] == "/api/tasks" and r["method"] == "POST"]
+    check("a title written by the bot is clamped too",
+          posted and len(posted[0]["body"]["title"]) <= lucent.TITLE_MAX
+          and posted[0]["body"]["description"] == "the request", posted[:1])
+
+    # --- the fixed workspace --------------------------------------------------------------
+    # With no address anywhere, bot work still has somewhere to go: the team's own Lucent.
+    os.environ.pop("LUCENT_URL", None)
+    st["url"] = ""
+    lucent._STARTED = True                        # set the address without spawning the threads
+    lucent.start()
+    check("with no address configured the bridge uses the fixed workspace",
+          lucent._URL == lucent.DEFAULT_URL == "https://lucent.vortex-freq.web.id", lucent._URL)
+    lucent._URL = url; lucent._STARTED = False
+    st["url"] = url; lucent._save()
 
     # --- Settings → Lucent ----------------------------------------------------------------
     # The desktop app has no environment to read, so the tab posts the admin login. It must

@@ -95,7 +95,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 **Extend it**
 * **MCP plugins** — add any MCP server and its tools become real tools for every bot.
 * **Connected apps** — GitHub, Slack, Notion, Linear, Gmail, Drive, Calendar and Webhooks.
-* **Lucent workspace** — each bot is a real Lucent member with its own API token: rooms map to projects, a delegation becomes a task, a report becomes a comment, and a `todo` task assigned to a bot wakes it and runs the work. Bots also get a `lucent_api` tool, so they can use every Lucent route as themselves. [API and setup](docs/lucent-api.md)
+* **Lucent workspace** — each bot is a real Lucent member with its own API token: rooms map to projects, every bot turn (room message, delegation, 1:1 chat, routine) is filed as a task with a short summary title, a due date and an estimate, and closed with its report, and a `todo` task assigned to a bot wakes it and runs the work. Bots also get a `lucent_api` tool, so they can use every Lucent route as themselves. [API and setup](docs/lucent-api.md)
 
 **Chat**
 * Markdown replies rendered properly, with raw HTML escaped.
@@ -145,14 +145,14 @@ Follow these steps to run a local copy.
 
 `run.sh` does the same with sensible defaults. On first run the server writes `data/config.json` from those variables, so edit it afterwards to change the router, key or models.
 
-*Optional, to put the team on a [Lucent](https://lucent.vortex-freq.web.id) board:* open **Settings → Lucent** and give it the address, an admin's email and that admin's password. In the desktop app that is the only step — there is no environment variable to set.
+*Optional, to put the team on a [Lucent](https://lucent.vortex-freq.web.id) board:* open **Settings → Lucent** and give it an admin's email and that admin's password. The address is already filled in with `https://lucent.vortex-freq.web.id`; in the desktop app that is the only step — there is no environment variable to set.
 ```bash
 # The same thing for a headless server, if you prefer the environment:
-export LUCENT_URL="https://lucent.vortex-freq.web.id"
+export LUCENT_URL="https://lucent.vortex-freq.web.id"   # optional; this is the default
 export LUCENT_EMAIL="you@example.com"     # an existing Lucent admin, optional
 export LUCENT_PASSWORD="..."              # its password, optional
 ```
-The bridge runs in the backend and needs no clicks: it creates a member per bot (name, title as role, the room it works in as team, its face) and one project per room, and mints a token per bot. A bot's team is the first room that lists it — set `lucent_team` on the bot record to put it somewhere else. A team left empty by a bot that moved is removed, so the Team page stays as small as the rooms. Every call is `Authorization: Bearer` — no cookies, no browser, no UI. With no credentials it registers `anzen@bots.anzen.local` itself; the tokens live in `data/lucent.json` (0600) and the state is visible at `GET /api/lucent`. Tokens never expire, and the admin's password is never written to disk — the bridge only needs it again if the token is revoked. Lucent must have the token-auth patch from [docs/lucent-api.md](docs/lucent-api.md). It polls every 20 seconds.
+The bridge runs in the backend and needs no clicks: it creates a member per bot (name, title as role, the room it works in as team, its face) and one project per room, and mints a token per bot. **Every bot turn is a task there** — a room message, a delegation, a chat with one bot, a routine: it is filed `in_progress` under that bot's own token in the room's project (no project for a bot outside a room), and the bot's report is posted as a comment that closes it. A turn started by a Lucent task is not filed again, so nothing doubles. A bot's team is the first room that lists it — set `lucent_team` on the bot record to put it somewhere else. A team left empty by a bot that moved is removed, so the Team page stays as small as the rooms. Every call is `Authorization: Bearer` — no cookies, no browser, no UI. With no credentials it registers `anzen@bots.anzen.local` itself; the tokens live in `data/lucent.json` (0600) and the state is visible at `GET /api/lucent`. Tokens never expire, and the admin's password is never written to disk — the bridge only needs it again if the token is revoked. Lucent must have the token-auth patch from [docs/lucent-api.md](docs/lucent-api.md). It polls every 20 seconds. Filing is queued off the turn, so a Lucent outage slows the board, not the bots. A filed title is a label of at most 60 characters — the first sentence of the request, cut at a word — and the description keeps the request whole; before it calls `finish`, the bot is told to tidy the task with a `due_date` (YYYY-MM-DD) and an `estimate` in hours, because Lucent counts a task with no due date as late.
 
 It also writes `data/bots.json` and `data/channels.json`, seeding **one room called Company with five bots already on the team** — Producer (Chief of Staff), Researcher, Builder, QA and Ops — so a fresh install opens on a working team instead of an empty sidebar. From then on they are ordinary records: rename them, re-brief them, add your own, or delete them.
 

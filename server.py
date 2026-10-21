@@ -3902,6 +3902,9 @@ TOOL_SCHEMAS = {
                    "PATCH tasks/<id> {any of those, position}  |  DELETE tasks/<id>  |  "
                    "POST tasks/<id>/subtasks {title}  |  PATCH subtasks/<id> {done}  |  DELETE subtasks/<id>  |  "
                    "POST tasks/<id>/comments {body}.\n"
+                   "A task title is a short label — at most 60 characters, the summary rather than the "
+                   "request; the description holds the detail, and a due_date (YYYY-MM-DD) plus an estimate "
+                   "in hours are what keep it from counting as late.\n"
                    "Projects: POST projects {name, description, status, color, due_date, lead_id}  |  "
                    "PATCH projects/<id>  |  DELETE projects/<id>.\n"
                    "Elsewhere: POST events {title, starts_at, duration_min, location, kind}  |  DELETE events/<id>  |  "
@@ -5199,6 +5202,11 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
     if mates:
         who += (" Your team in this room: " if ch_now else " Your teammates: ") + ", ".join(x["name"] for x in mates) + "."
     chunks.append(("System prompt", who))
+    # The board is the bot's own: its turn is a task there, and the title, due date and estimate are
+    # its to fill — only it knows what the job turned out to be and how long it will take.
+    if lucent and any(t.get("function", {}).get("name") == "lucent_api" for t in tools):
+        board = lucent.brief()
+        if board: chunks.append(("Lucent", board))
     # The operating instructions are placed before the skills on purpose. When a system prompt is too
     # long for the window `fit_messages` cuts it from the end, so whatever sits last is what is lost —
     # and what sits last must never be the working directory, the language rule, or the one line that
@@ -5450,11 +5458,17 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                         delegated.add(sub)
                         used.append("delegate:" + sub)
                         yield {"type": "agent", "id": sub, "name": sb["name"], "state": "start", "task": subtask}
+                        # The delegate's turn is a task in Lucent too, in whichever project this
+                        # turn belongs to — a room, a chat inside one, or none at all.
+                        room_now = (ch_now or {}).get("id") or "chat"
+                        if lucent: lucent.on_work(room_now, sub, subtask)
                         sout = {}
                         yield from run_agent(sid, sub, subtask, context + "\n\nPlan: " + str(task), sout, bots, settings, depth + 1)
                         yield {"type": "agent", "id": sub, "name": sb["name"], "state": "done"}
                         result = sb["name"] + " reported:\n" + (sout.get("text") or "(no report)")
                         rep = (sout.get("text") or "").strip()
+                        # ...and its report closes that task, exactly as a room member's does.
+                        if lucent and rep: lucent.on_report(room_now, sub, rep)
                         # What the teammate found is the room's business, not a note passed privately to
                         # the lead: without this the channel showed the delegation and then nothing until
                         # the lead's own summary, so the work in between happened in silence. It is said
@@ -5737,6 +5751,10 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
                 yield {"type": "error", "msg": "This chat's bot no longer exists — open a chat from the sidebar."}
                 return
             out = {}; seen_plan = False; engaged = []; ran = []
+            # A chat with one bot is work too, so it is a task in Lucent like a room member's turn —
+            # in the room's project when the chat is scoped to a room, and with no project when not.
+            room_now = (channel or {}).get("id") or "chat"
+            if lucent: lucent.on_work(room_now, solo, task)
             for ev in run_agent(sid, solo, task, _recent_ctx(sid), out, bots, settings, images=images):
                 if ev.get("type") == "plan": seen_plan = True
                 elif ev.get("type") == "agent" and ev.get("state") == "start": engaged.append(ev.get("name"))
@@ -5761,6 +5779,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
             if solo == "producer" and not seen_plan and engaged:
                 yield {"type": "plan", "kind": "route", "text": _on_it(engaged)}
             final = out.get("text") or ""
+            if lucent and final: lucent.on_report(room_now, solo, final)
             st = load(sid); st["messages"].extend(ran)
             st["messages"].append({"role":"assistant","who": bot_by_id(bots, solo)["name"], "content": final, "ts": time.time(), "took": out.get("took")})
             rec = ctx_get(sid)                           # fold the ctx chip into this same save: one write
@@ -5895,6 +5914,9 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
     for m in targets:
         yield {"type": "agent", "id": m, "name": bot_by_id(bots, m)["name"], "state": "start"}
         engaged.append(bot_by_id(bots, m)["name"])
+        # A member's turn is a task in Lucent, assigned to that member in the room's project. Its
+        # report closes it. Queued, never sent from here: the turn must not wait on another service.
+        if lucent: lucent.on_work(channel["id"], m, text)
         out = {}; work = {}
         # A report is the thing a member most needs to see, and a 200-char cut turned one into a
         # fragment the next member could not act on — so the tail is wider and each line keeps more.
@@ -5917,13 +5939,12 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
             if t == "agent" and ev.get("state") == "start" and ev.get("id") != m:
                 # What was handed over, in the room: the delegation is the channel's business, and a
                 # teammate's name with no task under it leaves the room showing a hand-off to nothing.
+                # The task itself is filed where the delegate's turn starts (run_agent), which is the
+                # one place that knows about a delegation in a room and in a chat alike.
                 hand = " ".join((ev.get("task") or "").split())
                 room_said.append({"role": "route", "who": "Room",
                                   "content": "→ " + (ev.get("name") or bid) + (": " + hand[:160] if hand else ""),
                                   "ts": time.time()})
-                # The same hand-off is a task in Lucent, assigned to the bot it names. Queued,
-                # never sent from here: the turn must not wait on another service.
-                if lucent: lucent.on_delegate(channel["id"], ev.get("id") or bid, hand)
             # A bot's words are the room's business: the channel *is* the conversation, and what each
             # one says is what makes it read as one instead of a wall of closing reports. So they are
             # *not* addressed away with `to` — the room draws them, through the one plain yield below.
@@ -7245,7 +7266,7 @@ def boot(warm_browser=True):
     if lucent:
         lucent.configure(DATA, FACES_DIR, PRESET_DIR, AVATAR_DIR, load_bots, load_channels,
                          save_channels, load_settings, _run_turn)
-        lucent.start()                            # no-ops unless LUCENT_URL or data/lucent.json is set
+        lucent.start()                            # every bot turn is filed there; Settings sets the login
     warm_mcp()                                    # connect MCP servers now, off the first turn's path
     if warm_browser and os.environ.get("BROWSER_WARMUP", "1") != "0":
         threading.Thread(target=BROWSER.start, daemon=True).start()  # warm up the headless browser in the background

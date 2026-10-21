@@ -51,16 +51,16 @@ ok("idle is base between blinks", presetFrame("idle", 1, 0, 1) === "base");
     ok(st + " wears " + frame, presetFrame(st, 1, 0.9, 1) === frame, presetFrame(st, 1, 0.9, 1));
 }
 
-ok("a poke shows the jolt frame for a moment",
-   presetFrame("idle", 1, 0, 1, 0.2) === "p1" && presetFrame("idle", 1, 0, 1, 0) !== "p1");
-ok("a poke does not break the working mouth rule",
-   presetFrame("working", 1, 1, 1, 0.2).startsWith("work-"));
+ok("a first poke shows the jolt frame",
+   presetFrame("idle", 1, 0, 1, "p1") === "p1" && presetFrame("idle", 1, 0, 1) !== "p1");
+ok("a repeated poke shows the exasperated frame", presetFrame("idle", 1, 0, 1, "p2") === "p2");
+ok("a poke reaches a bot at its desk", presetFrame("working", 1, 1, 1, "p1") === "p1");
 
 ok("every state and time lands on a shipped frame", (() => {
   for (const st of ["idle", "working", "thinking", "searching", "approval", "question", "finished",
                     "error", "sleeping", "ratelimit", "dizzy", "bored", "nope"])
     for (let i = 0; i < 400; i++)
-      if (!PRESET_FRAMES.includes(presetFrame(st, i * 0.05, (i % 3) * 0.3, i % 2, i % 5 * 0.1)))
+      if (!PRESET_FRAMES.includes(presetFrame(st, i * 0.05, (i % 3) * 0.3, i % 2, ["", "p1", "p2"][i % 3])))
         return false;
   return true;
 })());

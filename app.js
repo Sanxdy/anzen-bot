@@ -182,6 +182,36 @@ const lift = (hex, k) => { const n = parseInt(hex.slice(1), 16);
     .map(v => Math.round(v + (255 - v) * k).toString(16).padStart(2, "0")).join(""); };
 function bigFace(color) { const c = AV[color] || AV.blue; return { bodyTop: lift(c, 0.44), bodyBottom: lift(c, 0.08) }; }
 const faceOf = b => (b && b.face && SPECIES[b.face]) ? b.face : speciesFor(b && b.id);
+/* A row's face outlives the list it sits in. The sidebar and the chat list both rebuild from scratch
+   on every redraw, and a new canvas each time restarted the drawing — a face that blinked and popped
+   back whenever the window had been idle and re-read the config. The canvas and its MochiBot are kept
+   per key, so a rebuild that changed a label moves the same node into the new row and the drawing
+   carries on; a face whose colour, species or picture did change is re-skinned in place. */
+function mountFace(store, key, holder, size, b, cls) {
+  const opts = { size, species: faceOf(b), ...sideFace(b.color), ...lookOf(b) };
+  const old = store[key];
+  if (old && JSON.stringify(old._opts) === JSON.stringify(opts)) {
+    holder.replaceWith(old.cv);
+    return old;
+  }
+  if (old) { if (old._idleTimer) clearTimeout(old._idleTimer); detach(old); }
+  const cv = document.createElement("canvas");
+  cv.className = cls;
+  cv.dataset.species = opts.species;        // what the row draws, readable from the DOM
+  cv.setAttribute("aria-hidden", "true");   // decorative: the row's own name carries the meaning
+  holder.replaceWith(cv);
+  const m = attach(cv, "idle", opts);
+  m._opts = opts;
+  return m;
+}
+/* Retire the faces of rows that are gone; whatever is in `live` is on screen and stays attached. */
+function dropFaces(store, live) {
+  for (const [k, m] of Object.entries(store)) {
+    if (live[k]) continue;
+    if (m._idleTimer) clearTimeout(m._idleTimer);
+    detach(m);
+  }
+}
 function sideSet(id, st) {
   const m = S.sideMochi[id]; if (!m) return;
   if (m._idleTimer) { clearTimeout(m._idleTimer); m._idleTimer = null; }
@@ -392,7 +422,9 @@ const STATES_LABEL = { idle:"idle", working:"working at the desk", thinking:"thi
 /* The header and the dock must never disagree about what a chat is doing, so both read one table. The
    header drops the dock's whimsy — it is a status line beside a bot's name, not a hover tooltip. */
 const H_STATE = { ...STATES_LABEL, working: "working", finished: "done" };
-const POKE_TIP = ["hehe!", "stop it!", "that tickles", "boop!", "hey!", "again! again!", "ehehe"];
+/* What a bot says when poked. "stop it!" is not in the random list: it belongs to the poke that
+   actually annoyed it, so the words and the face never disagree. */
+const POKE_TIP = ["hehe!", "that tickles", "boop!", "hey!", "again! again!", "ehehe"];
 /* A chime for the states worth hearing from another window: a turn that finished, one that failed,
    and one that stopped to ask you something. Which states those are lives in sound.js, next to the
    cues themselves, so the mapping and the sounds cannot drift apart. */
@@ -436,7 +468,13 @@ function dockFace() {
 function showTip(txt, holdMs = 0) { const tip = $("#dockTip"); if (!tip) return;
   tip.textContent = txt; tip.classList.add("on"); clearTimeout(tipTimer);
   if (holdMs) tipTimer = setTimeout(() => tip.classList.remove("on"), holdMs); }
-function pokeDock() { if (!S.dock) return; S.dock.poke(); showTip(POKE_TIP[Math.floor(Math.random() * POKE_TIP.length)], 900); }
+function pokeDock() {
+  if (!S.dock) return;
+  /* The words climb with the face: a jolt gets the happy nonsense, irritation gets a warning, and
+     the arms-crossed poke gets told off. */
+  const level = S.dock.poke();
+  showTip([null, POKE_TIP[Math.floor(Math.random() * POKE_TIP.length)], "cut it out!", "stop it!"][level], 900);
+}
 /* The corner mascot is decoration, so it can be put away. It is a local preference, not a setting on
    the server: it is about this screen, and hiding it must not need a round-trip. */
 const dockHidden = () => { try { return localStorage.getItem("dock.hidden") === "1"; } catch (e) { return false; } };
@@ -881,10 +919,7 @@ window.anzenBack = () => {
 };
 function renderChats() {
   const box = $("#chats"); if (!box) return;
-  for (const m of Object.values(S.chatMochi)) {           // the list is rebuilt — retire its faces
-    if (m._idleTimer) clearTimeout(m._idleTimer);
-    detach(m);
-  }
+  const keep = S.chatMochi;                               // faces already on screen, kept by chat id
   S.chatMochi = {};
   const q = (S.chatQuery || "").trim().toLowerCase();
   /* A chat scoped to a company is still a chat with one bot, so it is named for the bot — the
@@ -900,6 +935,7 @@ function renderChats() {
   box.innerHTML = "";
   if (!rows.length) {
     box.appendChild(el("li", "chatempty", q ? "No chat matches “" + esc(S.chatQuery) + "”." : "Nothing here yet — say something to a bot and it shows up."));
+    dropFaces(keep, S.chatMochi);
     return;
   }
   for (const c of rows) {
@@ -916,19 +952,15 @@ function renderChats() {
        live drawing the bot's own row does. It used to be a generic glyph, which meant changing a
        bot's face changed nothing anywhere in the chat list. A room keeps its icon. */
     const b = c.kind === "room" ? null : botOf(c.id);
-    if (b) {
-      const cv = document.createElement("canvas"); cv.className = "ck face";
-      cv.setAttribute("aria-hidden", "true");
-      li.querySelector(".ck").replaceWith(cv);
-      S.chatMochi[c.id] = attach(cv, "idle", { size: 26, species: faceOf(b), ...sideFace(b.color), ...lookOf(b) });
-    }
+    if (b) S.chatMochi[c.id] = mountFace(keep, c.id, li.querySelector(".ck"), 26, b, "ck face");
     box.appendChild(li);
   }
+  dropFaces(keep, S.chatMochi);
 }
 
 /* One row for a bot inside a company. Same bot, same face, same config — the row id is what
    makes the chat scoped, so `webshop/producer` and `mobile/producer` are two conversations. */
-function subRow(b, scope) {
+function subRow(b, scope, faces) {
   const key = scope ? scope + "/" + b.id : b.id;
   const li = el("li", "bot subbot" + (key === S.active ? " sel" : "")); li.dataset.id = key; li.dataset.kind = "bot";
   li.dataset.bot = b.id;                                  // the row's key is scoped; the menu needs the bot id too
@@ -944,19 +976,11 @@ function subRow(b, scope) {
   kbd(li, () => { if (key !== S.active) select(key); });
   kbd(li.querySelector(".kebab"), e => openCtx(e, b.id, "bot", key));
   const holder = li.querySelector(".mc");                 // swap the static face for a live one
-  const cv = document.createElement("canvas"); cv.className = "sidebot";
-  cv.setAttribute("aria-hidden", "true");   // decorative: the row's own name carries the meaning
-  cv.dataset.species = faceOf(b);
-  holder.replaceWith(cv);
-  S.sideMochi[key] = attach(cv, "idle", { size: 46, species: cv.dataset.species, ...sideFace(b.color), ...lookOf(b) });
+  faces.live[key] = mountFace(faces.keep, key, holder, 46, b, "sidebot");
   return li;
 }
 function renderNav() {
-  for (const m of Object.values(S.sideMochi)) {           // nav rebuilds from scratch — retire old faces
-    if (m._idleTimer) clearTimeout(m._idleTimer);
-    detach(m);
-  }
-  S.sideMochi = {};
+  const faces = { keep: S.sideMochi, live: {} };           // rows that survive keep the face they have
   const shut = collapsed();
   const cbox = $("#chans"); cbox.innerHTML = "";
   const claimed = new Set();                              // bots that live under some company
@@ -1001,7 +1025,7 @@ function renderNav() {
     const group = el("li", "group"); group.dataset.group = c.id; group.dataset.drag = c.id; group.draggable = true;
     group.appendChild(li);
     const sub = el("ul", "sub" + (isShut ? " shut" : ""));
-    for (const b of members) sub.appendChild(subRow(b, c.id));
+    for (const b of members) sub.appendChild(subRow(b, c.id, faces));
     group.appendChild(sub);
     cbox.appendChild(group);
   }
@@ -1009,7 +1033,9 @@ function renderNav() {
   const loose = [...S.bots].filter(b => !b.hidden && !claimed.has(b.id))
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
   $("#botsLabel").style.display = loose.length ? "" : "none";
-  for (const b of loose) bbox.appendChild(subRow(b, null));
+  for (const b of loose) bbox.appendChild(subRow(b, null, faces));
+  S.sideMochi = faces.live;
+  dropFaces(faces.keep, faces.live);
   dockFace();                                             // the corner follows the active bot's face
 }
 
@@ -4167,7 +4193,7 @@ function tabHelp(p) {
   para(s, "The sidebar lists your chats, your rooms and your loose bots. Click a row to open its chat, click the caret to fold a team, and right-click (or the ⋯) for pin, hide, duplicate, clear and delete. The rail button collapses the sidebar to a strip of faces.");
   para(s, "Click the <b>CHATS</b> heading to fold the recent-chat list away and give the rooms and bots the room — the heading stays as the control that brings it back, and the choice is remembered.");
   para(s, "To put the sidebar in your own order, <b>hold a row and drag it</b>: a room (its team comes with it), a loose bot, or a bot inside a room. The order you drop into is saved on the server, so the phone shows what the window arranged. <b>Pin</b> from a room's menu floats it to the top, above everything else, and unpinning puts it back where you left it.");
-  para(s, "The corner face is the dock: it wears the face of whoever you are talking to and shows what it is doing — idle, working at the desk, thinking, searching, needs your approval, done, error. Poke it for fun. The header dot goes live while a turn is running.");
+  para(s, "The corner face is the dock: it wears the face of whoever you are talking to and shows what it is doing — idle, working at the desk, thinking, searching, needs your approval, done, error. Poke it and it jolts; keep poking and it has had enough. The header dot goes live while a turn is running.");
 
   /* ---- keyboard ---- */
   s = sec("keys", "Keyboard and gestures");
@@ -4557,7 +4583,7 @@ function tabApps(p) {
    the bridge the one thing it cannot read for itself — an admin login — so a fresh install
    connects without an environment variable. The password is used to mint a token and dropped. */
 function tabLucent(p) {
-  h3(p, "Lucent", "Send the team to a Lucent workspace: a project per room, a task per delegation, and a task assigned to a bot wakes it up.");
+  h3(p, "Lucent", "Send the team to a Lucent workspace: a project per room, and every bot turn — a room message, a delegation, a chat — filed there as a task and closed with the bot's report.");
   const wrap = el("div"); p.appendChild(wrap);
   let msg = "";
   const draw = async () => {
@@ -4567,8 +4593,8 @@ function tabLucent(p) {
     d.innerHTML = `<div class="ct"><span class="ico">${svg("globe")}</span><div><b>Lucent workspace</b>
       <div class="sub">${st.on ? esc(st.email || st.url) : "not connected"}</div></div>
       <div class="rt"><span class="tag ${st.on ? "ok" : "off"}">${st.on ? "on" : "off"}</span></div></div>`;
-    const url = el("input"); url.placeholder = "https://lucent.example.com";
-    if (st.url) url.value = st.url;
+    const url = el("input"); url.placeholder = "https://lucent.vortex-freq.web.id";
+    url.value = st.url || "https://lucent.vortex-freq.web.id";
     const email = el("input"); email.style.marginTop = "8px"; email.placeholder = "admin email";
     if (st.email) email.value = st.email;
     const pw = el("input"); pw.type = "password"; pw.style.marginTop = "8px";

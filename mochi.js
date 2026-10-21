@@ -126,7 +126,11 @@ const PRESET_STATE_FRAME = {
 /* Which frame a preset wears right now. `mouthOpen` is `emo.open`, the channel the app already
    drives for a talking bot. A state with its own frame wins over it: those states' default emotions
    open the mouth (thinking is "curious"), so the other order would never show the expression. */
-export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeLeft = 0) {
+export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeFrame = "") {
+  /* A poke overrides everything, including the desk loop: a bot that does not notice being poked is
+     indistinguishable from one that is not there. `p1` is the jolt, `p2` the exasperation the set
+     ships for a bot poked once too often. Neither is a mouth cycle, so the working mouth rule holds. */
+  if (pokeFrame) return pokeFrame;
   /* Working is a closed loop of three frames and its mouth never moves: the mouth cycle is a
      talking tell, and a bot at its desk is not talking. */
   if (state === "working") {
@@ -134,7 +138,6 @@ export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeLeft = 0) {
     if (Math.floor(ti / 2.3) % 2 === 0 && ti % 2.3 < 0.5) return "work-happy";   // every other window
     return Math.floor(ti / 0.22) % 2 ? "work-b" : "work-a";
   }
-  if (pokeLeft > 0) return "p1";
   const fixed = PRESET_STATE_FRAME[state];
   if (fixed) return fixed;
   if (mouthOpen > 0.05) return "m" + (Math.floor(ti / 0.13) % 4);
@@ -289,6 +292,7 @@ export class MochiBot {
     this.tw = {}; this.locks = new Set();            // keyframe tweens, keyed by property
     this.emo = {}; for (const k of EMO_KEYS) this.emo[k] = EMOTIONS.calm[k];
     this._pokeLeft = 0;                              // how long the poke frame still shows
+    this._pokeFrame = ""; this._pokes = 0; this._pokedAt = -99;
     if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
     this.setState(state, true);
   }
@@ -391,21 +395,21 @@ export class MochiBot {
     }
   }
   /* Re-skin a live bot: same canvas, same motion mid-flight, a different species, colour and
-     wardrobe. Pass no colours to fall back to the plain Mochi body; pass no `look` to keep what
-     it is wearing. */
+     wardrobe. Pass no colours to fall back to the plain Mochi body. The look is always replaced,
+     never merged: the dock is re-skinned when you switch chats, and a room has no face of its own,
+     so a missing look has to strip the previous bot's preset rather than leave it in the corner. */
   skin(species, colors, look) {
     if (SPECIES[species]) { this.species = species; this.sp = SPECIES[species]; }
     this.flat = (colors && colors.flat) || null;
     this.bodyTop = (colors && colors.bodyTop) || (colors && colors.flat) || "#EDEDEF";
     this.bodyBottom = (colors && colors.bodyBottom) || (colors && colors.flat) || "#C4C5CA";
-    if (look) {
-      this.outfit = OUTFITS[look.outfit] ? look.outfit : "";
-      this.accessory = ACCESSORIES[look.accessory] ? look.accessory : "";
-      this.preset = look.preset || "";
-      this.image = this.preset ? "" : (look.image || "");
-      this.imageClosed = this.preset ? "" : (look.imageClosed || "");
-      if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
-    }
+    const l = look || {};
+    this.outfit = OUTFITS[l.outfit] ? l.outfit : "";
+    this.accessory = ACCESSORIES[l.accessory] ? l.accessory : "";
+    this.preset = l.preset || "";
+    this.image = this.preset ? "" : (l.image || "");
+    this.imageClosed = this.preset ? "" : (l.imageClosed || "");
+    if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
   }
   /* The feeling on top of the state. Idle bots drift through their own moods. */
   setEmotion(e) {
@@ -414,15 +418,41 @@ export class MochiBot {
     this._mood = e; this._moodAt = 3 + Math.random() * 5;
   }
   poke() {
-    this._pokeLeft = 0.45;                           // a preset shows its jolt frame for a moment
+    /* Poking escalates, in three steps, because one reaction makes the tenth poke look like the
+       first. The set ships two dedicated poke frames — `p1`, the jolt, and `p2`, arms crossed — and
+       the shipped `e-annoyed` expression sits between them, so the three steps cost no new art:
+       startled, then irritated, then had enough. The count lapses after a couple of seconds. */
+    const again = this.t - this._pokedAt < 2.5;
+    this._pokes = again ? this._pokes + 1 : 1;
+    this._pokedAt = this.t;
+    const level = Math.min(this._pokes, 3);
+    this._pokeFrame = level === 1 ? "p1" : level === 2 ? "e-annoyed" : "p2";
+    this._pokeLeft = [0, 0.45, 0.9, 1.2][level];
     this.squash();
-    this.anim("oy", [[-0.34 * this.R, 120, Ease.out], [0.03 * this.R, 200, Ease.inOut], [0, 170, Ease.back]]);
-    this.anim("yaw", [[(Math.random() < 0.5 ? -1 : 1) * 0.34, 130, Ease.out], [0, 320, Ease.inOut]]);
+    /* A portrait does not hop either: `oy` lifts the whole picture off its shoulders. A face jolts
+       with its frame and a quick recoil of the head, so the tilt is the channel it gets. */
+    const faceBot = !!(this.preset || this.image);
+    if (level > 1) {
+      /* A head shake, and no hearts: a bot that bounces while telling you to stop reads as delighted
+         to see you. The shake grows with the level. */
+      const a = level === 2 ? 0.08 : 0.12;
+      if (faceBot) this.anim("tilt", [[a, 80, Ease.out], [-a, 120, Ease.inOut],
+                                      [a / 2, 120, Ease.inOut], [0, 170, Ease.inOut]]);
+      else this.anim("yaw", [[a * 2, 90, Ease.out], [-a * 2, 140, Ease.inOut], [a, 130, Ease.inOut], [0, 180, Ease.inOut]]);
+      this.setEmotion("angry");
+      return level;
+    }
+    if (faceBot) this.anim("tilt", [[-0.13, 80, Ease.out], [0.04, 150, Ease.inOut], [0, 260, Ease.inOut]]);
+    else {
+      this.anim("oy", [[-0.34 * this.R, 120, Ease.out], [0.03 * this.R, 200, Ease.inOut], [0, 170, Ease.back]]);
+      this.anim("yaw", [[(Math.random() < 0.5 ? -1 : 1) * 0.34, 130, Ease.out], [0, 320, Ease.inOut]]);
+    }
     this.setEmotion("excited");
     this.anim("es", [[1.18, 110, Ease.out], [1, 380, Ease.inOut]]);
     for (let i = 0; i < 3; i++)
       this.parts.push({ k: "heart", x: (Math.random() * 2 - 1) * 18, y: -14, vy: -26 - Math.random() * 16,
                         vx: (Math.random() * 2 - 1) * 10, a: 1, s: 0.6 + Math.random() * 0.5 });
+    return level;
   }
   /* look toward a normalised point (-1..1). cursor=true holds it there until released. */
   lookAt(nx, ny, cursor = false) {
@@ -693,7 +723,8 @@ export class MochiBot {
      frame instead of flashing an empty canvas. */
   _presetFace() {
     if (!this.preset) return null;
-    const want = presetFrame(this.state, this.ti, this.emo.open, this.open, this._pokeLeft);
+    const want = presetFrame(this.state, this.ti, this.emo.open, this.open,
+                             this._pokeLeft > 0 ? this._pokeFrame : "");
     for (const f of [want, "base"]) {
       const t = presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
       if (t && t.cv) return t.cv;

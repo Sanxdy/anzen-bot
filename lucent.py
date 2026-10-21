@@ -6,13 +6,16 @@ its own Lucent account, so a task it files is assigned to it and a comment it wr
 signed by it.
 
 Two directions:
-  out  a delegation in a room opens a task (in_progress, assigned to the delegate) and that
-       bot's report becomes a comment that closes it;
+  out  every bot turn — a room message, a delegation, a 1:1 chat, a routine — opens a task
+       (in_progress, assigned to the bot, in its room's project) and the bot's report becomes
+       a comment that closes it. Lucent is the record of what the team did, not only of what
+       was delegated;
   in   a todo task assigned to a bot in Lucent runs a turn in its room, and the reply is
        commented back and the task marked done.
 
 Config is `LUCENT_URL` plus optional `LUCENT_EMAIL`/`LUCENT_PASSWORD` of an existing admin,
-or `data/lucent.json`, which this module owns and keeps at 0600.
+or `data/lucent.json`, which this module owns and keeps at 0600. With neither, the bridge
+points at `DEFAULT_URL` and Settings asks for the admin password once.
 """
 import base64, json, os, queue, re, secrets, threading, time, urllib.error, urllib.request
 
@@ -22,6 +25,19 @@ TIMEOUT = 20
 ADMIN_EMAIL = "anzen@bots.anzen.local"
 BOT_DOMAIN = "bots.anzen.local"
 AVATAR_MAX = 300_000      # Lucent's own cap on a profile picture
+DEFAULT_URL = "https://lucent.vortex-freq.web.id"   # Settings may point elsewhere; unset means here
+TITLE_MAX = 60            # a board title is a label; the request itself is the description
+
+# Told to a bot in the prompt of a turn the bridge filed a task for. The title and the dates are
+# the bot's to fill: only it knows what the job turned out to be and how long it will take.
+BRIEF = (
+    "\n\nYour turn is a task on the team's Lucent board: it was filed when you started, in this "
+    "room's project. Before you call `finish`, tidy it with `lucent_api`: GET "
+    "/api/tasks?assignee=me&status=in_progress finds it (the one whose description is the request "
+    "you were given), then PATCH /api/tasks/<id> with \"title\" — a summary of at most %d "
+    "characters, because the description already holds the full request — \"due_date\" as "
+    "YYYY-MM-DD, and \"estimate\" in hours. A task with no due date counts as late." % TITLE_MAX
+)
 
 DATA = ""
 FACES_DIR = ""; PRESET_DIR = ""; AVATAR_DIR = ""
@@ -36,6 +52,7 @@ _ERRS = 0                 # failures since boot, so a tick can tell whether it c
 _PW_ONCE = ""             # a password typed into Settings: used to mint once, never written
 _STARTED = False
 _PROV = 0                 # last time members, teams and projects were reconciled
+_PICKUP = threading.local()   # set while a turn was started by a Lucent task, so it files no second one
 
 # What a bot may reach through `lucent_api`. Everything Lucent offers a member, and nothing
 # that manages the workspace itself: no auth, no members, no teams, no reset.
@@ -182,7 +199,7 @@ def save_config(url, email, password):
     """Settings → Lucent. Connects on the spot: the password is used to mint a token here and
     is not written to disk, so the file never holds an admin's secret."""
     global _URL, _PW_ONCE
-    url = (url or "").strip().rstrip("/")
+    url = (url or DEFAULT_URL).strip().rstrip("/")
     if not re.match(r"^https?://[^\s/]+", url):
         return {"ok": False, "error": "Enter the Lucent address, starting with http:// or https://."}
     st = _state(); a = st.setdefault("admin", {})
@@ -387,15 +404,45 @@ def _sync_projects(a, boot):
 
 
 # ---------------------------------------------------------------- out of a room
-def on_delegate(room, bot, task):
-    """A Producer delegation. Queued, never sent from the turn's own thread."""
-    if _URL and room and bot and (task or "").strip():
-        _Q.put({"kind": "delegate", "room": room, "bot": bot, "task": task})
+def _short(text):
+    """A title is a label on a board, not the request: one line, at most TITLE_MAX, cut at a word
+    so it never ends mid-word. The full request lives in the description."""
+    s = " ".join((text or "").split())
+    if len(s) > TITLE_MAX:
+        cut = s[:TITLE_MAX]
+        s = cut[:cut.rfind(" ")] if " " in cut else cut
+    return s.rstrip(" ,.;:-") or "Task"
+
+
+def _summary(text):
+    """The first sentence of a request, short enough to be its title."""
+    line = " ".join((text or "").split())
+    for sep in (". ", "? ", "! ", "; "):
+        i = line.find(sep)
+        if 0 < i <= TITLE_MAX:
+            return _short(line[:i])
+    return _short(line)
+
+
+def brief():
+    """The board instructions for a bot's prompt — empty for a turn that already is a task, so a
+    picked-up task is not described as one the bot has just filed."""
+    if not _URL or getattr(_PICKUP, "on", False):
+        return ""
+    return BRIEF
+
+
+def on_work(room, bot, text):
+    """A bot is starting work. Every turn is a task on the board — a delegation, a message to a
+    room, a chat with one bot, a routine — because that is what makes Lucent the record of what
+    the team did. Queued, never sent from the turn's own thread: the turn must not wait on it."""
+    if _URL and bot and (text or "").strip() and not getattr(_PICKUP, "on", False):
+        _Q.put({"kind": "work", "room": room or "chat", "bot": bot, "task": text})
 
 
 def on_report(room, bot, text):
-    if _URL and room and bot and (text or "").strip():
-        _Q.put({"kind": "report", "room": room, "bot": bot, "text": text})
+    if _URL and bot and (text or "").strip():
+        _Q.put({"kind": "report", "room": room or "chat", "bot": bot, "text": text})
 
 
 def _handle(item):
@@ -404,14 +451,23 @@ def _handle(item):
     if not tok:
         return
     key = "%s/%s" % (item["room"], item["bot"])
-    if item["kind"] == "delegate":
+    if item["kind"] == "work":
+        tid = st["open"].get(key)
+        if tid:
+            # The last turn on this key never reported — a crash or a model error — so its task is
+            # still open. The new work goes in as a comment rather than orphaning it: a task left
+            # in_progress for good is a lie on the board.
+            code, _ = _call("POST", "/api/tasks/%s/comments" % tid,
+                            {"body": item["task"][:2000]}, token=tok)
+            if code < 400:
+                return
+            st["open"].pop(key, None)          # the task is gone from Lucent; file a fresh one
+        body = {"title": _summary(item["task"]),
+                "description": item["task"][:2000], "status": "in_progress"}
         pid = st["projects"].get(item["room"])
-        if not pid:
-            return
-        task = " ".join(item["task"].split())
-        code, obj = _call("POST", "/api/tasks",
-                          {"title": task[:160], "description": item["task"][:2000],
-                           "status": "in_progress", "project_id": pid}, token=tok)
+        if pid:
+            body["project_id"] = pid
+        code, obj = _call("POST", "/api/tasks", body, token=tok)
         if code == 201 and obj.get("id"):
             st["open"][key] = obj["id"]
             _save()
@@ -473,6 +529,7 @@ def _run_task(ch, bid, task, tok):
             "It is posted back to the task." % (task["id"], task.get("title") or "",
                                                 task.get("description") or ""))
     final = ""
+    _PICKUP.on = True                # this turn *is* a task already; filing another would double it
     try:
         for ev in _RUN_TURN("%s/%s" % (ch["id"], bid), text, _BOTS(), _SETTINGS(),
                             channel=ch, solo=bid, who="Lucent"):
@@ -482,6 +539,8 @@ def _run_task(ch, bid, task, tok):
                 final = final or ("error: " + (ev.get("msg") or ""))
     except Exception as e:
         final = "error: %s" % e
+    finally:
+        _PICKUP.on = False
     if final:
         _call("POST", "/api/tasks/%s/comments" % task["id"], {"body": final[:2000]}, token=tok)
     _call("PATCH", "/api/tasks/%s" % task["id"], {"status": "done"}, token=tok)
@@ -501,6 +560,10 @@ def api_tool(bid, method, path, body):
         p = "/api/" + p.lstrip("/")
     if not any(m == method and re.match(rx, p) for m, rx in ALLOW):
         return "(that Lucent route is not open to bots: %s %s)" % (method, p)
+    # A bot cannot put its whole request in a title: the board is a list of labels, so a long one
+    # is cut here rather than left to fill the page. The description is where the detail belongs.
+    if isinstance(body, dict) and isinstance(body.get("title"), str):
+        body = {**body, "title": _short(body["title"])}
     code, obj = _call(method, p, body, token=tok)
     out = json.dumps(obj, ensure_ascii=False)[:6000]
     return out if code < 400 else "HTTP %d %s" % (code, out)
@@ -510,9 +573,7 @@ def api_tool(bid, method, path, body):
 def start():
     global _URL, _STARTED
     st = _state()
-    _URL = (os.environ.get("LUCENT_URL") or st.get("url") or "").strip().rstrip("/")
-    if not _URL:
-        return False
+    _URL = (os.environ.get("LUCENT_URL") or st.get("url") or DEFAULT_URL).strip().rstrip("/")
     st["url"] = _URL
     try:
         _save()
