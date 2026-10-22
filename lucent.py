@@ -29,14 +29,17 @@ DEFAULT_URL = "https://lucent.vortex-freq.web.id"   # Settings may point elsewhe
 TITLE_MAX = 60            # a board title is a label; the request itself is the description
 
 # Told to a bot in the prompt of a turn the bridge filed a task for. The title and the dates are
-# the bot's to fill: only it knows what the job turned out to be and how long it will take.
+# the bot's to fill: only it knows what the job turned out to be and how long it will take. Today's
+# date is in the text because a model has no clock — asked for YYYY-MM-DD without it, the only
+# answer it can be sure of is none, and a task with no due date counts as late.
 BRIEF = (
     "\n\nYour turn is a task on the team's Lucent board: it was filed when you started, in this "
-    "room's project. Before you call `finish`, tidy it with `lucent_api`: GET "
-    "/api/tasks?assignee=me&status=in_progress finds it (the one whose description is the request "
-    "you were given), then PATCH /api/tasks/<id> with \"title\" — a summary of at most %d "
+    "room's project, due today. Today is %s. Before you call `finish`, tidy it with `lucent_api`: "
+    "GET /api/tasks?assignee=me&status=in_progress finds it (the one whose description is the "
+    "request you were given), then PATCH /api/tasks/<id> with \"title\" — a summary of at most %d "
     "characters, because the description already holds the full request — \"due_date\" as "
-    "YYYY-MM-DD, and \"estimate\" in hours. A task with no due date counts as late." % TITLE_MAX
+    "YYYY-MM-DD (keep today's unless the work runs past it) and \"estimate\" in hours as a number, "
+    "which is your call. A task with no due date counts as late."
 )
 
 DATA = ""
@@ -429,7 +432,7 @@ def brief():
     picked-up task is not described as one the bot has just filed."""
     if not _URL or getattr(_PICKUP, "on", False):
         return ""
-    return BRIEF
+    return BRIEF % (time.strftime("%Y-%m-%d, %A"), TITLE_MAX)
 
 
 def on_work(room, bot, text):
@@ -463,7 +466,10 @@ def _handle(item):
                 return
             st["open"].pop(key, None)          # the task is gone from Lucent; file a fresh one
         body = {"title": _summary(item["task"]),
-                "description": item["task"][:2000], "status": "in_progress"}
+                "description": item["task"][:2000], "status": "in_progress",
+                # Due the day it starts, so a task is never dateless and never counted late for a
+                # field the bot forgot. The brief asks the bot to correct it if the job runs longer.
+                "due_date": time.strftime("%Y-%m-%d")}
         pid = st["projects"].get(item["room"])
         if pid:
             body["project_id"] = pid

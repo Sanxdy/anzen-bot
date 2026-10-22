@@ -7,7 +7,7 @@ the module's own state.
 
 Run: python3 tests/test_lucent.py
 """
-import json, os, sys, tempfile, threading
+import json, os, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -215,6 +215,11 @@ def main():
           created and created[0]["body"]["title"] == "Write the parser for the invoice feed", created[:1])
     check("...and the description keeps the request whole",
           created and created[0]["body"]["description"] == long, created[:1])
+    # A bot has no clock, so a due date it invents is a guess and the safe guess is none — which
+    # Lucent counts as late. The task therefore carries the day it started, and the brief says
+    # which day that is.
+    check("a filed task is due the day it starts",
+          created and created[0]["body"].get("due_date") == time.strftime("%Y-%m-%d"), created[:1])
 
     # A title is a label, never a paragraph: cut at a word boundary, capped at TITLE_MAX, and
     # something rather than nothing when the request has no words at all.
@@ -229,6 +234,8 @@ def main():
     # The board brief rides in the bot's prompt — except on a turn that already is a task.
     check("the prompt carries the board rules", "%d" % lucent.TITLE_MAX in lucent.brief()
           and "due_date" in lucent.brief(), lucent.brief())
+    check("...and today's date, because the bot has no clock to read",
+          time.strftime("%Y-%m-%d") in lucent.brief(), lucent.brief())
     lucent._PICKUP.on = True
     check("a picked-up task is not told to file one", lucent.brief() == "")
     lucent._PICKUP.on = False
