@@ -3,7 +3,7 @@
 
 No router needed — server.chat is stubbed.  Usage:  python3 tests/test_memory.py
 """
-import os, sys, tempfile, base64
+import os, sys, tempfile, base64, json
 tmp = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = tmp                        # nothing may fall back to the real data dir
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -171,6 +171,20 @@ ok("imported bots default to the configured model", all(b["model"] == S.DEFAULT_
 ok("imported bots persist", [b["id"] for b in S.load_bots() if b["id"] in ("lea", "alex")] == ["lea", "alex"])
 ok("the imported room persists", any(c["id"] == "demo-room" for c in S.load_channels()))
 ok("an id collision gets a suffix", S.build_team(FIXTURE)[0][0]["id"] == "lea-2")
+# The id was always made unique; the name was not, so a second import drew two sidebar rows reading
+# "Lea" and the only way to tell them apart was which chat it opened. One more paste of the same
+# team, and one that names two of its own agents the same, must still leave every name distinct.
+S.build_team(FIXTURE); S.build_team(FIXTURE.replace("name: Alex", "name: Lea"))
+_names = [(b.get("name") or "").strip().lower() for b in S.load_bots()]
+ok("no import can bring a name the roster already has", len(_names) == len(set(_names)))
+# ...and a roster already written that way — the user's own, from before the rule — must load with
+# the duplicates apart rather than waiting for the next import to notice.
+_keep = S.load_bots()
+json.dump([{"id": "a", "name": "Nova"}, {"id": "b", "name": "nova"}, {"id": "c", "name": "Nova"}],
+          open(S.BOTS_PATH, "w"))
+_names = [(b.get("name") or "").strip().lower() for b in S.load_bots()]
+ok("a roster already holding duplicate names loads with them apart", len(_names) == len(set(_names)))
+S.save_bots(_keep)
 
 # --- team import: the structure we hand out is the structure we accept ---
 # The copy button hands out TEAM_TEMPLATE and the endpoint holds a paste to it, so the one thing that

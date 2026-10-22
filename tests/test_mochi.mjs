@@ -16,9 +16,24 @@ function fakeCtx() {
 const fakeCanvas = () => ({ width: 0, height: 0, clientWidth: 160, clientHeight: 160,
   getContext: () => fakeCtx(), getBoundingClientRect: () => ({ left: 0, top: 0, width: 160, height: 160 }) });
 
+/* A video element as far as the engine is concerned: no decoder, so `readyState` is the switch
+   between "the preset frame stands in" and "the clip draws", and listeners are fired by hand. */
+const videos = [];
+const fakeVideo = () => {
+  const el = { videoWidth: 512, videoHeight: 512, readyState: 0, paused: true, loop: true,
+    muted: false, playsInline: false, preload: "", currentTime: 0, src: "", _l: {},
+    addEventListener(t, f) { (this._l[t] || (this._l[t] = [])).push(f); },
+    setAttribute() {},
+    play() { this.paused = false; return Promise.resolve(); },
+    pause() { this.paused = true; },
+    fire(t) { for (const f of this._l[t] || []) f({ target: this }); } };
+  videos.push(el);
+  return el;
+};
+
 globalThis.window = { devicePixelRatio: 2, addEventListener() {} };
 
-const { speciesFor, SPECIES, EMOTIONS, STATES, Ease, MochiBot, eyeFrame, softLimit, OUTFITS, ACCESSORIES, textureFor } = await import("../mochi.js");
+const { speciesFor, SPECIES, EMOTIONS, STATES, Ease, MochiBot, eyeFrame, softLimit, OUTFITS, ACCESSORIES, textureFor, presetFrame, presetTextureFor, PRESET_FRAMES } = await import("../mochi.js");
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = "") => {
@@ -212,6 +227,22 @@ console.log("\n-- poke --");
   const d = mk();
   d.poke(); d.t += 6; d.poke();
   ok("the count lapses, so a poke much later is a jolt again", d._pokeFrame === "p1", d._pokeFrame);
+}
+
+console.log("\n-- a poke's feeling wears off --");
+{
+  /* The poke sets its own emotion, and the idle mood drift that would take it back only runs in
+     `idle` — so a bot poked while working stayed excited for the rest of the turn. */
+  const b = mk({ state: "working" });
+  b.poke();
+  ok("a poke overrides the state's feeling", b.emotion === "excited", b.emotion);
+  run(b, 40);
+  ok("...and the state's feeling comes back when the poke fades", b.emotion === "focused", b.emotion);
+  const c = mk({ state: "thinking" });
+  c.poke(); c.t += 0.5; c.poke();
+  ok("an annoyed poke is angry", c.emotion === "angry", c.emotion);
+  run(c, 60);
+  ok("...and wears off to the state's feeling", c.emotion === "curious", c.emotion);
 }
 
 console.log("\n-- easing --");
@@ -579,6 +610,22 @@ console.log("\n-- colour grading --");
      !withPic.includes(INK) && !withPic.includes("#EDEDEF") && !withPic.includes("#C4C5CA"),
      JSON.stringify(withPic.slice(0, 10)));
   ok("nothing is dressed on a face picture", !withPic.some(inkish), JSON.stringify(withPic.slice(0, 8)));
+  /* A picture fills the box, so the props drawn round a body — thought bubble, magnifier, hand,
+     desk — would land on the photo. The desk is the only thing on that path that builds a gradient. */
+  const picLog = st => {
+    const log = [];
+    const b = new MochiBot(recCanvas(log), st, { species: "mochi", size: 160, image: pic });
+    b.tick(0.05); b.draw();
+    return log;
+  };
+  ok("a picture gets no scene props over it",
+     ["thinking", "searching", "approval", "working"].every(st =>
+       !picLog(st).some(v => v === "#EDEDF2" || v === "lin" || v === "rad")),
+     JSON.stringify(picLog("thinking").slice(0, 10)));
+  ok("a drawn bot still gets its props",
+     (() => { const log = [];
+       const b = new MochiBot(recCanvas(log), "thinking", { species: "mochi", size: 160 });
+       b.tick(0.05); b.draw(); return log.includes("#EDEDF2"); })());
   ok("without a picture the bot still draws its own face", wears({}).includes(INK));
   /* ---- the blink is a second drawing, cross-faded over the first ----
      The engine's `open` channel drives the fade, so a blink lands on the same frame the drawn eyes
@@ -631,6 +678,334 @@ console.log("\n-- colour grading --");
        b.skin("mochi", null, null);
        return b.preset === "" && b.image === "" && b.imageClosed === "" &&
               b.outfit === "" && b.accessory === ""; })());
+}
+
+console.log("\n-- preset frame dissolve --");
+{
+  /* A preset is stills on a clock, so every swap used to be a cut. While `_fade` runs, the outgoing
+     frame is drawn under the incoming one at complementary alpha; once it lands, one draw only. */
+  const shot = () => {
+    const imgs = [];
+    const ctx = {
+      a: 1, save() {}, restore() {},
+      get globalAlpha() { return this.a; }, set globalAlpha(v) { this.a = v; },
+      drawImage(cv) { imgs.push([cv, this.a]); },
+    };
+    return { ctx, imgs };
+  };
+  const b = mk({ preset: "cat" });
+  const A = { width: 1024, height: 1024 }, B = { width: 1024, height: 1024 };
+  b._facePrev = A; b._faceCur = B; b._fade = 0.5;
+  let { ctx, imgs } = shot();
+  b._facePic(ctx, B);
+  ok("a dissolving frame draws the old one under the new",
+     imgs.length === 2 && imgs[0][0] === A && imgs[0][1] === 0.5 && imgs[1][0] === B && imgs[1][1] === 0.5,
+     JSON.stringify(imgs.map(i => i[1])));
+  ({ ctx, imgs } = shot());
+  b._fade = 1;
+  b._facePic(ctx, B);
+  ok("a settled frame draws once", imgs.length === 1 && imgs[0][0] === B);
+  /* The fade is timed in seconds, not frames: at 60fps it lands in ~8 ticks, at 10fps in ~2. */
+  b._fade = 0;
+  for (let i = 0; i < 9; i++) b.tick(1 / 60);
+  ok("the dissolve lands in about 0.14s", b._fade === 1, String(b._fade));
+}
+
+console.log("\n-- preset textures are sized to the canvas --");
+{
+  /* The size used to be rounded up to a power of two, so a 210px panel at 2x (420) and a 104px dock
+     at 3x (312) both spent a 512 texture — a megabyte a frame, twenty-one frames a character. */
+  const u = "/api/preset/sizer/base.webp";
+  ok("a 2x 210px panel and a 3x 104px dock get their own textures",
+     presetTextureFor(u, 420) !== presetTextureFor(u, 312));
+  ok("the same size is decoded once", presetTextureFor(u, 420) === presetTextureFor(u, 420));
+  ok("the size is capped, not rounded up", presetTextureFor(u, 512) === presetTextureFor(u, 900));
+  ok("a preset frame still names a shipped frame",
+     PRESET_FRAMES.includes(presetFrame("finished", 1, 0, 1)), presetFrame("finished", 1, 0, 1));
+  /* No decoded frame (no document here) must fall back to the bot's drawn self, not an empty box. */
+  const b = mk({ preset: "cat" });
+  let threw = null; try { b.tick(0.05); b.draw(); } catch (e) { threw = e.message; }
+  ok("a preset with no decoded frame still draws the bot", !threw && b._presetFace() === null, threw || "");
+}
+
+console.log("\n-- clips --");
+{
+  /* Muse's trick: a preset that also ships clips plays them, and keeps its frames wherever the clip
+     set has nothing. The DOM here is a stub, so `readyState` is the only readiness signal. */
+  const realDoc = globalThis.document, realImg = globalThis.Image;
+  globalThis.document = {
+    createElement: tag => tag === "video" ? fakeVideo() : { width: 0, height: 0, getContext: () => ({ drawImage() {} }) },
+    addEventListener() {},
+  };
+  globalThis.Image = class { set src(u) { this.onload && this.onload(); } get width() { return 512; } get height() { return 512; } };
+  const recCanvas = imgs => ({ width: 0, height: 0, clientWidth: 160, clientHeight: 160,
+    getContext: () => new Proxy({}, {
+      get(t, k) {
+        if (k in t) return t[k];
+        if (k === "drawImage") return (cv, x, y, w, h) => imgs.push({ cv, x, y, w, h });
+        if (k === "createLinearGradient" || k === "createRadialGradient") return () => ({ addColorStop() {} });
+        return () => {};
+      },
+      set(t, k, v) { t[k] = v; return true; },
+    }),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 160, height: 160 }) });
+
+  /* With no clips the engine is exactly what it was: no video is made, nothing is drawn from one. */
+  const made = videos.length;
+  const none = mk({ preset: "cat" });
+  run(none, 5);
+  ok("with no clips the engine makes no video at all",
+     videos.length === made && none._clipFace() === null && none._clipEl === null, String(videos.length - made));
+
+  /* Which clip a state wears. */
+  const CLIPS = { idle: "/api/clip/x/idle.webm", working: "/api/clip/x/working.webm",
+                  celebrate: "/api/clip/x/milestone-confetti.webm" };
+  const b = mk({ preset: "cat", clips: CLIPS });
+  ok("idle plays the idle clip", b._clipUrl() === CLIPS.idle, b._clipUrl());
+  b.setState("working");
+  ok("a state with its own clip plays that one", b._clipUrl() === CLIPS.working, b._clipUrl());
+  b.setState("bored");
+  ok("a resting state with no clip borrows idle", b._clipUrl() === CLIPS.idle, b._clipUrl());
+  b.setState("thinking");
+  ok("a working state with no clip plays nothing, so its frames stay", b._clipUrl() === "", b._clipUrl());
+  b.setState("idle");
+
+  /* Not decoded, the frame stands in; decoded, the clip is the face. */
+  b.tick(0.05);
+  const vid = b._clipEl;
+  ok("a clip that has not decoded is not drawn, but is on its way", !!vid && b._clipFace() === null);
+  vid.readyState = 2;
+  ok("a decoded clip is the face", b._clipFace() === vid);
+
+  const imgs = [];
+  const cb = new MochiBot(recCanvas(imgs), "idle", { preset: "cat", size: 160, clips: CLIPS });
+  cb.tick(0.05);
+  cb._clipEl.readyState = 2;
+  imgs.length = 0;
+  cb.draw();
+  const frame = imgs.find(i => i.cv === cb._clipEl);
+  ok("a clip is drawn in the preset frame's own box",
+     !!frame && Math.abs(frame.w - 160 * 0.96) < 1e-9 && Math.abs(frame.h - 160 * 0.96) < 1e-9,
+     JSON.stringify(imgs));
+  ok("...and drawing does not pause it", cb._clipEl.paused === false);
+
+  /* A clip that cannot load is dead for the session: no retry, no second request, no noise. */
+  const dead = mk({ clips: { idle: "/api/clip/x/error.webm" } });
+  dead.tick(0.05);
+  const before = videos.length;
+  dead._clipEl.fire("error");
+  dead.tick(0.05); dead.draw(); dead.tick(0.05);
+  ok("a clip that fails to load is marked dead", dead._vids.get("/api/clip/x/error.webm").dead === true);
+  ok("...and is never requested again", videos.length === before && dead._clipFace() === null,
+     videos.length + " vs " + before);
+
+  /* One-shot milestones. */
+  const p = mk({ preset: "cat", clips: CLIPS });
+  const vids = videos.length;
+  p.playOnce("nothing-shipped");
+  ok("playOnce with no such clip is a silent no-op",
+     p._onceUrl === "" && p._clipEl === null && videos.length === vids, p._onceUrl);
+  p.tick(0.05);
+  const idleVid = p._clipEl;
+  idleVid.readyState = 2;
+  p.playOnce("celebrate");
+  const onceVid = p._onceEl;
+  ok("playOnce plays its clip once", !!onceVid && onceVid !== idleVid && onceVid.loop === false &&
+     p._clipUrl() === CLIPS.celebrate, String(onceVid && onceVid.loop));
+  ok("...over the state's clip, paused underneath", idleVid.paused === true);
+  onceVid.readyState = 2;
+  ok("...and the one-shot is what the face draws", p._clipFace() === onceVid);
+  onceVid.fire("ended");
+  ok("...then hands back to the state", p._onceUrl === "" && p._clipUrl() === CLIPS.idle &&
+     onceVid.loop === true && idleVid.paused === false && p._clipFace() === idleVid);
+
+  /* Cost: nothing decodes for a face nobody draws or a tab nobody sees. */
+  p._pauseClip();
+  ok("a culled face pauses its clip", idleVid.paused === true);
+  p.tick(0.05);
+  ok("...and the next tick resumes it", idleVid.paused === false);
+  p._hidden = true; p._syncClip();
+  ok("a hidden tab pauses the clip", idleVid.paused === true);
+  p._hidden = false; p._syncClip();
+  ok("...and showing the tab again resumes it", idleVid.paused === false);
+
+  /* A re-skin swaps the clip set with the face; a re-skin with none clears it. */
+  p.skin("mochi", null, { preset: "cat" });
+  ok("a re-skin with no clips clears the set and drops the videos",
+     Object.keys(p.clips).length === 0 && p._clipEl === null && p._vids.size === 0 && idleVid.paused === true);
+  /* The same set again is not a change: the dock is re-skinned on every redraw, and rebuilding the
+     videos there restarted the clip each time the sidebar repainted. */
+  p.skin("mochi", null, { preset: "cat" }, CLIPS);
+  p.tick(0.05);
+  const kept = p._clipEl; kept.readyState = 2; kept.paused = false;
+  p.skin("mochi", null, { preset: "cat" }, CLIPS);
+  ok("a re-skin with the same clips keeps the video running",
+     p._clipEl === kept && kept.paused === false && p._vids.size === 1,
+     String(p._clipEl === kept) + " " + kept.paused + " " + p._vids.size);
+
+  globalThis.document = realDoc; globalThis.Image = realImg;
+}
+
+console.log("\n-- the silhouette is traced once --");
+{
+  /* Path2D is not in Node, so the engine runs its fallback tracer here. Stub one to check that the
+     cached path is the same silhouette the fallback traces, and that a still body traces it once. */
+  const PATH = ["moveTo", "lineTo", "arc", "arcTo", "ellipse", "bezierCurveTo", "quadraticCurveTo", "closePath"];
+  const recorder = () => {
+    const log = [];
+    const ctx = new Proxy({}, {
+      get(t, k) {
+        if (k in t) return t[k];
+        if (PATH.includes(k)) return (...a) => log.push(k);
+        if (k === "fill" || k === "clip") return () => log.push("mark");
+        if (k === "createLinearGradient" || k === "createRadialGradient") return () => ({ addColorStop() {} });
+        return () => {};
+      },
+      set(t, k, v) { t[k] = v; return true; },
+    });
+    const cv = { width: 0, height: 0, clientWidth: 160, clientHeight: 160, getContext: () => ctx,
+                 getBoundingClientRect: () => ({ left: 0, top: 0, width: 160, height: 160 }) };
+    return { log, cv };
+  };
+  const fallback = recorder();
+  new MochiBot(fallback.cv, "idle", { species: "mochi", size: 160 }).draw();
+  const oneTrace = fallback.log.slice(0, fallback.log.indexOf("mark"));   // up to the glow's fill
+  ok("the fallback traces the silhouette into the context", oneTrace.length > 10, String(oneTrace.length));
+
+  const realPath = globalThis.Path2D, made = [];
+  globalThis.Path2D = class { constructor() { this.ops = []; made.push(this); } };
+  for (const k of PATH) globalThis.Path2D.prototype[k] = function () { this.ops.push(k); };
+  const cached = recorder();
+  const b = new MochiBot(cached.cv, "idle", { species: "mochi", size: 160 });
+  for (let i = 0; i < 3; i++) b.draw();
+  ok("one Path2D is built for a still body's whole life", made.length === 1, String(made.length));
+  ok("...carrying exactly the path the fallback traces",
+     made[0].ops.join() === oneTrace.join(), made[0].ops.length + " vs " + oneTrace.length);
+  /* The eyes and mouth still trace their own paths into the context; the body's squircle is the
+     only thing in this draw that uses lineTo, so its absence means the body was never re-traced. */
+  ok("...and the context never traces the body again", !cached.log.includes("lineTo"), cached.log.join());
+  const blobRec = recorder();
+  const blob = new MochiBot(blobRec.cv, "idle", { species: "blob", size: 160 });
+  const beforeBlob = made.length;
+  blob.draw(); blob.draw();
+  ok("the blob's breathing outline is rebuilt, not cached",
+     made.length - beforeBlob > 2, String(made.length - beforeBlob));
+  globalThis.Path2D = realPath;
+  const plain = recorder();
+  let threw = null;
+  try { new MochiBot(plain.cv, "idle", { species: "mochi", size: 160 }).draw(); } catch (e) { threw = e.message; }
+  ok("without Path2D the fallback still draws", !threw, threw || "");
+}
+
+console.log("\n-- body gradients are built once --");
+{
+  /* Four gradients a frame was the cost of every procedural repaint, for values that never move
+     between frames. The key is size + colours + the state's glow, so only a re-skin rebuilds them. */
+  let made = 0;
+  const ctx = new Proxy({}, {
+    get(t, k) {
+      if (k in t) return t[k];
+      if (k === "createLinearGradient" || k === "createRadialGradient")
+        return () => { made++; return { addColorStop() {} }; };
+      return () => {};
+    },
+    set(t, k, v) { t[k] = v; return true; },
+  });
+  const cv = { width: 0, height: 0, clientWidth: 160, clientHeight: 160,
+    getContext: () => ctx, getBoundingClientRect: () => ({ left: 0, top: 0, width: 160, height: 160 }) };
+  const b = new MochiBot(cv, "idle", { species: "mochi", size: 160 });
+  b.draw();
+  const first = made;                      // one build: body, tint, shade, highlight, desk
+  for (let i = 0; i < 30; i++) b.draw();
+  ok("a repainted body allocates no gradients after its first frame", made === first, first + " then " + made);
+  b.setState("working");
+  b.draw();
+  ok("a state change rebuilds once, for the new glow", made === first * 2, first + " -> " + made);
+  b.skin("mochi", { bodyTop: "#111111", bodyBottom: "#222222" }, null);
+  b.draw(); b.draw();
+  ok("a re-skin rebuilds once, then settles", made === first * 3, first + " -> " + made);
+}
+
+console.log("\n-- waiting on a teammate --");
+{
+  ok("the waiting state exists and says so",
+     !!STATES.waiting && /teammate/.test(STATES.waiting.label), STATES.waiting && STATES.waiting.label);
+  const b = mk();
+  b.setState("waiting", true);
+  const yaw = [];
+  for (let i = 0; i < 60; i++) { b.tick(0.1); yaw.push(b._targetYaw); }
+  /* Six seconds at 0.75 rad/s is most of one full sweep, so both sides have to be reached. */
+  ok("waiting looks left and right", Math.max(...yaw) > 0.3 && Math.min(...yaw) < -0.3,
+     Math.min(...yaw).toFixed(2) + ".." + Math.max(...yaw).toFixed(2));
+  ok("...level, not up like thinking", Math.abs(b._targetPitch) < 0.1, String(b._targetPitch));
+  /* A preset head is a picture: the gaze moves nothing, so waiting would look exactly like idle.
+     The sweep is 0.9 rad/s, so a full period takes 7s — nine seconds covers both sides. */
+  const p = mk({ preset: "cat" }); p.setState("waiting", true);
+  const tilt = [];
+  for (let i = 0; i < 90; i++) { p.tick(0.1); tilt.push(p.tilt); }
+  ok("a preset waiting tilts its head instead", Math.max(...tilt) > 0.02 && Math.min(...tilt) < -0.02,
+     Math.min(...tilt).toFixed(3) + ".." + Math.max(...tilt).toFixed(3));
+  const idle = mk({ preset: "cat" }); const still = [];
+  for (let i = 0; i < 40; i++) { idle.tick(0.1); still.push(Math.abs(idle.tilt)); }
+  ok("...and an idle preset does not", Math.max(...still) < 0.005, String(Math.max(...still)));
+}
+
+console.log("\n-- a finish throws confetti --");
+{
+  const b = mk();
+  b.setState("finished");
+  const burst = b.parts.filter(p => p.b);
+  ok("a finish throws a burst", burst.length >= 20, String(burst.length));
+  ok("...in every direction, not one cone",
+     new Set(burst.map(p => Math.sign(p.vx))).size === 2 && burst.some(p => p.vy > 0) && burst.some(p => p.vy < 0));
+  for (let i = 0; i < 20; i++) b.tick(0.05);
+  ok("...and it is gone inside a second", b.parts.filter(p => p.b).length === 0,
+     String(b.parts.filter(p => p.b).length));
+  /* A preset head fills its box and carries its own expression, so idle sparkles would land on its
+     face. A burst is thrown outward from the head, so that one is drawn. */
+  const counter = () => { let n = 0; const ctx = new Proxy({}, {
+    get: (t, k) => k === "save" ? () => n++ : () => {}, set: () => true }); return { ctx, n: () => n }; };
+  const p = mk({ preset: "cat" });
+  p.parts = [{ k: "star", x: 0, y: 0, vy: 0, a: 1, s: 1 }];
+  let c = counter(); p._parts(c.ctx, 0, 0);
+  ok("a preset draws no idle sparkles over its face", c.n() === 0, String(c.n()));
+  p.parts.push({ k: "star", b: 1, x: 0, y: 0, vx: 1, vy: 0, a: 1, s: 1 });
+  c = counter(); p._parts(c.ctx, 0, 0);
+  ok("...but the finish's burst is drawn round it", c.n() === 1, String(c.n()));
+  /* The sidebar holds `finished` for 3.2s, so a second turn can finish inside that window and
+     re-assert the same state. That is a second piece of news: another burst, another roll. */
+  const again = mk();
+  again.setState("finished");
+  for (let i = 0; i < 20; i++) again.tick(0.05);         // the first burst has aged out
+  const before = again.parts.filter(q => q.b).length;
+  again.setState("finished");
+  ok("a finish re-asserted inside the hold throws a second burst",
+     before === 0 && again.parts.filter(q => q.b).length >= 20,
+     before + " -> " + again.parts.filter(q => q.b).length);
+  ok("...and rolls again", again.locks.has("roll"), [...again.locks].join(","));
+}
+
+console.log("\n-- reduced motion --");
+{
+  /* `ti` is frozen at 0 under reduced motion, and the blink window `ti % 3.7 < 0.22` is open at 0 —
+     so a second copy of the module, imported with the query the media query answers, is what proves
+     a working preset does not wear the blink frame for the whole turn. */
+  globalThis.matchMedia = () => ({ matches: true });
+  globalThis.document = { addEventListener() {}, createElement: () => fakeVideo() };
+  const { presetFrame: reducedFrame, MochiBot: ReducedBot } = await import("../mochi.js?reduced");
+  ok("a working preset is not stuck mid-blink when motion is reduced",
+     reducedFrame("working", 0, 0, 1) !== "work-closed", reducedFrame("working", 0, 0, 1));
+  ok("...and an ordinary one still blinks", presetFrame("working", 0, 0, 1) === "work-closed");
+  /* A clip is motion, so reduced motion never plays one: not the state's, not a milestone. */
+  const rv = videos.length;
+  const rb = new ReducedBot(fakeCanvas(), "idle",
+    { clips: { idle: "/api/clip/x/idle.webm", celebrate: "/api/clip/x/milestone-confetti.webm" } });
+  rb.playOnce("celebrate");
+  rb.tick(0.05);
+  ok("reduced motion plays no clip at all",
+     rb._onceUrl === "" && rb._clipEl === null && rb._clipFace() === null && videos.length === rv,
+     rb._clipUrl());
+  delete globalThis.matchMedia; delete globalThis.document;
 }
 
 console.log("\n" + pass + " passed, " + fail + " failed\n");

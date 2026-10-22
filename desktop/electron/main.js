@@ -56,6 +56,7 @@ function socketPath() {
 // ------------------------------------------------------------------ the backend sidecar
 let backend = null;
 let SOCK = null;
+let started = false;         // startup is over: a window is (or was) open, so activate may reopen one
 
 function startBackend(sock) {
   const { cmd, args } = backendCommand(sock);
@@ -65,6 +66,12 @@ function startBackend(sock) {
   });
   backend.stdout.on('data', d => process.stdout.write('[backend] ' + d));
   backend.stderr.on('data', d => process.stderr.write('[backend] ' + d));
+  // A missing python, a bad ANZEN_PYTHON or a quarantined binary fails asynchronously; without this
+  // listener that is an uncaught exception, and `backend` stays set so waitForBackend polls a corpse.
+  backend.on('error', e => {
+    console.error('[backend] failed to start: ' + e.message);
+    backend = null;                   // same effect as exit, so waitForBackend rejects at once
+  });
   backend.on('exit', (code, sig) => {
     console.error(`[backend] exited code=${code} signal=${sig}`);
     backend = null;
@@ -187,22 +194,51 @@ function openWindow() {
 }
 
 // ------------------------------------------------------------------ run
-app.whenReady().then(async () => {
-  SOCK = socketPath();
-  try { fs.rmSync(SOCK, { force: true }); } catch { /* nothing to clear */ }
-  startBackend(SOCK);
-  try {
-    await waitForBackend(SOCK);
-  } catch (e) {
-    console.error('the backend did not start: ' + e.message);
-  }
-  openWindow();
-});
+// One shell at a time: a second launch clears the socket the first backend is bound to, and every
+// request in the first window fails. Taken before `whenReady`, so a losing launch never spawns one.
+const locked = app.requestSingleInstanceLock();
+if (!locked) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const [win] = BrowserWindow.getAllWindows();
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  });
+  app.whenReady().then(async () => {
+    SOCK = socketPath();
+    try { fs.rmSync(SOCK, { force: true }); } catch { /* nothing to clear */ }
+    startBackend(SOCK);
+    try {
+      await waitForBackend(SOCK);
+    } catch (e) {
+      console.error('the backend did not start: ' + e.message);
+    }
+    started = true;
+    openWindow();
+  });
+}
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) openWindow(); });
+app.on('activate', () => {
+  // macOS activates a fresh launch before the awaited backend is ready. Opening a window then shows
+  // an app whose every fetch fails — and the ready handler above opens a second window beside it.
+  if (started && BrowserWindow.getAllWindows().length === 0) openWindow();
+});
 app.on('before-quit', () => {
   // The window closing is what ends the app, and the backend goes with it rather than lingering as
   // an orphan holding the socket.
-  if (backend) { backend.kill('SIGTERM'); backend = null; }
+  if (!backend) return;
+  const pid = backend.pid;
+  if (process.platform === 'win32' && pid) {
+    // The frozen backend is a one-file PyInstaller binary: the process spawned here is a bootloader
+    // that runs the real backend as its own child, so terminating the bootloader would leave that
+    // child alive holding the socket. The whole tree goes — before the bootloader is gone, or there
+    // is no tree left to walk.
+    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
+  } else {
+    backend.kill('SIGTERM');
+  }
+  backend = null;
 });

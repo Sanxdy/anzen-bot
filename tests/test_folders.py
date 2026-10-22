@@ -22,6 +22,7 @@ S.SESS_PATH = os.path.join(tmp, "sessions.json")   # run_agent writes sessions; 
 S.LOGDIR = os.path.join(tmp, "logs"); os.makedirs(S.LOGDIR)
 S.TOKEN_PATH = os.path.join(tmp, "access_token")   # lan_token() mints here, never in the real data dir
 S.LAN_MARK = os.path.join(tmp, "lan")              # the LAN switch writes here, never in the real data dir
+S.LAN = os.path.exists(S.LAN_MARK)                 # the import already read the real dir; this suite's is empty
 # Tripwire: if the redirects above are ever dropped, fail loudly instead of overwriting
 # the real roster (which is exactly how data/bots.json once got emptied).
 assert S.BOTS_PATH.startswith(tmp) and S.CH_PATH.startswith(tmp), "test paths must point into tmp"

@@ -239,10 +239,13 @@ def app_env(data, stub_url, selftest=False):
 
 
 def launch(exe, data, stub_url, log, selftest=False):
+    # Its own Electron profile, so the one-shell-at-a-time lock does not make the test app quit
+    # whenever the real app happens to be open on this Mac. The socket is under DATA_DIR, not here.
+    own = ["--user-data-dir=" + os.path.join(data, "electron")]
     if exe is None:                       # run the shell out of the repo
-        cmd, cwd = ["npx", "electron", "."], os.path.join(ROOT, "desktop", "electron")
+        cmd, cwd = ["npx", "electron", "."] + own, os.path.join(ROOT, "desktop", "electron")
     else:
-        cmd, cwd = [exe], None
+        cmd, cwd = [exe] + own, None
     fh = open(log, "wb")
     return subprocess.Popen(cmd, cwd=cwd, env=app_env(data, stub_url, selftest),
                             stdout=fh, stderr=subprocess.STDOUT)
@@ -452,6 +455,10 @@ def main():
             cs = ui.get("chatScroll") or {}
             check("the chat list is capped and scrolls on its own",
                   cs.get("overflowY") == "auto" and cs.get("capped") is True, json.dumps(cs)[:200])
+            # The hover pills are laid out even while invisible, so one anchored outward used to give
+            # the whole panel a horizontal scrollbar with nothing ever shown outside it.
+            check("the transcript has no horizontal scroll",
+                  ui.get("hscroll") == 0, json.dumps(ui)[:200])
             check("the tool the turn ran is a row of its own",
                   ui.get("toolRows", 0) >= 1, json.dumps(ui)[:300])
             check("a tool row stays folded until it is asked for",

@@ -22,10 +22,12 @@ const ok = (name, cond, extra = "") => {
    uses; `Response` is only ever asked for `error()`, which is the marker a fallback must not be. */
 const listeners = {};
 const added = new Set(), put = [];
+let skipped = 0, addFails = null;
 const store = new Map();
 const cache = {
-  add: f => { added.add(f); return Promise.resolve(); },
+  add: f => { if (f === addFails) return Promise.reject(new Error("404")); added.add(f); return Promise.resolve(); },
   put: (req, res) => { put.push([req, res]); return Promise.resolve(); },
+  match: f => Promise.resolve(added.has(f) ? { marker: f } : null),
 };
 const caches = {
   open: () => Promise.resolve(cache),
@@ -37,7 +39,7 @@ const RESPONSE_ERROR = { marker: "Response.error()" };
 const Response = { error: () => RESPONSE_ERROR };
 const self = {
   addEventListener: (t, fn) => { listeners[t] = fn; },
-  skipWaiting: () => Promise.resolve(), clients: { claim: () => Promise.resolve() },
+  skipWaiting: () => { skipped++; return Promise.resolve(); }, clients: { claim: () => Promise.resolve() },
 };
 let fetchImpl = async () => { throw new Error("offline"); };
 const fetchStub = (...a) => fetchImpl(...a);
@@ -59,6 +61,16 @@ console.log("\n-- install caches the shell --");
   ok("./bridge.js is in the shell list", added.has("./bridge.js"), [...added].join(","));
   ok("./index.html is in the shell list", added.has("./index.html"));
   ok("./app.js is in the shell list", added.has("./app.js"));
+  ok("a complete shell takes over", skipped === 1, String(skipped));
+}
+
+console.log("\n-- an incomplete install does not take over --");
+{
+  added.clear(); addFails = "./sound.js";
+  const before = skipped;
+  let wait = null; install({ waitUntil: p => { wait = p; } }); await wait;
+  ok("one shell file that fails to cache keeps the old worker in charge", skipped === before, String(skipped));
+  addFails = null;
 }
 
 console.log("\n-- only a real, same-origin 200 is cached --");

@@ -182,6 +182,30 @@ const lift = (hex, k) => { const n = parseInt(hex.slice(1), 16);
     .map(v => Math.round(v + (255 - v) * k).toString(16).padStart(2, "0")).join(""); };
 function bigFace(color) { const c = AV[color] || AV.blue; return { bodyTop: lift(c, 0.44), bodyBottom: lift(c, 0.08) }; }
 const faceOf = b => (b && b.face && SPECIES[b.face]) ? b.face : speciesFor(b && b.id);
+/* A face may ship short videos for its states — idle, working, and the two celebrations. The server
+   lists what a face has; none at all is the normal case, and the face then draws frames as before.
+   Asked once per face and kept for the session. Only the corner face and the panel's placeholder
+   play them: a sidebar of twenty rows each decoding a video is a lot of work for a 52 px picture. */
+const NO_CLIPS = Object.freeze({});
+const CLIPS = {};
+function clipsFor(id) {
+  if (!id) return NO_CLIPS;
+  if (CLIPS[id]) return CLIPS[id];
+  CLIPS[id] = NO_CLIPS;                           // in flight: a second call must not ask again
+  get("/api/clips/" + encodeURIComponent(id)).then(d => {
+    if (!d || !d.clips) return;
+    CLIPS[id] = d.clips;
+    /* Landed after the chat that asked moved on, so only a face still wearing this set takes it.
+       Assigned rather than re-skinned: a re-skin resets the dissolve mid-turn. */
+    for (const f of [S.dock, S.compFace])
+      if (f && f._clipKey === id) { f.clips = d.clips; f._clipSet = d.clips; }
+  }).catch(() => {});
+  return NO_CLIPS;
+}
+/* Which set a face plays. A preset has its own; the drawn mascot — the face of every room and every
+   bot with no preset — has one shared set called `mochi`. A bot with a picture of its own gets none:
+   a clip is a whole character and would replace the picture the user chose. */
+const clipKeyFor = b => (b && b.preset) || (b && lookOf(b).image ? "" : "mochi");
 /* A row's face outlives the list it sits in. The sidebar and the chat list both rebuild from scratch
    on every redraw, and a new canvas each time restarted the drawing — a face that blinked and popped
    back whenever the window had been idle and re-read the config. The canvas and its MochiBot are kept
@@ -395,6 +419,9 @@ function mdToHtml(text, escaped) {
 const S = { bots: [], channels: [], models: [], settings: {}, skills: [], routines: [], fontSizes: [],
   active: null, activeIsChannel: false, approval: "ask", approvalSet: false, approvalOwn: null,
   dock: null, pending: {},
+  /* A failure the server never heard about — the turn never reached it — has no row in the transcript
+     to come back to, so its notice is kept here per chat and drawn again on every redraw. */
+  failNotes: {},
   /* `turns` holds what each chat's in-flight turn has drawn so far, keyed by chat — and `running`
      on one of them is that chat's own state, not the app's. Two chats work at once; a turn in one
      never holds up another. Switching chats keeps those nodes instead of destroying them, so the
@@ -402,6 +429,9 @@ const S = { bots: [], channels: [], models: [], settings: {}, skills: [], routin
      typed while *that same* chat's turn was already running, keyed by chat, so one chat's backlog
      never runs in another. */
   turns: {}, queue: {}, ctxSess: null, sideMochi: {}, chatMochi: {}, facePrev: null, compFace: null,
+  /* Row key -> the chat whose turn is using the browser. Set from the tool event, cleared when that
+     turn ends: a badge left behind would say the bot is still on a page it has left. */
+  browsing: {},
   /* The files panel's own place: the directory being shown, relative to the chat's repo root, the
      root itself (the absolute path a copy needs), the apps the "Open with" submenu offers, and which
      chat the directory belongs to — a path browsed in one repo is not a path in another. */
@@ -412,13 +442,29 @@ const S = { bots: [], channels: [], models: [], settings: {}, skills: [], routin
   messages: [], chats: [], chatQuery: "",
   /* The message you are quoting, waiting for you to send: `{who, text}`. It belongs to the chat it
      was started in, so switching chats drops it rather than carrying a quote into another one. */
-  reply: null };
+  reply: null,
+  /* Half-typed text per chat id — see `draftSwap`. */
+  drafts: {} };
 
 /* ---------------- mascot dock ---------------- */
 let dockReal = "idle", tipTimer = null;
+/* Who the corner is wearing, and what it is doing — the bubble over the face says both, because the
+   face itself can only say the second. A room has no single face, so it keeps the plain Mochi, the
+   same rule `dockFace` follows. */
+const dockWho = () => (S.activeIsChannel || !S.active) ? "Mochi" : NAME(S.active);
+const dockTipText = () => dockWho() + " · " + (STATES_LABEL[dockReal] || dockReal);
+/* A mood gets a moment on screen before it can be replaced. A turn steps working → thinking →
+   working several times a second, and each swap cut the face mid-dissolve, so the corner read as
+   twitching rather than as thinking. A state that is news rather than a working phase skips the
+   wait — an approval a second late is worse than a cut, and a finish that queued behind the idle
+   that follows it would never be seen at all. */
+const DOCK_HOLD = 1000, DOCK_AT_ONCE = new Set(["approval", "error", "question", "finished", "ratelimit"]);
+/* -1e9: nothing has been shown yet, so the first state of the session is not held — the page clock
+   starts near zero and a hold measured from it would delay the very first thing the dock says. */
+let dockShownAt = -1e9, dockNext = "", dockTimer = 0;
 const STATES_LABEL = { idle:"idle", working:"working at the desk", thinking:"thinking…", searching:"searching…",
-  approval:"needs your approval", question:"asking", finished:"done!", error:"error", sleeping:"sleeping",
-  ratelimit:"rate limited", dizzy:"dizzy", bored:"bored" };
+  approval:"needs your approval", question:"asking", waiting:"waiting on a teammate", finished:"done!",
+  error:"error", sleeping:"sleeping", ratelimit:"rate limited", dizzy:"dizzy", bored:"bored" };
 /* The header and the dock must never disagree about what a chat is doing, so both read one table. The
    header drops the dock's whimsy — it is a status line beside a bot's name, not a hover tooltip. */
 const H_STATE = { ...STATES_LABEL, working: "working", finished: "done" };
@@ -446,19 +492,69 @@ const unlockAudio = () => { unlock();
 document.addEventListener("pointerdown", unlockAudio, true);
 document.addEventListener("keydown", unlockAudio, true);
 function setDock(st) {
+  /* Held states are queued, not dropped: the newest one wins, and the queue is applied the moment
+     the mood on screen has had its second. Re-entering through this same function keeps the
+     announcement and the chime attached to when the state is actually shown. A repeat of the mood
+     already on screen is not a no-op: a turn goes working → thinking → working, and that second
+     "working" is the model answering — it is what cancels the "thinking" queued before it. */
+  const now = performance.now();
+  /* A sleeping dock is not a mood worth holding: the whole point of waking it is that it answers the
+     hand that touched it, and a second of a dozing face after a click reads as a slow app. */
+  if (st !== dockReal && dockReal !== "sleeping" && !DOCK_AT_ONCE.has(st) && now - dockShownAt < DOCK_HOLD) {
+    dockNext = st;
+    if (!dockTimer) dockTimer = setTimeout(() => {
+      dockTimer = 0; const s = dockNext; dockNext = ""; if (s) setDock(s);
+    }, DOCK_HOLD - (now - dockShownAt));
+    return;
+  }
+  if (dockTimer) { clearTimeout(dockTimer); dockTimer = 0; dockNext = ""; }
   /* The one place every state change funnels through, so the screen-reader milestone is said here
      rather than at each call site — and only when the state actually changes, or a turn would
      re-announce "working" on every step. */
-  if (dockReal !== st && st !== "idle") announce(STATES_LABEL[st] || st);
-  dockReal = st; if (S.dock) S.dock.setState(st); chime(st);
-  const tip = $("#dockTip"); if (tip && tip.classList.contains("on")) tip.textContent = STATES_LABEL[st] || st; }
+  /* `sleeping` is silent: it arrives five minutes after anyone last touched the page, and a screen
+     reader interrupting a quiet room to say the mascot is asleep is noise, not news. */
+  if (dockReal !== st && st !== "idle" && st !== "sleeping") announce(STATES_LABEL[st] || st);
+  dockReal = st; dockShownAt = now; if (S.dock) S.dock.setState(st); chime(st);
+  const tip = $("#dockTip"); if (tip && tip.classList.contains("on")) tip.textContent = dockTipText(); }
+
+/* A failed turn used to end in `idle` — the same face a finished one ends in — so the corner said
+   nothing about it and "it broke" looked exactly like "it worked". The failure gets its own face for
+   a few seconds. A rate limit gets the softer one: it clears on its own, and a red shaking face
+   would say the bot is broken when it is only waiting for a quota to refill.
+   `seq` guards the hand-back: a second failure restarts the count, and a turn that started in the
+   meantime is not knocked back to idle by the first one's timer. */
+const FAIL_FOR = 3200;
+const isLimit = s => /429|rate.?limit/i.test(String(s || ""));
+let failSeq = 0;
+function failDock(reason) {
+  const st = isLimit(reason) ? "ratelimit" : "error", seq = ++failSeq;
+  setDock(st);
+  setTimeout(() => { if (seq === failSeq && dockReal === st) setDock("idle"); }, FAIL_FOR);
+}
+
+/* A dock nobody has touched for five minutes goes to sleep: the sleepy face breathes slowly and
+   floats its Zs. Before this the corner held one neutral face for as long as the app was open, which
+   is the one thing an idle mascot should never look like. Only the dock sleeps — a sidebar row is a
+   status light, and a row of dozing faces would say the roster is asleep rather than the app quiet. */
+const SLEEP_MS = 5 * 60 * 1000, SLEEP_TICK = 15000;
+let lastAct = performance.now(), sleepTimer = 0;
+function dockWake() {
+  lastAct = performance.now();
+  if (dockReal === "sleeping") setDock("idle");
+}
+for (const ev of ["pointerdown", "keydown", "wheel"]) document.addEventListener(ev, dockWake, true);
+sleepTimer = setInterval(() => {
+  if (dockReal === "idle" && performance.now() - lastAct > SLEEP_MS) setDock("sleeping");
+}, SLEEP_TICK);
 /* The dock wears the face of whoever you are talking to, so the corner always says which
    bot is speaking. A room is a whole company with no single face, so it keeps the general
    Mochi — the plain one. */
 function dockFace() {
   if (!S.dock) return;
   const b = S.activeIsChannel ? null : botOf(S.active);
-  S.dock.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null);
+  const ck = clipKeyFor(b);
+  S.dock.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null, clipsFor(ck));
+  S.dock._clipKey = ck;
   S.dock.cv.dataset.species = S.dock.species;
   compDress();                                            // the computer panel's placeholder follows too
   /* Its accounts follow the chat too, but only when the chat changed: `renderNav` calls this on every
@@ -627,6 +723,8 @@ async function boot() {
   applyAppearance(S.settings.appearance);
   attach($(".bm"), "finished", { species: speciesFor(S.settings.company_name || "anzen") });
   S.dock = attach($("#dockMochi"), "idle", { species: "mochi" });   // re-skinned per context by dockFace()
+  queueLoad();                         // the last session's queued tasks, drawn but not re-sent
+  draftsLoad();                        // and the half-typed text each chat was left with
   renderNav();
   await refreshPending();
   await loadChats();
@@ -699,7 +797,7 @@ function setCollapsed(s) { try { localStorage.setItem("nav.collapsed", JSON.stri
 function foldGroup(cid) {
   const s = collapsed(); s.has(cid) ? s.delete(cid) : s.add(cid); setCollapsed(s);
   const g = document.querySelector('.group[data-group="' + CSS.escape(cid) + '"]');
-  if (!g) return renderNav();                             // not on screen yet — fall back to a rebuild
+  if (!g) return renderNav(true);                         // not on screen yet — fall back to a rebuild
   const shut = s.has(cid);
   g.querySelector(".sub")?.classList.toggle("shut", shut);
   g.querySelector(".caret")?.classList.toggle("open", !shut);
@@ -712,7 +810,7 @@ const shutSecs = () => { try { return new Set(JSON.parse(localStorage.getItem("n
 function applySecs() {
   const shut = shutSecs().has("chats");
   const lab = $("#chatsLabel"); if (!lab) return;
-  lab.parentElement.classList.toggle("shut", shut);
+  lab.closest(".navgroup").classList.toggle("shut", shut);
   lab.setAttribute("aria-expanded", String(!shut));
   lab.querySelector(".caret")?.classList.toggle("open", !shut);
 }
@@ -832,6 +930,9 @@ async function watchChats() {
   try {
     const r = await fetch("/api/watch");
     if (!r.ok || !r.body) throw new Error("no watch stream");
+    /* A `done` dropped while the stream was down never comes again, so the reconnect is where the
+       turns it left behind are ended. */
+    await pruneWatched();
     const rd = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
@@ -858,6 +959,11 @@ async function elsewhere(d) {
   if (!live) await loadChats();
   if (d.session !== S.active) return;
   if (d.type === "gone") { await select(firstChatId()); return; }
+  /* A learned note is sent after the turn's own `done`, so there is no turn state left to draw it in.
+     It is a note, not a turn: drawn through a throwaway sink so it still reaches the transcript, and
+     never kept in `S.turns` — a state created here stayed `running` for ever, which left the chat
+     busy and queued every later message with no turn left to drain the queue. */
+  if (d.type === "learned") { drawTurnEvent(d.session, { nodes: [], plan: null }, d); return; }
   if (d.turn && S.myTurns && S.myTurns[d.session] === d.turn) return;   // our own turn; its stream drew it
   const T = S.turns[S.active];
   /* A turn running in *this* window owns the transcript: its cards are being drawn into the DOM as
@@ -869,8 +975,10 @@ async function elsewhere(d) {
      blank until it ends. `done`/`error` is the end of it: hand the chat back to the record. */
   if (d.type === "done" || d.type === "error") { if (T) await endWatched(S.active); return; }
   if (live) {
-    const W = T || (S.turns[S.active] = { nodes: [], plan: null, running: true, watched: true });
+    const W = T || (S.turns[S.active] = { nodes: [], plan: null, running: true, watched: true,
+      seen: Date.now(), turn: d.turn });
     drawTurnEvent(S.active, W, d);
+    syncComposer();            // Stop belongs to this chat now, even though this window did not start it
     return;
   }
   if (T) return;              // a transcript nudge for a watched turn mid-flight; its `done` hands it back
@@ -882,11 +990,55 @@ async function endWatched(sid) {
   const T = S.turns[sid];
   if (T) { T.running = false; stepDone(T, T.failed); }
   delete S.turns[sid];
-  workingClear();                        // the turn is over: no live row left for a bot that has finished
+  workingClear(sid);                     // the turn is over: no live row left for a bot that has finished
   setState(sid, "idle");                 // the turn is over: no dot left lit, no "working" left on the header
+  syncComposer();                        // ...and Stop goes with it
   if (sid === S.active) await reloadTranscript();
   loadChats();
   drainQueue(sid);                       // anything typed here while that turn ran goes now that it has
+}
+/* A turn that was already running when this client looked — a phone opened on a working room, a
+   window woken after its screen was off, a chat switched to mid-turn. It is in neither the
+   transcript (not saved until it ends) nor the watch (which only carries what happens next), so the
+   server sends its state with the history and the strip and Stop are drawn from it. `live` is null
+   when nothing is running; a turn this window is running itself is left to its own stream. */
+function adoptLive(sid, live) {
+  const T = S.turns[sid];
+  if (T && !T.watched && T.running) return;
+  if (!live) {
+    /* The turn this window was watching is over — it ended while the screen was off, or its `done`
+       was dropped. The transcript that was just reloaded is the record, so the live view goes. */
+    if (T && T.watched) { delete S.turns[sid]; workingClear(sid); setState(sid, "idle"); syncComposer(); }
+    return;
+  }
+  const W = (T && T.watched) ? T : (S.turns[sid] = { nodes: [], plan: null, running: true,
+    watched: true, seen: Date.now(), turn: live.turn });
+  W.running = true; W.watched = true; W.seen = Date.now(); W.turn = live.turn;
+  const bots = live.bots || {};
+  W.asking = Object.values(bots).some(b => b.phase === "approval");
+  /* The step card the desktop is showing, drawn here too, so a late join lands on the same view. */
+  if (live.state) drawTurnEvent(sid, W, { type: "status", state: live.state });
+  if (chan(sid)) for (const id of Object.keys(bots)) {
+    const b = bots[id], r = workingRow(sid, id); if (!r) continue;
+    if (STEP_LABEL[b.phase]) r.phase.textContent = "· " + STEP_LABEL[b.phase];
+    if (b.tool) { r.tool = toolHead(b.tool, b.args || {}); workingAct(r); }
+    else if (b.text) { r.text = b.text; workingAct(r); }
+  }
+  setState(sid, W.asking ? "approval" : (live.state || "working"));
+  syncComposer();
+}
+/* The server's watch queue is bounded and drops what it cannot fit — `done` included — so a turn that
+   ended while this page was not reading would leave its chat "working" for ever, and Stop would go to
+   a turn the server no longer has. Nothing asks the server whether a chat is running, so silence is
+   the signal: a watched turn that has said nothing for this long is over. A turn this window is
+   running is never pruned — its own stream is the authority on when it ends. */
+const WATCH_SILENT_MS = 120000;
+async function pruneWatched() {
+  for (const sid of Object.keys(S.turns)) {
+    const T = S.turns[sid];
+    if (!T || !T.watched || !T.running || (S.myTurns && S.myTurns[sid] === T.turn)) continue;
+    if (Date.now() - (T.seen || 0) > WATCH_SILENT_MS) await endWatched(sid);
+  }
 }
 /* ---------------- coming back to a page that was away ----------------
    A tab in the background — or a phone whose screen went off — stops running timers, so the watch
@@ -917,8 +1069,18 @@ window.anzenBack = () => {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
   return before !== open();
 };
+/* A redraw that would draw exactly what is already on screen is skipped. Both rails are built from
+   `innerHTML`, so a redraw takes every row out of the document and puts a new one back: the faces'
+   canvases are detached and re-attached, and a company's logo is fetched and decoded again. `wake()`
+   redraws on every return to the window, so with nothing changed that was a logo flicker and a full
+   redraw of the faces for no reason. The signature is what the rows are drawn from, so a rename, a
+   new colour, a pin, a new picture or a switch of chat still rebuilds. */
+let chatSig = "", navSig = "";
 function renderChats() {
   const box = $("#chats"); if (!box) return;
+  const sig = JSON.stringify([S.chats, S.bots, S.channels, S.active, S.chatQuery]);
+  if (sig === chatSig) { paintDrafts(); return; }
+  chatSig = sig;
   const keep = S.chatMochi;                               // faces already on screen, kept by chat id
   S.chatMochi = {};
   const q = (S.chatQuery || "").trim().toLowerCase();
@@ -956,6 +1118,70 @@ function renderChats() {
     box.appendChild(li);
   }
   dropFaces(keep, S.chatMochi);
+  paintDrafts();
+}
+/* "Draft" on any row whose chat has text waiting in it. The chats list, a room's row and a bot's row
+   are three views of one chat id, so one function paints all three — and it edits the rows in place,
+   because a marker appearing must not tear down and remount a face. It goes at the start of the row's
+   second line: those lines ellipsize, and the start is never the part that gets cut. */
+function paintDrafts() {
+  for (const row of $$("#chats .chat, #bots .bot, #chans .bot")) {
+    const line = row.querySelector(".clast, .rl"); if (!line) continue;
+    const tag = row.querySelector(".cdraft");
+    if (!S.drafts[row.dataset.id]) { if (tag) tag.remove(); continue; }
+    if (!tag) line.insertBefore(el("span", "cdraft", "Draft"), line.firstChild);
+  }
+}
+/* ---------------- a bot on the browser ----------------
+   While a turn is on the web its row says so, and the mark is the way into the Computer panel — the
+   row itself still opens the chat, because a row that stopped navigating would be a trap. Set from
+   the tool event, which is the moment the bot really goes to a page, and cleared when the turn ends.
+   A room's row carries it too, so a room whose member is browsing says so without unfolding the team. */
+function markBrowsing(sid, key) {
+  S.browsing[key] = sid;
+  /* The chat's own key too, whatever the row's key turned out to be: the header chip asks by chat,
+     and a row that fell back to the bare bot id would otherwise leave it hidden. */
+  S.browsing[sid] = sid;
+  paintBrowsing();
+}
+function clearBrowsing(sid) {
+  let hit = false;
+  for (const k of Object.keys(S.browsing)) {
+    if (k === sid || k.startsWith(sid + "/")) { delete S.browsing[k]; hit = true; }
+  }
+  if (hit) paintBrowsing();
+}
+function paintBrowsing() {
+  for (const row of $$("#bots .bot, #chans .bot")) {
+    const nm = row.querySelector(".nm"); if (!nm) continue;
+    const mark = nm.querySelector(".web"), on = !!S.browsing[row.dataset.id];
+    if (!on) { if (mark) mark.remove(); continue; }
+    if (mark) continue;
+    const w = el("span", "web on");
+    w.innerHTML = svg("monitor");
+    w.title = "Using the browser — open the computer";
+    w.setAttribute("role", "button");
+    w.setAttribute("aria-label", "Open the computer panel");
+    w.onclick = e => {
+      e.stopPropagation();                       // the row's own click still opens the chat
+      const chat = S.browsing[row.dataset.id];
+      if (chat) openCompFor(chat);
+    };
+    nm.insertBefore(w, nm.querySelector(".dot"));
+  }
+  /* ...and the chat you are reading says so in its own header, which is where you look while a turn
+     runs. Same door: pressing it opens the Computer panel on that chat's screen. */
+  const chip = $("#chipWeb"), on = !!(chip && S.browsing[S.active]);
+  if (chip) {
+    chip.classList.toggle("on", on);
+    chip.onclick = on ? () => openCompFor(S.active) : null;
+  }
+}
+/* The panel is scoped to the chat you are in, so watching a bot that works in another room means
+   going there first — otherwise its own screen is refused as another chat's. */
+function openCompFor(sid) {
+  if (S.active !== sid) select(sid).then(openComp);
+  else openComp();
 }
 
 /* One row for a bot inside a company. Same bot, same face, same config — the row id is what
@@ -976,10 +1202,15 @@ function subRow(b, scope, faces) {
   kbd(li, () => { if (key !== S.active) select(key); });
   kbd(li.querySelector(".kebab"), e => openCtx(e, b.id, "bot", key));
   const holder = li.querySelector(".mc");                 // swap the static face for a live one
-  faces.live[key] = mountFace(faces.keep, key, holder, 46, b, "sidebot");
+  faces.live[key] = mountFace(faces.keep, key, holder, 52, b, "sidebot");
   return li;
 }
-function renderNav() {
+function renderNav(force) {
+  /* The rows are built from the roster and nothing else: the selection and the folds are toggled in
+     place by `select()` and `foldGroup()`, so they are not part of what a redraw would change. */
+  const sig = JSON.stringify([S.channels, S.bots]);
+  if (!force && sig === navSig) { paintDrafts(); paintBrowsing(); dockFace(); return; }
+  navSig = sig;
   const faces = { keep: S.sideMochi, live: {} };           // rows that survive keep the face they have
   const shut = collapsed();
   const cbox = $("#chans"); cbox.innerHTML = "";
@@ -1032,11 +1263,47 @@ function renderNav() {
   const bbox = $("#bots"); bbox.innerHTML = "";
   const loose = [...S.bots].filter(b => !b.hidden && !claimed.has(b.id))
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
-  $("#botsLabel").style.display = loose.length ? "" : "none";
+  /* The heading stays whatever the roster holds: its "+" is the only way to create a bot, and the
+     empty state's advice to add one would otherwise point at a control that is not there. */
   for (const b of loose) bbox.appendChild(subRow(b, null, faces));
   S.sideMochi = faces.live;
   dropFaces(faces.keep, faces.live);
+  paintDrafts();                                          // a draft left in a chat is on its bot's row too
+  paintBrowsing();                                        // ...and so is a bot that is on the web
   dockFace();                                             // the corner follows the active bot's face
+}
+
+/* ---------------- drafts ----------------
+   A half-typed message belongs to the chat it was typed in: left in the box it followed you into the
+   next chat, where Send would have delivered it to the wrong bot. Kept per chat id, and in
+   localStorage so a reload keeps it too. */
+const DKEY = "anzen.drafts";
+const DRAFTS_MAX = 50;                   // a cap, so the store cannot grow without bound
+function draftsSave() {
+  try { localStorage.setItem(DKEY, JSON.stringify(S.drafts)); } catch (e) {}
+}
+function draftsLoad() {
+  try {
+    const o = JSON.parse(localStorage.getItem(DKEY) || "{}");
+    if (o && typeof o === "object" && !Array.isArray(o)) S.drafts = o;
+  } catch (e) {}
+}
+/* Stored only while there is some text; deleting and re-adding moves the chat to the end, which is
+   the order the cap drops from — the oldest draft goes first. */
+function draftSet(id, text) {
+  if (!id) return;
+  delete S.drafts[id];
+  if (text && text.trim()) S.drafts[id] = text;
+  const keys = Object.keys(S.drafts);
+  for (let i = 0; i < keys.length - DRAFTS_MAX; i++) delete S.drafts[keys[i]];
+  draftsSave();
+}
+/* Switching chats swaps the composer with them: what you were typing stays with the chat you left,
+   and the chat you open gets back whatever was left in it. */
+function draftSwap(next) {
+  draftSet(S.active, $("#input").value);
+  const t = S.drafts[next] || "";
+  $("#input").value = t; autoGrow($("#input"));
 }
 
 /* ---------------- selection ---------------- */
@@ -1086,7 +1353,9 @@ function refreshHead() {
     run && t.asking);
   $("#hDot").classList.toggle("live", run);
 }
+let switching = false;                 // a chat transition is running; a second one would be refused
 async function select(id) {
+  findClose(false);                           // a find belongs to the chat it was opened in
   if (!id) {                                  // nothing to land on: no rooms, no chats, no bots
     S.active = null; S.activeIsChannel = false;
     $("#hName").textContent = "No chats yet";
@@ -1094,10 +1363,17 @@ async function select(id) {
       + '<div class="sub">Add a bot or a room from the sidebar to start a chat.</div></div>';
     return;
   }
+  /* The box follows the chat, not the click: see `draftSwap`. */
+  draftSwap(id);
+  /* What the panel shows now, so a failed history read can be undone: everything below moves the
+     header, the selection marks and the pending strip before the record has arrived. */
+  const prev = S.active, prevChan = S.activeIsChannel, prevName = $("#hName").textContent;
+  const prevPending = pending, prevReply = S.reply, prevSay = attachSay;
   S.active = id; S.activeIsChannel = !!chan(id); closeDrawer();
-  /* The strip is the room on screen, so it goes with the room that was: the next room's own events
-     build its own rows. */
-  workingClear();
+  /* The strip shows the room on screen, and a turn in another room keeps running — so switching is a
+     change of what is shown, not a reason to forget what any room is doing. */
+  workingPaint();
+  paintBrowsing();                    // the header's "using the browser" chip follows the chat shown
   closeModelMenu(); closeMention();
   S.reply = null; renderReply();      // a reply belongs to the chat it was started in
   pending = []; attachSay = ""; renderAttach();   // ...and so do the files picked for it
@@ -1115,7 +1391,23 @@ async function select(id) {
   if ($("#comp").classList.contains("on")) refreshComp();
   if ($("#files").classList.contains("on")) { filesForChat(); refreshFiles(); }
   const h = await get("/api/history?session=" + encodeURIComponent(id));
-  if (!h) return;                               // server unreachable mid-click: leave the panel as it was
+  if (!h) {
+    /* The record never arrived, so the transcript is still the chat we came from. Put the selection
+       back with it rather than leaving Send and the message actions aimed at a chat whose history is
+       not on screen. */
+    S.active = prev; S.activeIsChannel = prevChan;
+    $("#hName").textContent = prevName;
+    $("#input").placeholder = prevChan ? "Message the room… (@mention a bot)" : "Give a task…";
+    $$("#bots .bot, #chans .bot").forEach(x => x.classList.toggle("sel", x.dataset.id === prev));
+    pending = prevPending; attachSay = prevSay; S.reply = prevReply;
+    draftSwap(prev);                    // the box goes back with the transcript
+    renderAttach(); renderReply(); workingPaint(); refreshHead(); dockFace();
+    /* Both side panels were re-asked for the chat that never opened; ask again for this one. */
+    if ($("#comp").classList.contains("on")) refreshComp();
+    if ($("#files").classList.contains("on")) { filesForChat(); refreshFiles(); }
+    setHead("could not open that chat — try again", true);
+    return;
+  }
   if (id !== S.active) return;                  // a later click already owns the panel; drop this reply
   $("#chipModel").textContent = "Model: " + (h.model || "none");
   applyApproval(h, id);
@@ -1125,7 +1417,21 @@ async function select(id) {
      one is not where this one opens. Set here, on the redraw itself, so nothing that happens while
      the history is in flight can leave the new chat opening at the top. */
   pinned = true;
-  render(S.messages, h.pending);
+  /* Switching chats dissolves rather than cuts. Only the redraw is inside the transition: the header,
+     the selection and the composer have already moved, and the transcript then cross-fades into the
+     new one. Native where the browser has the API, a plain swap everywhere else — and not on a phone,
+     where a snapshot costs more than it shows, or with reduced motion. */
+  const swap = () => render(S.messages, h.pending);
+  if (document.startViewTransition && !switching && matchMedia("(hover: hover)").matches
+      && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    switching = true;
+    try { await document.startViewTransition(swap).finished; }
+    catch (e) { /* dropped mid-way by the browser; the redraw itself already happened */ }
+    finally { switching = false; }
+  } else swap();
+  /* A turn already running in the chat being opened is not in its record yet: the server sends its
+     state with the history, so the strip and Stop come back instead of the chat reading as idle. */
+  adoptLive(id, h.live);
   /* A turn may be running here (you switched away and came back) or in another chat. Either way the
      header and the composer say so, so a disabled Send is never a mystery and the running chat is
      never a blank panel. */
@@ -1206,6 +1512,11 @@ function render(messages, pending) {
     else if (m.role === "notice" || m.role === "sys") addCard("sys", "", m.content, sink);
     else addMsg(m.role, m.content, m.who, sink, { quote: m.quote, fwd: m.fwd, attachments: m.attachments, i, ts: m.ts, took: m.took }, S.active);
   });
+  /* A failure that never reached the server has no row in this record, so its notice is drawn from
+     the note kept for this chat (see runChat): without it, coming back to a chat whose turn never
+     started showed the message you sent with no answer and no reason. */
+  const failed = S.failNotes[S.active];
+  if (failed && !messages.some(m => m.content === failed)) addCard("sys", "", failed, sink);
   if (pending) addApproval(pending.cmd, pending.agent);
   /* A turn that is still running here has already drawn cards into this chat. Put them back in
      order, so coming back to a running chat shows the work instead of an empty panel. */
@@ -1225,6 +1536,80 @@ function render(messages, pending) {
     box.style.scrollBehavior = "auto"; box.scrollTop = keep; box.style.scrollBehavior = sb;
     $("#jump").hidden = false;
   }
+  /* The rebuild threw the marks away with the transcript, so an open find would lose its highlights on
+     the next redraw. Same query, same match number, put back over the new nodes. */
+  if (findQuery) findRun(findQuery, findAt);
+}
+
+/* ---------------- find in the open transcript ----------------
+   A hit is a `mark` wrapped around the text node that holds it, not a second copy of the transcript:
+   closing puts the original text nodes back, so a later markdown re-render sees the same text it
+   wrote. The bar is the browser's own find's companion, not a replacement — Ctrl/Cmd+F is untouched. */
+let findQuery = "", findHits = [], findAt = -1;
+function findUnmark() {
+  for (const m of $("#msgs").querySelectorAll("mark.findhit")) {
+    const p = m.parentNode;
+    p.replaceChild(document.createTextNode(m.textContent), m);
+    p.normalize();                       // two text nodes where there was one would change the text
+  }
+  findHits = []; findAt = -1;
+}
+function findPaint(scroll) {
+  const n = findHits.length;
+  findHits.forEach((m, i) => m.classList.toggle("cur", i === findAt));
+  $("#findCount").textContent = !findQuery ? "" : n ? (findAt + 1) + " of " + n : "No matches";
+  if (scroll && n) findHits[findAt].scrollIntoView({ block: "center" });
+}
+function findRun(q, keep) {
+  findUnmark();
+  findQuery = q || "";
+  if (findQuery) {
+    const needle = findQuery.toLowerCase();
+    const walk = document.createTreeWalker($("#msgs"), NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) if (n.nodeValue.trim()) nodes.push(n);
+    for (const n of nodes) {
+      const hay = n.nodeValue.toLowerCase(), at = [];
+      for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) at.push(i);
+      /* Split from the end: each split rewrites the node's tail, so the offsets before it stay good. */
+      const marks = [];
+      for (let k = at.length - 1; k >= 0; k--) {
+        const tail = n.splitText(at[k]);
+        const hit = tail.splitText(needle.length);
+        const mark = document.createElement("mark");
+        mark.className = "findhit";
+        tail.parentNode.replaceChild(mark, tail);
+        mark.appendChild(tail);
+        marks.unshift(mark);
+      }
+      findHits.push(...marks);
+    }
+  }
+  findAt = findHits.length ? Math.min(keep || 0, findHits.length - 1) : -1;
+  findPaint(true);
+}
+/* Enter is next, Shift+Enter is previous, and both wrap: a find that stops at the last hit makes you
+   wonder whether the query was wrong. */
+function findStep(d) {
+  if (!findHits.length) return;
+  findAt = (findAt + d + findHits.length) % findHits.length;
+  findPaint(true);
+}
+function findOpen() {
+  $("#findbar").hidden = false;
+  const inp = $("#findInput");
+  inp.focus(); inp.select();
+}
+/* Closing is the transcript exactly as it was — marks unwrapped, nodes normalised — and the composer
+   has the caret back, because that is where typing goes next. A chat switch closes it without taking
+   the focus, since a tap in the drawer should not raise a phone keyboard. */
+function findClose(refocus) {
+  const bar = $("#findbar");
+  if (bar.hidden) return;
+  bar.hidden = true;
+  findUnmark();
+  findQuery = ""; $("#findInput").value = ""; $("#findCount").textContent = "";
+  if (refocus !== false) $("#input").focus();
 }
 /* The answer as it is written. Each delta is appended to the bubble the turn already opened for
    that bot and repainted at most every STREAM_MS — not on every token, and not on every frame
@@ -1237,6 +1622,7 @@ function streamText(ev, who, to, T, sid) {
   const box = to || MSGS;
   const live = (T.live = T.live || {});
   const key = (ev.to || "") + "\u0000" + (ev.agent || "");
+  const txt = ev.text || "";
   let d = live[key];
   if (ev.delta) {
     if (!d) {
@@ -1246,7 +1632,7 @@ function streamText(ev, who, to, T, sid) {
       d.dataset.raw = ""; d._box = box;
       live[key] = d; box.add(d);
     }
-    d.dataset.raw += ev.text;
+    d.dataset.raw += txt;
     const paint = () => { d._paint = 0; d._painted = performance.now();
       d.querySelector(".md").innerHTML = mdToHtml(d.dataset.raw); d._box.scroll(); };
     const since = performance.now() - (d._painted || 0);
@@ -1255,12 +1641,12 @@ function streamText(ev, who, to, T, sid) {
     return;
   }
   delete live[key];
-  if (!ev.text.trim()) { if (d) d.remove(); return; }
-  if (!d) { addMsg("assistant", ev.text, who, to, null, sid); return; }
+  if (!txt.trim()) { if (d) { if (d._paint) clearTimeout(d._paint); d.remove(); } return; }
+  if (!d) { addMsg("assistant", txt, who, to, null, sid); return; }
   if (d._paint) { clearTimeout(d._paint); d._paint = 0; }
-  d.dataset.raw = ev.text;
-  d.querySelector(".md").innerHTML = mdToHtml(ev.text);
-  msgActs(d, who || "", ev.text, "assistant");
+  d.dataset.raw = txt;
+  d.querySelector(".md").innerHTML = mdToHtml(txt);
+  msgActs(d, who || "", txt, "assistant");
   box.scroll();
 }
 /* What your own messages are labelled with. Set in Settings → General, and "Client" until you name
@@ -1293,7 +1679,9 @@ function addMsg(role, text, who, to, meta, sid) {
      exactly as typed — a shell command with an asterisk must not come back italic. Only a URL in it
      is dressed up, because a URL you cannot click is the one thing plain text gets wrong. */
   if (role === "user") d.appendChild(el("span", "", linkify(text)));
-  else d.appendChild(el("div", "md", mdToHtml(text || "")));
+  /* A message that is only a file has no words, and an empty markdown div under its picture is just
+     a gap. */
+  else if (text) d.appendChild(el("div", "md", mdToHtml(text)));
   if (role !== "user" && text && text.length > 40 && S.settings.voice && S.settings.voice.auto) {
     const sp = el("button", "speak", `${svg("speaker")} Listen`); sp.onclick = () => speak(text); d.appendChild(sp);
   }
@@ -1351,16 +1739,20 @@ async function copyText(text, btn) {
   setTimeout(() => { btn.textContent = was; }, 1200);
 }
 /* Forgetting the tail of a transcript is the server's call, so it is asked first and the answer is
-   what is drawn — the two can never disagree about where the chat now ends. */
-async function truncateAt(keep) {
-  const r = await jpost("/api/history/truncate", { session: S.active, keep });
+   what is drawn — the two can never disagree about where the chat now ends. The chat is the one the
+   click was made in, not whatever is selected by the time the answer lands: a switch while the
+   server was working must not put one chat's tail on screen as another's. */
+async function truncateAt(keep, sid) {
+  const r = await jpost("/api/history/truncate", { session: sid, keep });
   if (r.ok === false) { alert(r.error || "Could not change this chat."); return false; }
-  S.messages = r.messages || []; return true;
+  if (sid === S.active) S.messages = r.messages || [];
+  return true;
 }
 async function editMsg(i) {
-  if (busy(S.active)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
+  const sid = S.active;          // bound now: the composer and the truncation belong to this chat
+  if (busy(sid)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
   const m = S.messages[i]; if (!m) return;
-  if (!await truncateAt(i)) return;
+  if (!await truncateAt(i, sid) || sid !== S.active) return;
   pinned = true;                 // the tail just changed: this redraw lands at the newest message
   render(S.messages, null);
   $("#input").value = m.content || "";
@@ -1368,7 +1760,8 @@ async function editMsg(i) {
   $("#input").focus(); $("#input").setSelectionRange($("#input").value.length, $("#input").value.length);
 }
 async function retryMsg(i) {
-  if (busy(S.active)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
+  const sid = S.active;          // bound now: the retry is sent to the chat it was asked in
+  if (busy(sid)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
   let u = -1;
   for (let k = i - 1; k >= 0; k--) if (S.messages[k] && S.messages[k].role === "user") { u = k; break; }
   if (u < 0) { alert("There is no message to ask again."); return; }
@@ -1377,10 +1770,10 @@ async function retryMsg(i) {
      came and the bot is told the same paths it was told the first time. */
   const opts = (m.quote || m.fwd || (m.attachments || []).length)
     ? { quote: m.quote, fwd: m.fwd, attachments: m.attachments } : null;
-  if (!await truncateAt(u)) return;
+  if (!await truncateAt(u, sid) || sid !== S.active) return;
   pinned = true;                 // asking again puts you back at the live end of the chat
   render(S.messages, null);
-  await deliver(S.active, m.content || "", opts);
+  await deliver(sid, m.content || "", opts);
 }
 /* The files that came with a message. A picture is drawn as the picture — a screenshot you sent is
    something you want to see, not a row with its name in it — and anything else is a chip that
@@ -1390,10 +1783,21 @@ function attachBlock(list) {
   const b = el("div", "atts");
   for (const a of list) {
     const src = a.url || a.data;
-    const img = /^image\//.test(a.type || "") || /\.(png|jpe?g|gif|webp|avif)$/i.test(a.name || "");
+    const t = a.type || "", n = a.name || "";
+    const img = /^image\//.test(t) || /\.(png|jpe?g|gif|webp|avif)$/i.test(n);
+    const vid = /^video\//.test(t) || /\.(mp4|webm|mov|m4v)$/i.test(n);
+    const aud = /^audio\//.test(t) || /\.(mp3|m4a|wav|ogg|oga|flac|aac)$/i.test(n);
     if (img && src) {
       const im = el("img"); im.src = src; im.alt = a.name || "attachment"; im.title = a.name || "";
       b.appendChild(im);
+    } else if (vid && src) {
+      /* A video or a clip plays where it was sent: a bot that captured one had to hand over a file
+         path before, and a path is not something you can watch. */
+      const v = el("video"); v.controls = true; v.preload = "metadata"; v.src = src;
+      v.title = a.name || "video"; b.appendChild(v);
+    } else if (aud && src) {
+      const au = el("audio"); au.controls = true; au.preload = "metadata"; au.src = src;
+      au.title = a.name || "audio"; b.appendChild(au);
     } else {
       const f = el("a", "afile"); f.href = src || "#"; f.download = a.name || ""; f.target = "_blank";
       f.rel = "noopener"; f.title = "Download " + (a.name || "this file");
@@ -1437,15 +1841,16 @@ function addCard(cls, label, text, to, raw) {
    starts (`out` null) and once with the result — under the same `id`, so the first event makes the
    row and the second fills it rather than drawing a second row for the same command. `to.tools`
    is that per-sink index, so a room's delegated work keeps its own rows in the member's chat. */
-const TOOL_LABEL = { run_shell:"shell", browser_open:"browser · open", browser_read:"browser · read",
-  browser_click:"browser · click", browser_type:"browser · type", browser_press:"browser · key",
-  browser_back:"browser · back", browser_see:"browser · look", browser_eval:"browser · eval", read_file:"read file",
-  write_file:"write file", list_files:"list files", generate_image:"draw image", memory_update:"memory",
+const TOOL_LABEL = { run_shell:"shell", browser_open:"using the browser", browser_read:"using the browser",
+  browser_click:"using the browser", browser_type:"using the browser", browser_press:"using the browser",
+  browser_back:"using the browser", browser_see:"using the browser", browser_eval:"using the browser", read_file:"read file",
+  write_file:"write file", list_files:"list files", generate_image:"draw image", send_file:"send file",
+  memory_update:"memory",
   use_skill:"read skill", delegate:"delegate",
   gmail_api:"gmail · api", slack_api:"slack · api", github_api:"github · api", notion_api:"notion · api",
   linear_api:"linear · api", drive_api:"gdrive · api", calendar_api:"calendar · api", webhook_post:"webhook · post" };
 const TOOL_ICON = { run_shell:"menu", read_file:"eye", write_file:"edit", list_files:"apps",
-  generate_image:"apps", memory_update:"memory", use_skill:"skills", delegate:"bots", browser_see:"eye", browser_open:"monitor" };
+  generate_image:"apps", send_file:"apps", memory_update:"memory", use_skill:"skills", delegate:"bots", browser_see:"eye", browser_open:"monitor" };
 function toolHead(name, args) {
   if (name === "run_shell") return "$ " + (args.command || "");
   if (name === "browser_open") return args.url || "";
@@ -1455,6 +1860,7 @@ function toolHead(name, args) {
   if (name === "memory_update") return args.note || "";
   if (name === "browser_see") return args.question || "";
   if (name === "generate_image") return args.prompt || "";
+  if (name === "send_file") return args.path || "";
   if (name === "use_skill") return (args.skill || "") + (args.file ? " · " + args.file : "");
   if (name === "delegate") return "→ " + NAME(args.role) + ": " + (args.task || "");
   return JSON.stringify(args).slice(0, 200);
@@ -1489,6 +1895,18 @@ function addTool(agent, name, args, out, to, id) {
     </button><div class="tbody"></div>`;
   const head_ = d.querySelector(".thead");
   head_.onclick = () => { d.classList.toggle("open"); head_.setAttribute("aria-expanded", d.classList.contains("open") ? "true" : "false"); };
+  /* The step that puts a page on screen is also the way to it: the bot is on a real page, and the
+     page is one press away. Only `open` carries the button — every step of a long browse would
+     otherwise be a row of buttons — and it sits outside the header button rather than inside it,
+     because a button within a button is not a control a screen reader can reach. */
+  if (name === "browser_open") {
+    d.classList.add("watch");
+    const v = el("button", "tview", "Watch");
+    v.type = "button";
+    v.title = "Open the Computer panel on this page";
+    v.onclick = () => openComp();
+    d.appendChild(v);
+  }
   if (id) map[id] = d;
   fillTool(d, name, args, out);
   box.add(d); box.scroll(); return d;
@@ -1507,6 +1925,17 @@ function toolFailed(name, out) {
 }
 function fillTool(d, name, args, out) {
   const st = d.querySelector(".tstate"), body = d.querySelector(".tbody");
+  /* Once the page is really open, the row names it: the URL was the thing asked for, the title is
+     the thing on screen. A failed open leaves the URL — that is what the failure is about. */
+  if (name === "browser_open" && out) {
+    try {
+      const o = JSON.parse(out);
+      if (o && o.title) {
+        const h = d.querySelector(".h");
+        if (h) { h.textContent = o.title; h.title = o.title + (o.url ? " — " + o.url : ""); }
+      }
+    } catch { /* not JSON: a refusal is prose, and the URL still says which page it is about */ }
+  }
   if (out == null) { st.innerHTML = `<span class="spin" title="running"></span>`; clockStart(d.querySelector(".telapsed")); return d; }
   clockStop(d.querySelector(".telapsed"));
   body.innerHTML = "";
@@ -1534,6 +1963,15 @@ function addShot(png, note, title, to) {
   const box = to || MSGS;
   const d = el("div", "m bot shot");
   d.innerHTML = `<div class="who">${esc(title || "Browser · screenshot")}</div>`;
+  /* A screenshot is a still of a page that is still open, so the card carries the way back to it.
+     Only a browser shot gets this: a generated image has no page behind it. The panel is scoped to
+     this chat and says so when another bot has the browser, rather than showing the wrong screen. */
+  if (title !== "Image") {
+    const view = el("button", "btn sm", "View Browser");
+    view.style.marginLeft = "auto";
+    view.onclick = () => openComp();
+    d.querySelector(".who").appendChild(view);
+  }
   const im = el("img"); im.src = png; im.alt = title === "Image" ? "generated image" : "page screenshot"; d.appendChild(im);
   if (note) d.appendChild(el("div", "note", (title === "Image" ? "Prompt: " : "Seen: ") + esc(note)));
   box.add(d); box.scroll();
@@ -1589,6 +2027,10 @@ function offlineTurn(started) {
     ? "The connection to the server dropped part-way through this turn. The bot may still be working on it — open this chat again in a moment to see, or send your message again to retry."
     : "Could not reach the server, so this turn never started. It may be restarting — try again in a moment.");
 }
+/* The server ends every finished turn with an explicit `done`, and sends a keepalive every 15 s while
+   it has nothing else to say. So neither a clean EOF nor a long silence is the end of a turn: the
+   first is a server that died or restarted, the second a connection that is no longer there at all. */
+const STREAM_IDLE_MS = 45000;
 async function stream(path, payload, onEvent, T) {
   let res;
   try {
@@ -1596,21 +2038,30 @@ async function stream(path, payload, onEvent, T) {
   } catch (e) { throw isOffline(e) ? offlineTurn(false) : e; }
   if (!res.ok) throw humanErr("The server refused this turn (HTTP " + res.status + "). Try again in a moment.");
   if (!res.body) throw humanErr("The server sent a reply this browser cannot read.");
-  const rd = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  const rd = res.body.getReader(); const dec = new TextDecoder(); let buf = "", sawDone = false, idle = null;
+  const arm = () => { clearTimeout(idle); idle = setTimeout(() => { try { rd.cancel(); } catch (e) {} }, STREAM_IDLE_MS); };
   /* Stop walks away from the stream. The server notices the dropped connection and ends the turn;
      cancelling the reader is what carries that over both transports — a plain fetch closes the
      socket, and the desktop bridge cancels the IPC request behind the same call. */
   if (T) { T.reader = rd; if (T.stopped) { try { rd.cancel(); } catch (e) {} } }
-  while (true) {
-    let r; try { r = await rd.read(); } catch (e) { if (T && T.stopped) return; throw isOffline(e) ? offlineTurn(true) : e; }
-    const { done, value } = r; if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf("\n\n")) >= 0) {
-      const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
-      if (chunk.startsWith("data: ")) { try { onEvent(JSON.parse(chunk.slice(6))); } catch (e) {} }
+  arm();
+  try {
+    while (true) {
+      let r; try { r = await rd.read(); } catch (e) { if (T && T.stopped) return; throw isOffline(e) ? offlineTurn(true) : e; }
+      const { done, value } = r; if (done) break;
+      arm();
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (chunk.startsWith("data: ")) {
+          try { const ev = JSON.parse(chunk.slice(6)); if (ev && ev.type === "done") sawDone = true; onEvent(ev); } catch (e) {}
+        }
+      }
     }
-  }
+  } finally { clearTimeout(idle); }
+  /* A turn that already reported its own error, or one you stopped, is not a connection that dropped. */
+  if (!sawDone && !(T && (T.stopped || T.failed))) throw offlineTurn(true);
 }
 /* One place that puts a message into a chat — typed, forwarded, or a reply with a quote attached.
    `opts` carries `quote` and/or `fwd`, which travel with the message to the server and are kept on
@@ -1631,7 +2082,9 @@ async function send() {
   const text = $("#input").value.trim();
   if (!text && !pending.length) return;
   closeMention();                                        // the picker is for the text just sent
+  clearTimeout(draftTimer);                              // a keystroke timer must not put the text back
   $("#input").value = ""; $("#input").style.height = "auto";
+  draftSet(S.active, "");
   const q = S.reply; S.reply = null; renderReply();      // the quote goes with this one message only
   const atts = pending; pending = []; attachSay = ""; renderAttach();
   const o = {};
@@ -1670,17 +2123,22 @@ function renderAttach() {
    out: the message still sends, and the one that did not make it is the one thing to say. */
 function addFiles(list) {
   attachSay = "";
-  let total = pending.reduce((n, a) => n + (a.size || 0), 0);
+  /* The strip this pick belongs to, taken now: Send and a chat switch replace `pending`, and a read
+     that finishes after that must not land in the next message. */
+  const into = pending;
+  let total = into.reduce((n, a) => n + (a.size || 0), 0);
+  let n = into.length;
   for (const f of list || []) {
-    if (pending.length >= MAX_ATTACH_N) { attachSay = "Up to " + MAX_ATTACH_N + " files per message."; break; }
+    if (n >= MAX_ATTACH_N) { attachSay = "Up to " + MAX_ATTACH_N + " files per message."; break; }
     if (total + f.size > MAX_ATTACH) {
       attachSay = f.name + " was not added — a message can carry up to " + kb(MAX_ATTACH) + " of files.";
       continue;
     }
-    total += f.size;
+    total += f.size; n++;           // counted before the read: one pick is a whole selection at once
     const r = new FileReader();
     r.onload = () => {
-      pending.push({ name: f.name || "file", type: f.type || "", size: f.size, data: r.result });
+      if (into !== pending) return;   // sent, or switched chats, while this read was still running
+      into.push({ name: f.name || "file", type: f.type || "", size: f.size, data: r.result });
       renderAttach();
     };
     r.readAsDataURL(f);
@@ -1724,9 +2182,15 @@ function openPick({ icon, title, body, foot }) {
     <div class="bpick">${body}</div>${foot ? `<div class="bfoot">${foot}</div>` : ""}`;
   scrim.appendChild(modal); document.body.appendChild(scrim); document.body.classList.add("overlay");
   const prev = document.activeElement;
+  /* Same shell rule as Settings: the trap keeps Tab in, but a screen reader in browse mode could
+     still walk into the chat behind — and that transcript is not read-only. Captured `prev` first:
+     setting `inert` takes focus off the opener. */
+  behindInert(true);
   const close = () => {
     scrim.remove(); document.removeEventListener("keydown", onKey);
-    if (!$("#scrim").classList.contains("on")) document.body.classList.remove("overlay");
+    /* A pick opened over Settings hands the shell back to Settings, not to the page: only the
+       outermost dialog turns the page back on. */
+    if (!$("#scrim").classList.contains("on")) { document.body.classList.remove("overlay"); behindInert(false); }
     if (prev && prev.focus) prev.focus();
   };
   const onKey = e => {
@@ -1776,8 +2240,22 @@ function forwardMsg(who, text) {
    row keyed on the name would be a row that loses its bot.
    A room only. In a 1:1 chat the header already names the bot and its state, and a second indicator
    for one fact is one too many. */
-const WORKING = new Map();   // bot id -> the row's own parts, so an update is a text change, not a redraw
+/* Keyed on the session *and* the bot: the same bot can be working in two rooms at once, and a row
+   that only remembers the bot would put one room's work under the other's name. */
+const WORKING = new Map();   // "session\0bot" -> the row's own parts, so an update is a text change, not a redraw
+const wkey = (sid, id) => sid + "\u0000" + id;
 const workingBox = () => $("#working");
+/* The strip shows the room on screen. Rows for any other room are kept, hidden, rather than thrown
+   away: the turn is still running there, and switching back must not lose what it is doing. */
+function workingPaint() {
+  const box = workingBox(); if (!box) return;
+  let shown = 0;
+  for (const r of WORKING.values()) {
+    r.row.hidden = r.sid !== S.active;
+    if (!r.row.hidden) shown++;
+  }
+  box.hidden = !shown;
+}
 
 /* What the bot is doing, as one line: the tool it last called, said the way the transcript says it
    (toolHead), and — only while it has called nothing — the first sentence of the last thing it said,
@@ -1794,14 +2272,15 @@ function workingAct(r) {
 }
 /* The row, built once and then only edited: the clock's start time lives on its own element, so a row
    rebuilt on every event would restart the clock and a long step would never read as long. */
-function workingRow(id) {
-  let r = WORKING.get(id);
-  if (r) return r;
+function workingRow(sid, id) {
+  const k = wkey(sid, id);
+  let r = WORKING.get(k);
+  if (r) { workingPaint(); return r; }   // the room on screen may have changed since the last event
   const box = workingBox(); if (!box) return null;
   const b = bot(id) || {}, name = b.name || NAME(id);
   const row = el("div", "wrow"); row.dataset.agent = id;
   row.innerHTML = `<span class="spin" aria-hidden="true"></span>`
-    + hueSpan(name, "wname", hueOf(name, S.active))
+    + hueSpan(name, "wname", hueOf(name, sid))
     /* Each part carries the separator in front of it, so a bot with no title — or with nothing to show
        yet — leaves no dangling `·` behind: the separator goes when the thing it separates does. */
     + `<span class="wtitle"></span><span class="wact"></span><span class="wphase"></span>`
@@ -1810,34 +2289,41 @@ function workingRow(id) {
        number every time it moved — the same reason the transcript is `aria-live="off"`. The phase
        beside it is text, so what a row means never rests on the clock or on the pulse. */
     + `<span class="telapsed" aria-hidden="true"></span>`;
-  r = { row, title: row.querySelector(".wtitle"), act: row.querySelector(".wact"),
+  r = { row, sid, title: row.querySelector(".wtitle"), act: row.querySelector(".wact"),
         phase: row.querySelector(".wphase"), clock: row.querySelector(".telapsed"), tool: "", text: "" };
   r.phase.textContent = "· " + STEP_LABEL.working;      // a bot that has just been handed work is working
   const t = (b.title || "").trim();
   if (t) r.title.textContent = "· " + t;
-  box.appendChild(row); box.hidden = false;
+  box.appendChild(row);
   clockStart(r.clock);
-  WORKING.set(id, r);
+  WORKING.set(k, r);
+  workingPaint();
   return r;
 }
-function workingDrop(id) {
-  const r = WORKING.get(id); if (!r) return;
-  r.row.remove(); WORKING.delete(id);
-  const box = workingBox(); if (box && !WORKING.size) box.hidden = true;
+function workingDrop(sid, id) {
+  const k = wkey(sid, id), r = WORKING.get(k); if (!r) return;
+  r.row.remove(); WORKING.delete(k);
+  workingPaint();
 }
 /* The strip is the live view, and the transcript's record takes over the moment a turn lands — so
-   nothing here outlives one. */
-function workingClear() { for (const id of [...WORKING.keys()]) workingDrop(id); }
-/* One event, folded onto its bot's row. Called for every event of a turn that has not been stopped. */
+   nothing here outlives one. One room's turn ending takes only that room's rows. */
+function workingClear(sid) {
+  for (const [k, r] of [...WORKING]) if (r.sid === sid) { r.row.remove(); WORKING.delete(k); }
+  workingPaint();
+}
+/* One event, folded onto its bot's row. Called for every event of a turn that has not been stopped.
+   Every room's turn is tracked, not only the one on screen: a row that only existed for the room you
+   were looking at vanished the moment you switched away and back, and a bot in a long silent step then
+   had nothing to bring it back. `workingPaint` decides what is shown; this decides what is true. */
 function liveEvent(sid, ev) {
-  if (sid !== S.active || !chan(sid)) return;          // a room, and the room on screen
+  if (!chan(sid)) return;                              // a room; a member's own chat has no strip
   /* The turn itself is over — checked before the bot is looked for, because these two events carry
      no `agent` and the guard below would swallow them, leaving the strip up over a finished turn. */
-  if (ev.type === "final" || ev.type === "error") { workingClear(); return; }
+  if (ev.type === "final" || ev.type === "error") { workingClear(sid); return; }
   const id = ev.agent || (ev.type === "agent" ? ev.id : null);
   if (!id) return;                                     // a room-level status names no bot to put it on
-  if (ev.type === "agent" && ev.state === "done") { workingDrop(id); return; }
-  const r = workingRow(id); if (!r) return;
+  if (ev.type === "agent" && ev.state === "done") { workingDrop(sid, id); return; }
+  const r = workingRow(sid, id); if (!r) return;
   if (ev.type === "status") { if (STEP_LABEL[ev.state]) r.phase.textContent = "· " + STEP_LABEL[ev.state]; }
   /* The approval phase comes from the `approval` event, which names its bot, and not from the
      `status` beside it, which does not — a member waiting on your decision is the one case where the
@@ -1859,6 +2345,32 @@ let _qid = 0;   // a stable id per queued task, so a row's buttons act on *its* 
 function queueAdd(sid, text, opts) {
   (S.queue[sid] = S.queue[sid] || []).push({ id: ++_qid, text, opts: opts || {} });
   if (sid === S.active) renderQueue();
+  queueSave();
+}
+/* A queued task is work the UI has already drawn as committed, so it outlives the tab: a reload is
+   not a reason to lose it. Only what can be sent back is written — text, opts and their attachments;
+   `steering` is a moment in a running turn, not something to restore. A write that fails (an
+   attachment's data URL past the quota) leaves the queue in memory, where it still runs. */
+const QKEY = "queue.tasks";
+function queueSave() {
+  try {
+    const o = {};
+    for (const [sid, q] of Object.entries(S.queue))
+      o[sid] = q.map(x => ({ id: x.id, text: x.text, opts: x.opts || {} }));
+    localStorage.setItem(QKEY, JSON.stringify(o));
+  } catch (e) {}
+}
+/* Restored, not re-sent: a task the last session queued is drawn in its chat and runs when that
+   chat's next turn ends, exactly as if it had been typed while the turn was running. */
+function queueLoad() {
+  try {
+    const o = JSON.parse(localStorage.getItem(QKEY) || "{}");
+    for (const [sid, q] of Object.entries(o)) {
+      if (!Array.isArray(q) || !q.length) continue;
+      S.queue[sid] = q.filter(x => x && typeof x.text === "string");
+      for (const x of S.queue[sid]) if (x.id > _qid) _qid = x.id;
+    }
+  } catch (e) {}
 }
 /* Where a steer ends up is the server's call, so the row is cleared by the `steer` event coming
    back rather than by the click: a steer that arrived too late stays queued and simply runs next. */
@@ -1866,38 +2378,61 @@ function steerLanded(sid, text) {
   const q = S.queue[sid]; if (!q) return;
   let i = q.findIndex(x => x.text === text && x.steering);
   if (i < 0) i = q.findIndex(x => x.text === text);
-  if (i >= 0) { q.splice(i, 1); if (sid === S.active) renderQueue(); }
+  if (i >= 0) { q.splice(i, 1); if (sid === S.active) renderQueue(); queueSave(); }
 }
+/* Rows are keyed by the queued task's id and edited in place, the way #working's are: #queue is an
+   aria-live region, so clearing and re-adding the list would read the whole queue out on every
+   change — and "Steer now" alone repaints twice. */
+const QROWS = new Map();
+let qHead = null, qHint = null;
 function renderQueue() {
   const box = $("#queue"); if (!box) return;
   const q = S.queue[S.active] || [];
-  box.hidden = !q.length; box.innerHTML = "";
-  if (!q.length) return;
-  box.appendChild(el("div", "qhead", q.length === 1 ? "1 task queued" : q.length + " tasks queued"));
-  q.forEach(it => {
-    const row = el("div", "qitem");
+  box.hidden = !q.length;
+  if (!q.length) { QROWS.clear(); qHead = qHint = null; box.innerHTML = ""; return; }
+  if (!qHead || qHead.parentNode !== box) {
+    box.innerHTML = "";
+    qHead = box.appendChild(el("div", "qhead"));
+    qHint = box.appendChild(el("div", "qhint", "Runs when the current task finishes."));
+  }
+  const head = q.length === 1 ? "1 task queued" : q.length + " tasks queued";
+  if (qHead.textContent !== head) qHead.textContent = head;
+  for (const it of q) {
     const nf = (it.opts && it.opts.attachments || []).length;
-    row.appendChild(el("span", "qtext", esc((it.opts && it.opts.fwd ? "↪ " : "") + it.text
-      + (nf ? (it.text ? " " : "") + "(" + nf + (nf === 1 ? " file)" : " files)") : ""))));
+    let r = QROWS.get(it.id);
+    if (!r) {
+      const row = el("div", "qitem");
+      r = { row, text: row.appendChild(el("span", "qtext")), note: null, steer: null };
+      const x = el("button", "qx", "×");
+      x.title = "Remove from the queue"; x.setAttribute("aria-label", "Remove from the queue");
+      x.onclick = () => { const i = q.findIndex(z => z.id === it.id); if (i >= 0) { q.splice(i, 1); renderQueue(); queueSave(); } };
+      r.x = row.appendChild(x);
+      QROWS.set(it.id, r);
+      box.insertBefore(row, qHint);
+    }
+    const txt = (it.opts && it.opts.fwd ? "↪ " : "") + it.text
+      + (nf ? (it.text ? " " : "") + "(" + nf + (nf === 1 ? " file)" : " files)") : "");
+    if (r.text.textContent !== txt) r.text.textContent = txt;
     /* The row is what the click leaves on screen, so it says what the click did: the turn has it and
        hands it over at its next step. It deliberately does not say the message arrived — that is the
        turn's own `steer` event to claim (see `steerNow`), and the wording must not claim it first.
        A message with files is not offered a steer: a steer carries words only, so handing it over
        early would drop them — it waits its turn, where the files go with it. */
-    if (it.steering) row.appendChild(el("span", "qnote", `<span class="spin"></span> taken — handing over…`));
-    else if (!nf) {
-      const s = el("button", "qsteer", "Steer now");
-      s.title = "Hand this to the running task now instead of waiting for it to finish";
-      s.onclick = () => steerNow(it.id);
-      row.appendChild(s);
+    if (it.steering) {
+      if (!r.note) r.note = r.row.insertBefore(el("span", "qnote", `<span class="spin"></span> taken — handing over…`), r.x);
+      if (r.steer) { r.steer.remove(); r.steer = null; }
+    } else {
+      if (r.note) { r.note.remove(); r.note = null; }
+      if (nf) { if (r.steer) { r.steer.remove(); r.steer = null; } }
+      else if (!r.steer) {
+        const s = el("button", "qsteer", "Steer now");
+        s.title = "Hand this to the running task now instead of waiting for it to finish";
+        s.onclick = () => steerNow(it.id);
+        r.steer = r.row.insertBefore(s, r.x);
+      }
     }
-    const x = el("button", "qx", "×");
-    x.title = "Remove from the queue"; x.setAttribute("aria-label", "Remove from the queue");
-    x.onclick = () => { const i = q.findIndex(z => z.id === it.id); if (i >= 0) { q.splice(i, 1); renderQueue(); } };
-    row.appendChild(x);
-    box.appendChild(row);
-  });
-  box.appendChild(el("div", "qhint", "Runs when the current task finishes."));
+  }
+  for (const [id, r] of QROWS) if (!q.some(z => z.id === id)) { r.row.remove(); QROWS.delete(id); }
 }
 /* Remove one queued task by its stable id — never by index, which shifts under the row you clicked.
    Says whether it was still there: the caller needs to know that it, and not the turn's own drain,
@@ -1906,7 +2441,7 @@ function queueDrop(sid, id) {
   const q = S.queue[sid]; if (!q) return false;
   const i = q.findIndex(z => z.id === id);
   if (i < 0) return false;
-  q.splice(i, 1); if (sid === S.active) renderQueue(); return true;
+  q.splice(i, 1); if (sid === S.active) renderQueue(); queueSave(); return true;
 }
 async function steerNow(id) {
   const q = S.queue[S.active] || []; const it = q.find(x => x.id === id); if (!it) return;
@@ -1932,18 +2467,21 @@ async function steerNow(id) {
    turn go now, while a task queued in another chat keeps waiting on that chat's own turn. */
 function drainQueue(sid) {
   const q = S.queue[sid]; if (!q || !q.length) return;
-  const it = q.shift(); if (sid === S.active) renderQueue();
+  const it = q.shift(); if (sid === S.active) renderQueue(); queueSave();
   deliver(sid, it.text, it.opts);
 }
 async function resolveApproval(allow, node) {
   node.querySelectorAll("button").forEach(b => b.disabled = true);
   node.querySelector(".t").textContent = allow ? "Allowed" : "Denied";
-  const b = S.activeIsChannel ? null : botOf(S.active);
+  /* Bound now: the card belongs to the chat it was drawn in, and the read that follows the answer
+     must not land on whichever chat is on screen by then. */
+  const sid = S.active;
+  const b = S.activeIsChannel ? null : botOf(sid);
   /* A failed answer must not leave the card frozen with both buttons greyed out. Only the approve
      call is retried-safe to re-open — a history read that failed afterwards means the answer did land,
      so the card stays closed and just keeps its wording. */
   try {
-    await post("/api/approve", { session: S.active, bot: b ? b.id : undefined, allow });
+    await post("/api/approve", { session: sid, bot: b ? b.id : undefined, allow });
   } catch (e) {
     node.querySelectorAll("button").forEach(x => x.disabled = false);
     node.querySelector(".t").textContent = "Could not send that answer — try again";
@@ -1952,8 +2490,8 @@ async function resolveApproval(allow, node) {
   if (!allow) setDock("idle");
   /* The answer landed; if the follow-up read failed the card keeps its closed wording, which is
      right — only a failed *answer* re-opens it. */
-  const h = await get("/api/history?session=" + encodeURIComponent(S.active));
-  if (h) applyApproval(h, S.active);
+  const h = await get("/api/history?session=" + encodeURIComponent(sid));
+  if (h && sid === S.active) applyApproval(h, sid);
 }
 /* One turn, bound to the chat it was started in. Every card it streams goes to that chat's sink,
    never to "whatever is on screen now", so switching chats mid-turn neither scatters the output
@@ -1964,7 +2502,9 @@ async function resolveApproval(allow, node) {
    so the tool rows and the answer being written look the same on the phone as on the desktop. `T`
    is the chat's turn state; `to` routes a room's delegated work into the member's own chat. */
 function drawTurnEvent(sid, T, ev) {
+  T.seen = Date.now();                 // the watch's only sign of life (see `pruneWatched`)
   const isChan = !!chan(sid), here = () => sid === S.active;
+  if (ev.type === "final" || ev.type === "error") clearBrowsing(sid);
   /* The live strip is fed from here, on the way in, so it sees every event exactly once and in the
      order it arrived. A turn the user has stopped is not fed: Stop already took its rows down, and a
      step still in flight on the way to landing must not put them back. */
@@ -1992,6 +2532,11 @@ function drawTurnEvent(sid, T, ev) {
       cleanBot(ev.text), to, named ? "label" : undefined); }
   else if (ev.type === "agent" && ev.state === "start") { setState(row(ev.id), "working"); sideSet(row(ev.id), "working");
     if (isChan && here()) { setDock("working"); setHead(hSub(H_STATE.working)); $("#hDot").classList.add("live"); }
+    /* A bot that handed work to a teammate is not working — it is waiting, and the corner should say
+       so: "working" for a step that is somebody else's is the one state that lies. A room keeps the
+       rule above, where six members share one face and "waiting" on one of them says less. The header
+       says it at once; the face follows within its second, because a mood is held (see `setDock`). */
+    if (!isChan && here()) { setDock("waiting"); setHead(hSub(H_STATE.waiting)); }
     /* A hand-off names what was handed over: a teammate's name with no task under it leaves the room
        showing a delegation to nothing, which is half the reason a room read as silent. The other half
        — that the card then sat unchanged for as long as that teammate's step took — is the live
@@ -2000,11 +2545,17 @@ function drawTurnEvent(sid, T, ev) {
     if (ev.name) addCard("sys", "", "▸ " + hueSpan(ev.name, "", hueOf(ev.name, sid)) + " started"
       + (ev.task ? ": " + esc(cleanBot(ev.task).slice(0, 160)) : "")
       + (isChan ? " — its steps are in " + esc(ev.name) + "'s chat" : ""), to, "text"); }
-  else if (ev.type === "agent" && ev.state === "done") { setState(row(ev.id), "finished"); sideSet(row(ev.id), "finished"); }
-  else if (ev.type === "tool") addTool(ev.agent, ev.name, ev.args || {}, ev.out, to, ev.id);
+  else if (ev.type === "agent" && ev.state === "done") { setState(row(ev.id), "finished"); sideSet(row(ev.id), "finished");
+    /* The teammate answered, so the bot is back at its own desk — until a later status says otherwise. */
+    if (!isChan && here()) { setDock("working"); setHead(hSub(H_STATE.working)); } }
+  else if (ev.type === "tool") { addTool(ev.agent, ev.name, ev.args || {}, ev.out, to, ev.id);
+    if (ev.agent && String(ev.name || "").startsWith("browser_")) markBrowsing(sid, row(ev.agent)); }
   else if (ev.type === "shot") addShot(ev.png, ev.note, undefined, to);
   else if (ev.type === "image") addShot(ev.png, ev.note, "Image", to);
-  else if (ev.type === "agent_text" && ev.text) streamText(ev, who, to, T, sid);
+  else if (ev.type === "file" && ev.att) addMsg("assistant", "", who, to, { attachments: [ev.att] });
+  /* An empty `agent_text` is the turn taking back a half-written answer it abandoned for a steer, so
+     it is dispatched like any other — `streamText` clears the bubble on it. */
+  else if (ev.type === "agent_text") streamText(ev, who, to, T, sid);
   else if (ev.type === "approval") {
     T.asking = true; addApproval(ev.cmd, ev.agent, to);
     /* The card is on screen, so the header must say what the dock says. A card waiting in a chat you
@@ -2058,7 +2609,11 @@ function drawTurnEvent(sid, T, ev) {
   /* The server's own failure — a model call or a tool that threw inside the turn. Without this
      branch the turn just stops with no report and no reason, which reads as a silent hang. */
   else if (ev.type === "error") { T.failed = true; chime("error"); announce("The bot hit an error and stopped.");
-    addCard("sys", "", "The bot hit an error and stopped: " + (ev.msg || "no reason given"), to); }
+    /* Kept on the turn, not only drawn: the redraw at the end replaces the live cards with the saved
+       record, and a record that does not carry this notice would drop the only reason the turn stopped. */
+    T.failNote = "The bot hit an error and stopped: " + (ev.msg || "no reason given");
+    T.failCard = addCard("sys", "", T.failNote, to);
+    if (here()) { failDock(ev.msg); setHead(hSub(H_STATE.error), true); $("#hDot").classList.remove("live"); } }
   /* This app stopping the bot — a refused command, a denied card, a tool that threw. It goes in the
      transcript and not only in the step row, because the row is folded and a bot that was refused
      and then went quiet used to leave the room with nothing to read: the refusal *is* the account of
@@ -2067,6 +2622,9 @@ function drawTurnEvent(sid, T, ev) {
     if (ev.level === "error") chime("error");
     announce(ev.text);
     addCard("sys", "", ev.text, to);
+    /* A rate limit is the one notice the corner should wear: it is why the turn is about to sit
+       still, and the orange sweating face says "waiting for a quota", not "broken". */
+    if (isLimit(ev.text) && here()) failDock(ev.text);
   }
 }
 async function runChat(path, payload) {
@@ -2082,6 +2640,8 @@ async function runChat(path, payload) {
   S.turns[sid] = { nodes: [], plan: null, running: true };
   const T = S.turns[sid], own = turnSink(sid);
   const mode = S.approval;                       // the approval mode this turn started under
+  let note = "";                                 // the failure's words, for the record kept below
+  delete S.failNotes[sid];                       // this chat is trying again: the old notice is spent
   renderQueue();                                 // the running chat's queued tasks are drawn, not run
   syncComposer();                                // Stop appears for this chat, and only for this chat
   try {
@@ -2089,13 +2649,24 @@ async function runChat(path, payload) {
     await refreshPending();
     for (const d of T.nodes.slice())
       if (d.classList && d.classList.contains("bot") && !d.textContent.trim()) { d.remove(); T.nodes.splice(T.nodes.indexOf(d), 1); }
-    if (here() && !S.pending[sid]) setDock("idle");
+    /* A turn that reported its own failure ended badly, not well: `idle` here would wipe the failure
+       face the error event just put up, which is what it did before this check. */
+    /* A turn that did real work earns a small celebration in the corner, and one that finished a whole
+       plan earns the bigger one. A quick answer earns neither: a cape after every reply is noise. */
+    if (here() && !T.failed && !S.pending[sid]) {
+      setDock("idle");
+      const mark = T.plan ? "milestone-confetti"
+        : T.nodes.some(n => n.classList && n.classList.contains("tool")) ? "milestone-cape" : "";
+      if (mark && S.dock) S.dock.playOnce(mark);
+    }
   } catch (e) {
     /* A turn you stopped is not a turn that broke: the stream ending because you walked away is the
        outcome you asked for, so it is said plainly and is not chimed as a failure. */
     if (T.stopped) {
       if (!here()) addCard("sys", "", "Stopped. The bot may have been part-way through a step.", own);
-      if (here()) setDock("idle");
+      /* The header follows the corner. Nothing else writes it on this path — the stream ended without
+         a status — so it kept saying "working" beside a dot that was no longer live. */
+      if (here()) { setDock("idle"); setHead(hSub("stopped")); $("#hDot").classList.remove("live"); }
     } else {
     /* The turn failed (server down, dropped stream, bad response). Say so in words the user can act
        on and hand the composer back — a stuck Send button would lock the user out until a reload. A
@@ -2105,18 +2676,22 @@ async function runChat(path, payload) {
     /* A failure the app recognises is already phrased for a person; anything else is a bug, so the
        user gets a plain sentence and the raw message goes to the console for whoever has to read it. */
     if (!(e && e.human)) console.error("turn failed:", e);
-    addCard("sys", "", e && e.human ? e.message
-      : "The turn failed. Check that the server is still running, then try again.", own);
-    /* A failed turn ends in `idle`, which has no cue of its own, so the failure is announced here
-       rather than left silent — "nothing happened" and "it broke" must not sound the same. */
+    note = e && e.human ? e.message
+      : "The turn failed. Check that the server is still running, then try again.";
+    T.failCard = addCard("sys", "", note, own);
+    /* A failed turn ends in a failure face, not in `idle`: the chime and the transcript line are not
+       enough on their own — the corner is where the eye already is. */
     chime("error"); announce("The turn failed.");
-    if (here()) setDock("idle");
+    if (here()) {
+      failDock(e && e.message);
+      setHead(hSub(H_STATE.error), true); $("#hDot").classList.remove("live");
+    }
     }
   } finally {
     T.running = false;
     /* The turn is over, however it ended — done, stopped, failed — so the strip goes with it, on the
        same beat as the header. The transcript's record is what is left. */
-    workingClear();
+    workingClear(sid);
     stepDone(T, T.failed);
     syncComposer();
     if (!here()) refreshHead();        // the chat on screen no longer needs to name a finished turn
@@ -2125,22 +2700,41 @@ async function runChat(path, payload) {
     const waiting = !!T.plan && mode === "plan";
     if (waiting) addPlanApprove(T.plan, sid);
     /* Once a turn is done the transcript is the record, so its streamed cards are dropped and a later
-       switch back shows the saved history instead of them. Two things the history does not carry are
-       kept by their chat, so a turn that ended while you were elsewhere is not a silent blank: a
-       failure notice, and a plan still waiting for your go. The final report goes with them — the
-       history has it, and keeping the card would show the same report twice. */
+       switch back shows the saved history instead of them. A plan still waiting for your go is not in
+       the transcript yet, so its card stays — with the final report dropped, because the history has
+       that and keeping the card would show the same report twice. */
     if (!T.failed && !waiting) delete S.turns[sid];
     else if (!here()) for (const n of T.nodes.slice())
       if (n.classList && n.classList.contains("final")) { n.remove(); T.nodes.splice(T.nodes.indexOf(n), 1); }
     if (here()) renderQueue();
     /* The turn's cards were the live view; now that it has stopped they are drawn again from the
        saved transcript, which is also what gives each message its place in the history — the thing
-       Edit and Retry act on. A failed turn is not redrawn: its streamed cards carry the error, and
-       that is exactly what the transcript does not have. A plan still waiting on your go is not in
-       the transcript yet either, so its card stays as it is. */
+       Edit and Retry act on. A plan still waiting on your go is not in the transcript yet either, so
+       its card stays as it is. */
     if (here() && !waiting && !T.failed) {
       await reloadTranscript();
       if (T.stopped) addCard("sys", "", "Stopped. The bot may have been part-way through a step.");
+    }
+    /* The server saves a failed turn's notice into the transcript, so the live cards are the record
+       only when that history cannot be read back — a server that is down is the one case they exist
+       for, and the failure message must not go with them. Kept beside a history that already says
+       the same thing, the failure and its tool rows were drawn twice, and once more on every visit. */
+    if (T.failed && !waiting) {
+      const h = await get("/api/history?session=" + encodeURIComponent(sid));
+      if (h) {
+        /* A disk that would not take the failure notice is the case this card exists for: the read
+           comes back without it, and dropping the live one would leave a red dock and no reason. */
+        const rows = h.messages || [], after = rows.slice(rows.map(m => m.role).lastIndexOf("user") + 1);
+        const kept = T.failCard && !after.some(m => m.role === "notice" || m.role === "sys");
+        /* Nothing reached the server, so there is nothing to come back to: keep the words and draw
+           them on every redraw of this chat, until a turn of its own starts and clears them. */
+        if (kept) S.failNotes[sid] = T.failNote || note;
+        delete S.turns[sid];
+        if (here()) {
+          S.messages = rows; render(rows, h.pending);
+          if (kept) $("#msgs").appendChild(T.failCard);
+        }
+      }
     }
     loadChats();                       // the sidebar's order and last line follow the new turn
     /* A member's chat drew this turn's work as live cards; its history has it now, so hand it back
@@ -2149,25 +2743,30 @@ async function runChat(path, payload) {
       if (!S.turns[s]) continue;
       delete S.turns[s];
       if (s === S.active) select(s);
-      drainQueue(s);                   // and a task typed into that member's chat goes too
+      /* A failed turn is a server that is not there: sending the next task would fail at once and
+         take the one after it with it, so the queue waits for a turn that can actually run. */
+      if (!T.failed) drainQueue(s);      // and a task typed into that member's chat goes too
     }
     /* Whatever was typed into *this* chat while its turn ran goes now — unless a plan is still
        waiting on your go, where a second turn would just talk over the decision you have not made.
        Another chat's queue is untouched: it is waiting on its own turn, not on this one. */
-    if (!waiting) drainQueue(sid);
+    if (!waiting && !T.failed) drainQueue(sid);
   }
 }
 /* Redraw the transcript from the server. Where the panel lands is the reader's call and `render`
    decides it — a turn ending or a poll is not a reason to drag someone out of the part they were
    reading. */
 async function reloadTranscript() {
-  /* The record is being redrawn, so the live view is over: whatever the strip was showing is in the
-     transcript now, or never happened. */
-  workingClear();
+  /* Redrawing the record says nothing about what a bot is doing: a turn is still running, and the
+     strip is the only sign of it. Wiping the rows here is how a wake-up (or a phone hand-off) left a
+     working room looking idle until the bot's next event. */
   /* A failed read leaves the transcript already on screen, which is a better answer than an empty
      one — so the redraw is skipped rather than blanking the panel. */
-  const h = await get("/api/history?session=" + encodeURIComponent(S.active));
-  if (h) { S.messages = h.messages || []; render(S.messages, h.pending); }
+  /* The chat is bound before the read, not after it: a switch mid-fetch would otherwise paint the
+     chat you left into the one you opened, and leave `S.messages` holding the wrong record. */
+  const sid = S.active;
+  const h = await get("/api/history?session=" + encodeURIComponent(sid));
+  if (h && sid === S.active) { S.messages = h.messages || []; render(S.messages, h.pending); adoptLive(sid, h.live); }
 }
 /* Stop is offered for the chat you are looking at and only while *its* turn is running — a turn in
    another chat is not yours to stop from here. Send stays live: typing into a chat whose own turn is
@@ -2181,12 +2780,15 @@ async function stopTurn() {
   const sid = S.active; if (!busy(sid)) return;
   const T = S.turns[sid]; if (!T) return;
   T.stopped = true;
-  workingClear();      // you asked for the work to stop, so the live rows stop with it (see drawTurnEvent)
+  workingClear(sid);   // you asked for the work to stop, so the live rows stop with it (see drawTurnEvent)
   const stop = $("#btnStop"); stop.disabled = true; stop.textContent = "Stopping…";
   // Ask the *server* to land the turn. Cancelling the stream alone only closes the socket — the
   // turn's thread keeps running and its events pile up in a queue nobody reads — so the turn would
   // go on working invisibly. The stream is left open on purpose, so the bot's closing report lands.
-  try { await post("/api/stop", { session: sid }); } catch (e) {}
+  const r = await jpost("/api/stop", { session: sid });
+  /* The server has no turn left to stop — a watched turn whose `done` was dropped is the case this
+     recovers, since no stream here will ever end it. Stop is the one way out, so it ends it. */
+  if (r && r.stopping === false && T.watched) await endWatched(sid);
   setTimeout(() => { stop.disabled = false; stop.textContent = "Stop"; }, 800);
 }
 /* ---------- thinking / steps (see the CSS for what this looks like) ---------- */
@@ -2451,6 +3053,7 @@ async function ctxAction(act, id, kind, dir) {
                + "their memory and their work logs, so they still know what this project is about.")) return;
     const r = await jpost("/api/clear", { session: sess });
     if (r.ok === false) { alert(r.error || "Could not clear this chat."); return; }
+    delete S.failNotes[sess];                     // a notice about a turn that never started goes with it
     await refreshPending();                       // a card that was waiting is gone with the transcript
     if (S.active === sess) select(sess);          // re-render the chat, now empty
     return;
@@ -2492,9 +3095,23 @@ function panelTop() {
 }
 
 /* ---------------- computer panel ---------------- */
-let compTimer = null;
+let compTimer = null, compTaken = false;
+/* How often the frame re-shoots. Driving it is a person looking at their own click land, so it has to
+   be quick enough to feel like a screen; watching a bot is a status readout, and 2.5s is plenty. */
+const compEvery = () => compTaken ? 600 : 2500;
+function setTaken(on) {
+  compTaken = on;
+  $("#compTake").textContent = on ? "Hand back" : "Take over";
+  $("#comp").classList.toggle("driving", on);
+  const f = $("#compFrame");
+  f.classList.toggle("drive", on);
+  f.tabIndex = on ? 0 : -1;
+  if (on) f.focus();
+  clearInterval(compTimer); compTimer = setInterval(refreshComp, compEvery());
+}
 async function openComp() {
   if ($("#files").classList.contains("on")) closeFiles(false);   // one right-hand panel at a time
+  if ($("#link").classList.contains("on")) closeLink(false);     // ...including the link viewer
   const c = $("#comp"); c.classList.add("on"); c.inert = false; document.body.classList.add("overlay");
   panelTop();
   // With no screenshot to show, the frame holds the bot itself rather than a black rectangle: a
@@ -2504,7 +3121,7 @@ async function openComp() {
   compDress();
   compAccounts();
   await refreshComp();
-  clearInterval(compTimer); compTimer = setInterval(refreshComp, 2500);
+  clearInterval(compTimer); compTimer = setInterval(refreshComp, compEvery());
 }
 /* `restoreFocus` is off for a click outside: the user has just pointed somewhere else on purpose, and
    pulling the caret back to the toolbar button would undo what they just did. Every other close — the
@@ -2513,6 +3130,9 @@ function closeComp(restoreFocus = true) {
   const c = $("#comp"); const wasOpen = c.classList.contains("on");
   c.classList.remove("on"); c.inert = true; document.body.classList.remove("overlay"); clearInterval(compTimer);
   clearTimeout(accTimer);
+  /* Closing the panel is "I am done here": a bot left paused by a panel nobody can see would look
+     like a hung browser, and the only control that could hand it back is gone with the panel. */
+  if (compTaken) { setTaken(false); jpost("/api/computer/take", { on: false }); clearInterval(compTimer); }
   if (S.compFace) { detach(S.compFace); S.compFace = null; }
   if (restoreFocus && wasOpen && $("#btnComp").focus) $("#btnComp").focus();
 }
@@ -2520,7 +3140,9 @@ function closeComp(restoreFocus = true) {
 function compDress() {
   if (!S.compFace) return;
   const b = S.activeIsChannel ? null : botOf(S.active);
-  S.compFace.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null);
+  const ck = clipKeyFor(b);
+  S.compFace.skin(b ? faceOf(b) : "mochi", b ? bigFace(b.color) : null, b ? lookOf(b) : null, clipsFor(ck));
+  S.compFace._clipKey = ck;
 }
 async function refreshComp(force) {
   // The panel polls this every 2.5s; a transient error must not throw an unhandled rejection each
@@ -2535,6 +3157,10 @@ async function refreshComp(force) {
              $("#compMeta").textContent = "the computer panel is offline — retrying…"; return; }
   const img = $("#compShot"), live = !!d.png;
   $("#compFrame").classList.toggle("live", live);
+  /* The server owns whether a person is driving: this tab may have been reloaded, or the panel may be
+     open on another device. The frame follows the server rather than its own last click. */
+  if (typeof d.human === "boolean" && d.human !== compTaken) setTaken(d.human);
+  $("#compTake").disabled = !live && !compTaken;   // nothing on screen, nothing to take over
   if (live) {
     img.src = d.png;
     // `err` alongside a picture is not a failure: it is the note saying this is the profile that is
@@ -2549,28 +3175,27 @@ async function refreshComp(force) {
     $("#compMeta").textContent = d.err || "no screen yet — open a page below";
   }
 }
-/* The accounts belong to the chat's room, so they live in this panel rather than behind the room
-   editor: browsing is what the panel is about, and a bot needs no account name typed into the chat.
-   A chat with one bot edits the default list. A room with no list of its own means "use the default
-   list", so the panel shows those rows and the first edit adopts them into the room. */
+/* The accounts belong to the chat you are in — the room's, or the bot's own when the chat is with
+   one bot — so they live in this panel rather than behind the room editor: browsing is what the
+   panel is about, and a bot needs no account name typed into the chat. Nothing is inherited: a new
+   room or bot starts with no accounts, and no chat shows another chat's rows. */
 let accTimer = null, accFor = null;     // `accFor` is the chat the rows were drawn for
 function compAccounts() {
   const box = $("#compAcc"); if (!box) return;
   clearTimeout(accTimer);
   accFor = S.active;
-  const ch = S.activeIsChannel ? chan(S.active) : null;
-  const room = ch ? ch.id : "";
-  /* Which list the rows are: the room's own once it has one, else the default list it falls back to.
-     Re-derived on every read, because the first edit in a room's panel is what gives it its own. */
-  const scope = () => ch && (ch.browser || []).length ? "?room=" + encodeURIComponent(ch.id) : "";
-  const rows = JSON.parse(JSON.stringify(ch && (ch.browser || []).length ? ch.browser
-                                                : ((S.settings.browser || {}).accounts || [])));
+  /* A bot's chat inside a room is still that room's turn, so it uses the room's list — `chanOf`
+     answers with the room for both. Only a chat with no room behind it falls to the bot's own. */
+  const ch = chanOf(S.active);
+  const who = ch || botOf(S.active) || {};   // the room, or the bot whose own chat this is
+  const room = ch ? ch.id : "", bid = ch ? "" : (who.id || "");
+  const scope = room ? "?room=" + encodeURIComponent(room)
+              : bid ? "?bot=" + encodeURIComponent(bid) : "";
+  const rows = JSON.parse(JSON.stringify(who.browser || []));
   const say = $("#compAccSay");
-  $("#compAccHint").textContent = !ch
-    ? "A chat with one bot uses the default list. The same rows live on each room in its computer panel."
-    : (ch.browser || []).length
-      ? "These are " + ch.name + "'s accounts: a bot working in this room opens a site in the account that covers it, already signed in, and opens everything else in a blank browser."
-      : "This room has no accounts of its own, so it uses the default list below. Change a row here and the room gets its own copy of the list, which the other rooms do not share.";
+  $("#compAccHint").textContent = ch
+    ? "These are " + ch.name + "'s accounts: a bot working in this room opens a site in the account that covers it, already signed in, and opens everything else in a blank browser."
+    : "These are " + (who.name || "this bot") + "'s accounts, used in a chat with it alone. Each room keeps its own list; nothing is shared between them.";
   const state = {};                   // account name -> the profile row the server reports
   const CLOSE = "Remember to close the window — closing it is what saves the login, and a window left open has not written it yet.";
   /* A row's three answers: where the account stands, what to do about it, and what its button says.
@@ -2594,7 +3219,7 @@ function compAccounts() {
   };
   const read = async () => {
     try {
-      const o = await (await fetch("/api/browser/own" + scope())).json();
+      const o = await (await fetch("/api/browser/own" + scope)).json();
       for (const pf of o.profiles || [])
         for (const n of (pf.names || [pf.name])) state[n] = pf;
     } catch (e) {}
@@ -2602,10 +3227,11 @@ function compAccounts() {
   /* Every edit is saved at once — there is no Save button in a side panel. A blank name is not an
      account, so it is left out of what is stored until it has one. */
   const saved = async () => {
-    const r = await jpost("/api/browser/accounts", { room, accounts: rows.filter(a => (a.name || "").trim()) });
+    if (!room && !bid) return;
+    const accounts = rows.filter(a => (a.name || "").trim());
+    const r = await jpost("/api/browser/accounts", room ? { room, accounts } : { bot: bid, accounts });
     if (!r.ok) { say.textContent = "Could not save — " + (r.err || "unknown"); return; }
-    if (ch) ch.browser = r.accounts;
-    else S.settings.browser = Object.assign({}, S.settings.browser || {}, { accounts: r.accounts });
+    who.browser = r.accounts;
     say.textContent = "";
   };
   const infos = [];                   // {name, owner, info, btn}, so the poll repaints and never redraws
@@ -2653,7 +3279,10 @@ function compAccounts() {
     const add = el("button", "btn ghost sm", "Add account");
     add.onclick = () => { rows.push({ name: "", sites: "" }); draw(); };
     box.appendChild(add);
-    if (box.isConnected && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
+    /* Closing the panel is a class, not a removal, so `isConnected` stays true and a callback that
+       lands after `closeComp` cleared the timer would re-arm the poll for the life of the page. The
+       panel being open is what the poll is for. */
+    if ($("#comp").classList.contains("on") && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
   };
   /* A sign-in happens in the other window, so nothing here would notice it. While a window is open,
      keep the states fresh — the row turns to Signed in on its own. Text only, so it cannot steal
@@ -2662,7 +3291,7 @@ function compAccounts() {
     clearTimeout(accTimer);
     await read();
     for (const r of infos) paintRow(r);
-    if (box.isConnected && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
+    if ($("#comp").classList.contains("on") && Object.values(state).some(x => x.up)) accTimer = setTimeout(refresh, 3000);
   };
   /* Text, tooltip and button together: the line says where the account stands, the tooltip says what
      to do about it, and the button says what pressing it will really do. */
@@ -2683,6 +3312,7 @@ function filesForChat() {
 }
 async function openFiles() {
   if ($("#comp").classList.contains("on")) closeComp(false);   // one right-hand panel at a time
+  if ($("#link").classList.contains("on")) closeLink(false);     // ...including the link viewer
   const f = $("#files");
   filesForChat();
   f.classList.add("on"); f.inert = false; document.body.classList.add("overlay");
@@ -2701,10 +3331,16 @@ function closeFiles(restoreFocus = true) {
    after a bot wrote a file shows the file. `get` answers null for every failure, so one test covers
    a server that is down and a server that refused; the refusal's own sentence is written for a
    person and is shown as it came. */
+let filesSeq = 0;
 async function refreshFiles() {
+  /* Descending into a folder fires another read without waiting for the last one, so the answers can
+     arrive out of order. Only the read asked for most recently may draw — otherwise a slow listing of
+     the folder you left lands last and rewinds the panel to it. */
+  const seq = ++filesSeq;
   const sid = encodeURIComponent(S.active || "");
   const d = await get("/api/files?session=" + sid + "&path=" + encodeURIComponent(S.filesPath || ""));
   const apps = await get("/api/file/apps?session=" + sid);
+  if (seq !== filesSeq) return;
   if (apps && apps.ok) S.filesApps = apps.apps || [];   // a failed ask keeps the last good list
   if (!d) { renderFilesNote("could not reach the server — press Refresh to try again"); return; }
   if (d.ok === false) { renderFilesNote(d.error || "That folder could not be listed.", true); return; }
@@ -2853,7 +3489,12 @@ function closeLink(restoreFocus = true) {
      and running scripts for a panel nobody can see. The history is kept, so reopening a link is
      instant to re-navigate and the Back button still knows where it was. */
   const f = $("#linkBody").querySelector(".linkframe"); if (f) f.remove();
-  if (restoreFocus && wasOpen && linkReturn && linkReturn.focus) linkReturn.focus();
+  /* The transcript is rebuilt on every turn end, so the line the link was opened from is often gone
+     by now; the composer is where a keyboard user still is. Focus must never fall to <body>. */
+  if (restoreFocus && wasOpen) {
+    const back = linkReturn && linkReturn.isConnected ? linkReturn : $("#input");
+    if (back && back.focus) back.focus();
+  }
   linkReturn = null;
 }
 
@@ -2882,6 +3523,10 @@ const TABS = [
   ["help", "Help", "help", ""],
 ];
 let curTab = "general", curEdit = null, settingsReturnFocus = null;
+/* The Faces tab polls while a drawing job runs. The chain had no handle, so leaving the tab and
+   coming back started a second one, and closing Settings left it running against a panel nobody can
+   see. One handle: `renderPanel` and `closeSettings` stop it, and the tab starts it again on entry. */
+let facePoll = null;
 /* The shell behind a dialog, taken out of reach while it is open. The focus trap keeps a Tab inside
    the modal, but a screen reader in browse mode could still walk into the chat underneath, and the
    transcript is not read-only — a stray activation there is a real edit. `inert` removes both at
@@ -2909,6 +3554,8 @@ function openSettings(tab, id) {
 }
 function closeSettings() { $("#scrim").classList.remove("on"); document.body.classList.remove("overlay");
   behindInert(false);
+  clearTimeout(facePoll);   // the Faces poll has nothing to draw into once the dialog is shut
+  syncDrawer();   // the dialog handed the shell back wholesale; the drawer's own state is not the dialog's to clear
   if (S.facePrev) { detach(S.facePrev); S.facePrev = null; }   // don't keep ticking a hidden preview
   if (settingsReturnFocus && settingsReturnFocus.focus) settingsReturnFocus.focus();
   settingsReturnFocus = null;
@@ -2956,6 +3603,7 @@ function renderTabs() {
   };
 }
 function renderPanel() {
+  clearTimeout(facePoll);   // the panel is being torn down; a poll from the old one must not outlive it
   const p = $("#setPanel"); p.innerHTML = "";
   if (S.facePrev) { detach(S.facePrev); S.facePrev = null; }   // the face preview dies with the panel
   p.setAttribute("aria-labelledby", "tab-" + curTab);
@@ -3049,7 +3697,7 @@ function toggle(p, title, sub, on, val) {
                       t.setAttribute("aria-checked", nv ? "true" : "false"); on(nv); };
   d.appendChild(t); p.appendChild(d); return t;
 }
-const saveSettings = async patch => { const r = await jpost("/api/settings", { settings: patch }); S.settings = r.settings || S.settings; applyAppearance(S.settings.appearance); };
+const saveSettings = async patch => { const r = await jpost("/api/settings", { settings: patch }); S.settings = r.settings || S.settings; applyAppearance(S.settings.appearance); return r; };
 
 /* --- General --- */
 function tabGeneral(p) {
@@ -3509,12 +4157,13 @@ function tabFaces(p) {
   /* The drawings land one bot at a time, so the gallery is refreshed on every poll: the bots that
      are done show their face while the rest are still being drawn. The panel is rebuilt once at the
      end, which is also when the sidebar rows and the dock pick the new faces up. */
+  const later = () => { clearTimeout(facePoll); facePoll = setTimeout(poll, 2000); };
   const poll = async () => {
     const f = await get("/api/faces"); if (!f) return;
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
     st.presets = f.presets || [];
     drawPresets(); drawTiles(); drawRooms(); say();
-    if (st.job.running) return void setTimeout(poll, 2000);
+    if (st.job.running) return void later();
     await reloadConfig();
     if (curTab === "faces") renderPanel();
   };
@@ -3523,7 +4172,7 @@ function tabFaces(p) {
     st.source = f.source || ""; st.files = f.files || []; st.bots = f.bots || []; st.job = f.job || {};
     st.presets = f.presets || [];
     drawPresets(); drawSource(); drawTiles(); drawRooms(); say();
-    if (st.job.running) setTimeout(poll, 2000);
+    if (st.job.running) later();
   };
   pick.onclick = () => file.click();
   file.onchange = () => {
@@ -3541,11 +4190,13 @@ function tabFaces(p) {
   };
   gen.onclick = async () => {
     gen.disabled = true; msg.style.color = ""; msg.textContent = "Starting…";
-    /* One face per bot, drawn from the source; the list is the roster the batch is assigned to. */
-    const targets = S.bots.map(b => ({ id: b.id }));
+    /* One face per bot, drawn from the source; the list is the roster the batch is assigned to. The
+       species and colour go with it because this side derives the species from the id exactly as the
+       engine does, and the drawing has to be of the same character the sidebar shows. */
+    const targets = S.bots.map(b => ({ id: b.id, species: faceOf(b), color: b.color || "" }));
     const r = await jpost("/api/faces/generate", { targets });
     if (!r.ok) { gen.disabled = false; msg.style.color = "#ff6b6b"; msg.textContent = r.error || "could not start"; return; }
-    st.job = r.job || { running: true }; say(); setTimeout(poll, 2000);
+    st.job = r.job || { running: true }; say(); later();
   };
   clr.onclick = async () => {
     if (!confirm("Clear every bot's drawn face and start over? The image you introduced stays.")) return;
@@ -3713,7 +4364,9 @@ function botEditor(p, b) {
   const save = el("button", "btn pri", "Save bot");
   save.onclick = async () => {
     if (!b.name.trim()) return alert("Give the bot a name.");
-    await post("/api/bot", { bot: b }); curEdit = null; await reloadConfig(); renderPanel();
+    const r = await (await post("/api/bot", { bot: b })).json();
+    if (!r.ok) return alert(r.error || "Could not save the bot.");   // stay on the form, keep what was typed
+    curEdit = null; await reloadConfig(); renderPanel();
   };
   const back = el("button", "btn ghost", "Back"); back.onclick = () => { curEdit = null; renderPanel(); };
   row.append(save, back);
@@ -3954,6 +4607,9 @@ function tabPhone(p) {
   rBox.append(rUrlLbl, rUrl, rSecLbl, rSec, rPhoneLbl, rPhone, rRow);
   let rToggle = null;
   const drawRelay = st => {
+    /* A refusal carries no state at all; its reason is the caller's to show. Drawing it would flip
+       the switch off and wipe the address the user just typed. */
+    if (!st || !("on" in st)) return;
     if (rToggle) rToggle.classList.toggle("on", !!st.on);
     if (document.activeElement !== rUrl) rUrl.value = st.url || "";
     rSec.value = st.secret || "";
@@ -3968,9 +4624,19 @@ function tabPhone(p) {
     + "below; nothing is opened on this machine.",
     async v => {
       rNote.textContent = "Switching…";
-      drawRelay(await jpost("/api/relay", { on: v, url: rUrl.value.trim() }));
+      const r = await jpost("/api/relay", { on: v, url: rUrl.value.trim() });
+      if (r.ok === false) {
+        rToggle.classList.toggle("on", !v); rToggle.setAttribute("aria-checked", v ? "false" : "true");
+        rNote.textContent = r.error || "Could not change the relay.";
+        return;
+      }
+      drawRelay(r);
     }, false);
-  rUrl.onchange = async () => { drawRelay(await jpost("/api/relay", { url: rUrl.value.trim() })); };
+  rUrl.onchange = async () => {
+    const r = await jpost("/api/relay", { url: rUrl.value.trim() });
+    if (r.ok === false) { rNote.textContent = r.error || "That relay address was refused."; return; }
+    drawRelay(r);
+  };
   rc.append(rNote, rBox);
   p.appendChild(rc);
   rCopySec.onclick = () => copyText(rSec.value, rCopySec);
@@ -4134,7 +4800,7 @@ function tabHelp(p) {
 
   /* ---- the browser ---- */
   s = sec("browser", "Browser");
-  feat(s, "monitor", "Browser accounts", "Where the bots browse, and with which logins. The accounts are set per room, in that room's <b>Computer</b> panel (the screen icon in the toolbar) — a bot working in a room opens a site in the account that covers it, already signed in, and opens everything else anonymously. Each row is a name and the sites it covers: click <b>Sign in</b> once, log in in the window that opens, then <b>close the window</b> — closing is what saves the login. A chat with a single bot uses the default list.");
+  feat(s, "monitor", "Browser accounts", "Where the bots browse, and with which logins. The accounts are set per room, in that room's <b>Computer</b> panel (the screen icon in the toolbar) — a bot working in a room opens a site in the account that covers it, already signed in, and opens everything else anonymously. Each row is a name and the sites it covers: click <b>Sign in</b> once, log in in the window that opens, then <b>close the window</b> — closing is what saves the login. A chat with a single bot has its own list, in the same panel; a new room or bot starts with none.");
 
   /* ---- memory ---- */
   s = sec("memory", "Memory");
@@ -4238,7 +4904,12 @@ function tabMemory(p) {
   fld(p, "BOT", sel);
   fld(p, "MEMORY.MD", ta, "Only the first 200 lines load each turn. The bot appends its own lessons here after using tools.");
   const row = el("div", "row");
-  const save = el("button", "btn pri", "Save"); save.onclick = async () => { await post("/api/memory", { bot: sel.value, text: ta.value }); save.textContent = "Saved"; setTimeout(() => save.textContent = "Save", 1200); };
+  const save = el("button", "btn pri", "Save");
+  save.onclick = async () => {
+    const r = await jpost("/api/memory", { bot: sel.value, text: ta.value });
+    if (r.ok === false) { save.textContent = r.error || "Could not save"; return; }
+    save.textContent = "Saved"; setTimeout(() => save.textContent = "Save", 1200);
+  };
   row.appendChild(save); p.appendChild(row);
   load();
 
@@ -4381,7 +5052,11 @@ function tabSkills(p) {
   p.insertBefore(frow, box.parentNode);
   const row = el("div", "row");
   const save = el("button", "btn pri", "Save");
-  save.onclick = async () => { await post("/api/bot", { bot: bot(sel.value) }); save.textContent = "Saved"; setTimeout(() => save.textContent = "Save", 1200); };
+  save.onclick = async () => {
+    const r = await (await post("/api/bot", { bot: bot(sel.value) })).json();
+    if (!r.ok) return alert(r.error || "Could not save the bot.");   // a refused name must not read as "Saved"
+    save.textContent = "Saved"; setTimeout(() => save.textContent = "Save", 1200);
+  };
   row.appendChild(save); p.appendChild(row);
   draw();
 }
@@ -4661,8 +5336,9 @@ function tabAppearance(p) {
   acc.oninput = () => applyAppearance({ ...cur(), accent: acc.value });   // preview live
   const row = el("div", "row");
   const save = el("button", "btn pri", "Save");
-  save.onclick = async () => { await saveSettings({ appearance: { ...cur(), accent: acc.value } });
-    save.textContent = "Saved"; setTimeout(() => save.textContent = "Save", 1400); };
+  save.onclick = async () => { const r = await saveSettings({ appearance: { ...cur(), accent: acc.value } });
+    save.textContent = r.ok === false ? (r.error || "Could not save") : "Saved";
+    setTimeout(() => save.textContent = "Save", 1400); };
   row.appendChild(save);
   const wrap = el("div"); wrap.appendChild(acc); wrap.appendChild(row);
   fld(p, "ACCENT", wrap, "Pick a colour. It previews live. Click Save to keep it.");
@@ -4707,9 +5383,8 @@ $("#btnHelp").onclick = () => openSettings("help");
 kbd($("#btnHelp"), $("#btnHelp").onclick);
 initRail();
 /* ---------------- the chats section, and dragging the sidebar into shape ---------------- */
-/* The label folds the section; the + beside it still opens a new chat, so a click that landed on
-   the add button is left to it. */
-const foldChats = e => { if (!e.target.closest(".add")) foldSec("chats"); };
+/* The caret and the word fold the section; the + beside them is its own button. */
+const foldChats = () => foldSec("chats");
 $("#chatsLabel").onclick = foldChats;
 kbd($("#chatsLabel"), foldChats);
 applySecs();
@@ -4744,7 +5419,7 @@ document.addEventListener("click", e => {
    so changing models never means a trip through Settings. */
 function closeModelMenu(e) {
   if (inside(e, "#mmPop, #chipModel")) return;
-  const m = $("#mmPop"); if (m) m.remove();
+  const m = $("#mmPop"); if (m) { m.hidden = true; m.innerHTML = ""; }
   $("#chipModel").setAttribute("aria-expanded", "false");
   document.removeEventListener("click", closeModelMenu, true);
 }
@@ -4758,12 +5433,10 @@ async function pickModel(m) {
    place knows the prefix and the chip's label and the menu's "in use" mark cannot drift apart. */
 const chipModelName = () => $("#chipModel").textContent.replace(/^Model:\s*/, "").trim();
 function modelMenu() {
-  if ($("#mmPop")) return closeModelMenu();
+  const pop = $("#mmPop");
+  if (!pop.hidden) return closeModelMenu();
   const chip = $("#chipModel");
-  const pop = el("div", "mpop"); pop.id = "mmPop";
-  /* The chip advertises `aria-haspopup="dialog"`, so this has to *be* one — a plain div under a
-     chip that promises a menu is a lie a screen reader repeats. Same shape as `#ctxpop`. */
-  pop.setAttribute("role", "dialog"); pop.setAttribute("aria-label", "Choose a model");
+  pop.hidden = false;
   const q = el("input"); q.placeholder = "Filter models…";
   const list = el("div", "mlist");
   const draw = () => {
@@ -4786,7 +5459,6 @@ function modelMenu() {
   const own = el("button", "mrow", `<b>Each bot's own model</b><span>Clear this chat's pick</span>`);
   own.onclick = () => pickModel("");
   pop.append(q, list, own);
-  chip.parentNode.appendChild(pop);
   chip.setAttribute("aria-expanded", "true");
   setTimeout(() => document.addEventListener("click", closeModelMenu, true), 0);
   q.focus();
@@ -4798,7 +5470,7 @@ $("#chipModel").onclick = modelMenu;
    is the only place a per-bot default is worth setting from inside the chat. */
 function closeApprovalMenu(e) {
   if (inside(e, "#apPop, #chipMem")) return;
-  const m = $("#apPop"); if (m) m.remove();
+  const m = $("#apPop"); if (m) { m.hidden = true; m.innerHTML = ""; }
   $("#chipMem").setAttribute("aria-expanded", "false");
   document.removeEventListener("click", closeApprovalMenu, true);
 }
@@ -4815,12 +5487,11 @@ async function pickApproval(mode) {
   chipApproval();
 }
 function approvalMenu() {
-  if ($("#apPop")) return closeApprovalMenu();
+  const pop = $("#apPop");
+  if (!pop.hidden) return closeApprovalMenu();
   const chip = $("#chipMem");
   const room = roomOf(S.active);
-  const pop = el("div", "mpop"); pop.id = "apPop";
-  /* Matches the chip's `aria-haspopup="dialog"` — see the note in `modelMenu`. */
-  pop.setAttribute("role", "dialog"); pop.setAttribute("aria-label", "Choose an approval level");
+  pop.hidden = false;
   if (room) {
     /* A channel has one level for the whole room, so the menu sets that and nothing else: no
        per-member pickers, because a member's own default is not what runs in a room. A bot's own
@@ -4843,7 +5514,6 @@ function approvalMenu() {
     b.onclick = () => pickApproval(v);
     pop.appendChild(b);
   }
-  chip.parentNode.appendChild(pop);
   chip.setAttribute("aria-expanded", "true");
   setTimeout(() => document.addEventListener("click", closeApprovalMenu, true), 0);
   /* A dialog the keyboard cannot enter is a dialog a keyboard user cannot use. Move focus to the
@@ -4955,6 +5625,50 @@ $("#compRefresh").onclick = async e => {
 $("#compOpen").onclick = async () => { const u = $("#compUrl").value.trim(); if (!u) return;
   await post("/api/computer/open", { url: u, session: S.active }); await refreshComp(true);
 };
+/* ---------------- driving the bot's browser ----------------
+   The frame is a screenshot scaled into a fixed box, so a click is sent as a fraction of the page,
+   never as a pixel: the image is device pixels, the page is CSS pixels, and the box letterboxes it —
+   the fraction is the one number that is the same in all three. */
+function frameSpot(e) {
+  const img = $("#compShot"), r = img.getBoundingClientRect();
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+  if (!iw || !ih || !r.width || !r.height) return null;
+  const s = Math.min(r.width / iw, r.height / ih), w = iw * s, h = ih * s;
+  const fx = (e.clientX - (r.left + (r.width - w) / 2)) / w;
+  const fy = (e.clientY - (r.top + (r.height - h) / 2)) / h;
+  return (fx < 0 || fx > 1 || fy < 0 || fy > 1) ? null : { fx, fy };
+}
+const drive = body => { if (compTaken) jpost("/api/computer/input", body); };
+$("#compTake").onclick = async () => {
+  const on = !compTaken;
+  const r = await jpost("/api/computer/take", { on });
+  if (!r || !r.ok) { $("#compMeta").textContent = (r && (r.err || r.error)) || "the browser did not answer"; return; }
+  setTaken(on);
+  await refreshComp(true);
+};
+$("#compFrame").addEventListener("click", e => {
+  if (!compTaken) return;
+  const s = frameSpot(e); if (!s) return;
+  $("#compFrame").focus();                     // so the keys that follow land in the page
+  drive({ kind: "click", fx: s.fx, fy: s.fy });
+});
+$("#compFrame").addEventListener("wheel", e => {
+  if (!compTaken) return;
+  e.preventDefault();                          // the panel must not scroll instead of the page
+  drive({ kind: "wheel", dy: e.deltaY });
+}, { passive: false });
+/* The keys a page needs but cannot be typed: Enter submits, Tab moves, Backspace deletes, the arrows
+   scroll. Everything else of one character is text. Composition (an IME) is not forwarded — it would
+   arrive as the raw key and not as the character it became. */
+const DRIVE_KEYS = new Set(["Enter", "Tab", "Backspace", "Escape", "Delete", "Home", "End",
+                            "PageUp", "PageDown", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
+$("#compFrame").addEventListener("keydown", e => {
+  if (!compTaken) return;
+  if (DRIVE_KEYS.has(e.key)) { e.preventDefault(); drive({ kind: "key", key: e.key }); return; }
+  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault(); drive({ kind: "type", text: e.key });
+  }
+});
 $("#btnFiles").onclick = openFiles;
 $("#filesClose").onclick = closeFiles;
 $("#linkClose").onclick = closeLink;
@@ -5000,7 +5714,7 @@ $("#msgs").addEventListener("click", e => {
 });
 /* The poke affordance is a real <button>, so Enter and Space come for free — no `kbd` shim. */
 $("#dockPoke").onclick = pokeDock;
-$("#dock").addEventListener("pointerenter", () => showTip(STATES_LABEL[dockReal] || dockReal));
+$("#dock").addEventListener("pointerenter", () => showTip(dockTipText()));
 $("#dock").addEventListener("pointerleave", () => $("#dockTip").classList.remove("on"));
 /* The × is a sibling of the poke button, so its clicks never reach the poke at all. */
 $("#dockHide").onclick = () => setDockHidden(true);
@@ -5083,13 +5797,46 @@ $("#input").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("#input").addEventListener("input", e => { autoGrow(e.target); renderMention(); });
+/* The draft is saved as you type, but not on every keystroke: this is a localStorage write. The chat
+   is taken now, so a timer that fires after a switch still saves where the text was typed. */
+let draftTimer = 0;
+$("#input").addEventListener("input", e => {
+  clearTimeout(draftTimer);
+  const sid = S.active, text = e.target.value;
+  draftTimer = setTimeout(() => draftSet(sid, text), 300);
+});
 /* The picker follows the caret: when the composer loses focus the list has nothing to point at, so it
    goes away. Clicking an option keeps focus (its mousedown is prevented), so this never fires there. */
 $("#input").addEventListener("blur", closeMention);
+/* The find bar: the header button, and Ctrl/Cmd+Shift+F. Plain Ctrl/Cmd+F stays the browser's own,
+   which is still the better tool for finding something outside this transcript. */
+$("#btnFind").onclick = findOpen;
+$("#findClose").onclick = () => findClose();
+$("#findPrev").onclick = () => findStep(-1);
+$("#findNext").onclick = () => findStep(1);
+$("#findInput").addEventListener("input", e => findRun(e.target.value, 0));
+$("#findInput").addEventListener("keydown", e => {
+  if (e.isComposing) return;
+  if (e.key === "Enter") { e.preventDefault(); findStep(e.shiftKey ? -1 : 1); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); findClose(); }
+});
+document.addEventListener("keydown", e => {
+  if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.key.toLowerCase() !== "f") return;
+  e.preventDefault(); findOpen();
+});
 document.addEventListener("click", closeCtx);
+/* The jump pill hangs off the composer, whose height is not a constant either: it grows with the
+   draft, the working strip and the queue. Watched rather than measured once, so the pill moves with
+   every one of them instead of painting over the first line of the draft. */
+function composerH() {
+  const c = document.querySelector(".composer"); if (!c) return;
+  document.documentElement.style.setProperty("--composer-h", Math.round(c.getBoundingClientRect().height) + "px");
+}
+const composerEl = document.querySelector(".composer");
+if (composerEl) new ResizeObserver(composerH).observe(composerEl);
 /* A resize moves the toolbar's height, so the panels' offset is re-measured alongside the menu that
    the resize invalidates anyway. */
-window.addEventListener("resize", () => { closeCtx(); panelTop(); });
+window.addEventListener("resize", () => { closeCtx(); panelTop(); composerH(); });
 /* Right-clicking a row opens the same menu as its ⋯ kebab. Help documents this, so it has to work:
    a right-click that fell through to the browser's own menu was a dead end. Delegated from the two
    static containers, so the rows themselves stay free of it. */
@@ -5113,6 +5860,9 @@ $("#filesList").addEventListener("contextmenu", e => {
    matching `.modal` stood this handler down for good and Escape dismissed nothing at all. */
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape" || $("#scrim").classList.contains("on") || document.querySelector(".modal.pick")) return;
+  /* The find bar is a surface over the transcript too, so it takes the first Escape even when the
+     caret is not in its input. */
+  if (!$("#findbar").hidden) return findClose();
   /* The menu first, before the panels: it is drawn over them, and a files menu is opened from a row
      *inside* the files panel — so with the panels checked first, Escape on a menu item dismissed the
      panel underneath and left the menu floating over nothing. Topmost surface first is the rule. */
@@ -5128,8 +5878,8 @@ document.addEventListener("keydown", e => {
      that was clicked instead. */
   if ($("#link").classList.contains("on")) { closeLink(); return; }
   if ($("#side").classList.contains("open")) { closeDrawer(); return $("#btnMenu").focus(); }
-  if ($("#mmPop")) { closeModelMenu(); return $("#chipModel").focus(); }
-  if ($("#apPop")) { closeApprovalMenu(); return $("#chipMem").focus(); }
+  if (!$("#mmPop").hidden) { closeModelMenu(); return $("#chipModel").focus(); }
+  if (!$("#apPop").hidden) { closeApprovalMenu(); return $("#chipMem").focus(); }
   if ($(".ctxwrap.open")) { closeCtxPop(); return $("#chipCtx").focus(); }
 });
 

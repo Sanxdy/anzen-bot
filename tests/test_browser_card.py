@@ -68,14 +68,16 @@ try:
         except Exception: time.sleep(0.5)
     else: raise SystemExit("server never came up")
 
-    api("/api/settings", {"settings": {"browser": {
-        "mode": "profiles", "headless": False,
-        "accounts": [{"name": "Fresh", "sites": "127.0.0.2:%d" % site.server_address[1]},
-                     {"name": "Local", "sites": "127.0.0.1:%d" % site.server_address[1]},
-                     {"name": "Unknown", "sites": "127.0.0.9:%d" % site.server_address[1]},
-                     # The user's own shape: two rows, one name, two sites. The name is what picks the
-                     # browser, so these two share one — and the site has to come from the row clicked.
-                     {"name": "Local", "sites": "localhost:%d" % site.server_address[1]}]}}})
+    api("/api/settings", {"settings": {"browser": {"mode": "profiles", "headless": False}}})
+    # The rows belong to the chat, so they go on the room the page opens on — not into a
+    # machine-wide list nothing reads any more.
+    api("/api/browser/accounts", {"room": "company", "accounts": [
+        {"name": "Fresh", "sites": "127.0.0.2:%d" % site.server_address[1]},
+        {"name": "Local", "sites": "127.0.0.1:%d" % site.server_address[1]},
+        {"name": "Unknown", "sites": "127.0.0.9:%d" % site.server_address[1]},
+        # The user's own shape: two rows, one name, two sites. The name is what picks the
+        # browser, so these two share one — and the site has to come from the row clicked.
+        {"name": "Local", "sites": "localhost:%d" % site.server_address[1]}]})
     # The mode is read when the browser attaches, so it has to be restarted for the server to be in
     # profiles mode — the same thing the old settings card did.
     api("/api/browser/restart", {})
@@ -201,21 +203,21 @@ try:
         check("the machine-wide list still answers for a chat outside a room",
               len(api("/api/browser/own")["profiles"]) > 1, api("/api/browser/own")["profiles"])
         # The complaint that made this move: the accounts were one machine-wide list in a Settings tab
-        # that no longer exists. The page opens on a room, so the rows it showed were that room's
-        # fallback — and the first edit in its panel must adopt them onto the room, not vanish.
+        # that no longer exists. A room's rows are the room's own, and one that never had any starts
+        # empty — no fallback to somebody else's list.
         seeded = [c for c in api("/api/config")["channels"] if c["id"] == "company"][0]
-        check("the first edit in a room's panel gives that room the rows it was showing",
+        check("the room's panel rows are the room's own",
               [a["name"] for a in seeded["browser"]] == ["Fresh", "Local", "Unknown", "Local", "local"],
               seeded["browser"])
-        check("  ...and a room with none left still falls back rather than losing its routing",
-              S._room_routes({"browser": []}) is None)
+        check("  ...and a room with none routes nothing rather than borrowing the machine-wide list",
+              S._own_routes({"browser": []}) == {})
 
         # The panel itself is where those rows live now, scoped to the chat you are in. It replaced
         # both the room editor's Browser section and the Settings → Browser tab, so neither may exist.
         pg.reload(wait_until="domcontentloaded"); pg.wait_for_timeout(1400)
         pg.click("#btnComp"); pg.wait_for_timeout(1000)
         names = lambda: pg.locator('#compAcc input[placeholder="Account name"]').evaluate_all("e => e.map(x => x.value)")
-        check("a one-bot chat's panel shows the default accounts", "Local" in names(), names())
+        check("the panel opens on the room's own rows", "Local" in names(), names())
         pg.click('#chans li.bot[data-id="promo"]'); pg.wait_for_timeout(900)   # a press outside closes the panel
         pg.click("#btnComp"); pg.wait_for_timeout(1000)
         check("switching to a room swaps the panel's rows for that room's",
@@ -223,6 +225,20 @@ try:
         check("  ...and the hint names the room the rows belong to",
               "Promo" in pg.locator("#compAccHint").inner_text(),
               pg.locator("#compAccHint").inner_text())
+        # A bot's own chat has its own list, and a bot that never had one shows nothing — the
+        # complaint was that a new bot inherited the whole list as if the user had set it up there.
+        check("a bot's own chat starts with no accounts of its own",
+              api("/api/browser/own?bot=producer")["profiles"] == [])
+        bsaved = api("/api/browser/accounts", {"bot": "producer",
+                                               "accounts": [{"name": "Bot acct", "sites": "bot.example"}]})
+        pb = [x for x in api("/api/config")["bots"] if x["id"] == "producer"][0]
+        check("a bot's rows save onto that bot",
+              bsaved.get("ok") and [a["name"] for a in pb.get("browser") or []] == ["Bot acct"], pb.get("browser"))
+        room_now = [a["name"] for a in [c for c in api("/api/config")["channels"]
+                                        if c["id"] == "company"][0]["browser"]]
+        check("  ...and the room's list is left alone",
+              room_now == ["Fresh", "Local", "Unknown", "Local", "local"], room_now)
+        api("/api/browser/accounts", {"bot": "producer", "accounts": []})
         pg.click("#btnSettings"); pg.wait_for_timeout(500)
         check("Settings no longer has a Browser tab",
               pg.locator("#tab-browser").count() == 0, pg.locator("#tabBrowserNav").count())

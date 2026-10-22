@@ -29,11 +29,15 @@ class MutationObserver { constructor(fn) { moCallback = fn; } observe(root, opts
 
 const containers = { "#msgs": { id: "#msgs" }, "#side": { id: "#side" }, "#setPanel": { id: "#setPanel" } };
 const documentElement = { id: "documentElement" };
+const clicks = [];
 const document = {
   documentElement,
   querySelector: sel => containers[sel] || null,
   querySelectorAll: () => [],
+  addEventListener: (type, fn) => { if (type === "click") clicks.push(fn); },
+  createElement: () => { const a = { href: "", download: "", clicked: 0, click() { this.clicked++; } }; saves.push(a); return a; },
 };
+const saves = [];
 
 let created = 0, revoked = [];
 const URLstub = { createObjectURL: () => "blob:" + (++created), revokeObjectURL: u => revoked.push(u) };
@@ -106,6 +110,25 @@ fireSrcChange(loop); await flush();                       // -> blob:1
 fireSrcChange(loop); await flush();                       // the observer firing on that same write
 ok("a second pass without a new source is a no-op", created === 1, String(created));
 ok("...and revokes nothing", revoked.length === 0, JSON.stringify(revoked));
+
+console.log("\n-- a clip and a download are carried too --");
+/* A sent video is a `<video src="/api/upload/…">` and a download is an `<a href="/api/…">`; neither
+   is an image, and on a page from disk both would resolve to a file:// path that does not exist. */
+created = 0; revoked = []; saves.length = 0;
+const clip = { nodeType: 1, tagName: "VIDEO", dataset: {}, _src: "/api/upload/chat-a/clip.mp4",
+  getAttribute(k) { return k === "src" ? this._src : null; },
+  get src() { return this._src; }, set src(v) { this._src = v; } };
+moCallback([{ type: "childList", addedNodes: [clip] }]); await flush();
+ok("a clip's source is swapped to a blob", clip.src === "blob:1", clip.src);
+
+const anchor = { getAttribute: k => k === "href" ? "/api/upload/chat-a/report.pdf" : (k === "download" ? "report.pdf" : null) };
+let stopped = false, prevented = false;
+clicks[0]({ target: { closest: () => anchor }, preventDefault: () => { prevented = true; }, stopPropagation: () => { stopped = true; } });
+await flush();
+ok("a download link is intercepted, not handed to the OS", prevented && stopped);
+ok("...and saved from a blob under its own name",
+   saves.length === 1 && saves[0].download === "report.pdf" && saves[0].href === "blob:2" && saves[0].clicked === 1,
+   JSON.stringify(saves));
 
 console.log(`\n${pass} ok, ${fail} failed`);
 process.exit(fail ? 1 : 0);

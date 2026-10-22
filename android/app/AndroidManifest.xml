@@ -7,8 +7,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- The pairing token lives in this app's SharedPreferences and its WebView cookie store, and
+         it is a bearer credential for a machine that runs shell commands. Auto Backup is on by
+         default and would copy both to the cloud, so it is off. -->
     <application
         android:label="Anzen-bot"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:hardwareAccelerated="true"

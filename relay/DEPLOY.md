@@ -65,3 +65,8 @@ cloudflared, `/etc/cloudflared/config.yml` (root) needs one rule above the catch
 Create the matching DNS record with your provider; for cloudflared, use
 `cloudflared tunnel route dns <tunnel-name> relay.example.com`. Keep backups of the config before
 editing it.
+
+The proxy must pass the public `Host` through untouched (cloudflared does). The relay replays it to
+the desktop, and the backend compares the phone's `Origin` against that name to decide who may call
+the API — a proxy that rewrites `Host` to `127.0.0.1:7788` (nginx's default `proxy_pass` does) still
+serves the shell, but every write from the phone comes back 403, which reads like a wrong token.

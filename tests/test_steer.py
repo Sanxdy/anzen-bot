@@ -179,5 +179,105 @@ ok("...and it is not drawn as though the turn took it",
 ok("...and it is not written into the record as a message the bot answered",
    "no step left for this" not in transcript("producer"))
 
+# --- 7. a steer interrupts the answer being written instead of waiting for it to finish. A step that
+#        has only streamed words has decided nothing, so it is dropped and the next step starts with
+#        the steer in front of it. Without this, "Steer now" sat on "handing over…" for as long as the
+#        step took — which for a long answer is the whole turn. ---
+CALLS.clear()
+writing = threading.Event()
+def long_stream(model, messages, tools=None, max_tokens=1600):
+    CALLS.append([m.get("content", "") for m in messages if m.get("role") == "user"])
+    n = len(CALLS)
+    yield ("delta", "writing")
+    if n == 1:
+        writing.set()
+        for _ in range(100):                       # ~10s of answer the steer must not wait for
+            time.sleep(0.1); yield ("delta", " more")
+    yield ("done", {"content": "the short answer", "tool_calls": [], "usage": {}})
+S.chat_stream = long_stream
+events7 = []; done7 = threading.Event(); answer7 = {}
+t7 = threading.Thread(target=run_turn, args=("producer", "write a long answer", events7, done7))
+t0 = time.time(); t7.start()
+writing.wait(timeout=30)
+answer7["r"] = post("/api/chat/steer", {"session": "producer", "text": "stop and do this instead"})
+t7.join(timeout=30)
+ok("the steer is taken while the bot is writing", answer7["r"].get("ok") is True, answer7["r"])
+ok("...and the answer being written does not have to finish first", time.time() - t0 < 5,
+   "took %.1fs" % (time.time() - t0))
+ok("...the bot reads it on the step that follows", any("stop and do this instead" in " ".join(c) for c in CALLS[1:]), CALLS)
+ok("...the half-written answer is not kept as its reply",
+   S.load("producer")["messages"][-1].get("content") == "the short answer",
+   S.load("producer")["messages"][-1])
+ok("...and the client is told, so the row clears at once",
+   any(e.get("type") == "steer" and e.get("text") == "stop and do this instead" for e in events7))
+
+# --- 8. Stop is immediate. It used to be read only at the top of a step, so the button did nothing
+#        until whatever the bot was in the middle of had finished — a long answer, a command, a page
+#        that never loads. Each of those is checked here, because each is a place a step can sit. ---
+print("--- Stop lands now, wherever the turn is ---")
+S.reflect = lambda *a, **k: []
+S.max_steps = real_steps
+
+# 8a. while the bot is writing its answer
+CALLS.clear(); writing2 = threading.Event()
+def long_stream2(model, messages, tools=None, max_tokens=1600):
+    CALLS.append([m.get("content", "") for m in messages if m.get("role") == "user"])
+    yield ("delta", "writing")
+    for _ in range(200):                       # ~20s of answer the Stop must not wait for
+        time.sleep(0.1); yield ("delta", " more")
+    yield ("done", {"content": "never reached", "tool_calls": [], "usage": {}})
+S.chat_stream = long_stream2
+events8 = []; done8 = threading.Event()
+t8 = threading.Thread(target=run_turn, args=("producer", "write a long answer", events8, done8))
+t0 = time.time(); t8.start()
+for _ in range(100):
+    if CALLS: break
+    time.sleep(0.05)
+time.sleep(0.3)
+post("/api/stop", {"session": "producer"})
+t8.join(timeout=10)
+ok("Stop ends a turn that is writing, at once", done8.is_set() and time.time() - t0 < 5,
+   "%.1fs" % (time.time() - t0))
+ok("...without asking the model for a closing report", len(CALLS) == 1, CALLS)
+ok("...and the half-written answer is not kept as its reply",
+   S.load("producer")["messages"][-1].get("content") != "never reached",
+   S.load("producer")["messages"][-1])
+
+# 8b. while a command is running: the command is killed, not waited out
+S._WORK.sid = "producer"
+S.STOP.add("producer")
+t9 = time.time()
+out9, rc9 = S.run_shell("sleep 30")
+ok("Stop kills a command that is already running", time.time() - t9 < 5, "%.1fs" % (time.time() - t9))
+ok("...and says so rather than reporting its output", "(stopped by the user)" in out9 and rc9 == 130, (out9, rc9))
+S.STOP.discard("producer")
+
+# 8c. around the tool calls: a call that was already in flight when Stop arrived is the last thing the
+#     step runs, and the turn lands instead of taking another step.
+ran = []
+real_exec = S.exec_tool
+S._WORK.sid = "producer"; S.STOP.add("producer")
+par = S._exec_parallel("producer", [(None, "list_files", {}), (None, "list_files", {})])
+ok("calls left after a Stop are not started",
+   all(r[0] == "(not run: the user stopped the turn)" for r in par), par)
+S.STOP.discard("producer")
+S._WORK.sid = None
+
+def one_call(model, messages, tools=None, max_tokens=1600):
+    if any(m.get("role") == "tool" for m in messages):
+        yield ("done", {"content": "landed", "tool_calls": [], "usage": {}}); return
+    yield ("done", {"content": "", "tool_calls": [
+        {"id": "a1", "function": {"name": "memory_update", "arguments": "{\"note\": \"probe\"}"}}], "usage": {}})
+def stop_during(*a, **k):
+    ran.append(a[1]); S.STOP.add("producer"); return real_exec(*a, **k)
+S.exec_tool = stop_during
+S.chat_stream = one_call
+out10 = {}
+evs10 = list(S.run_agent("producer", "producer", "do it", "", out10, S.load_bots(), {}, 0))
+S.exec_tool = real_exec
+S.STOP.discard("producer")
+ok("a Stop during a call is the last thing that step does", ran == ["memory_update"], ran)
+ok("...and the turn lands rather than starting another step", out10.get("stop") == "stop", out10)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

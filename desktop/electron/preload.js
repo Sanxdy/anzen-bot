@@ -7,7 +7,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const handlers = new Map();     // id -> { head, chunk, end, error }
-let nextId = 1;
+// Seeded per page load: main.js keeps its in-flight map across a reload, so restarting at 1 would let
+// the new page's first request receive the old turn's still-streaming chunks.
+let nextId = 1 + Math.floor(Math.random() * 1e9);
 
 ipcRenderer.on('anzen:head', (_e, m) => { const h = handlers.get(m.id); if (h) h.head(m.status, m.headers); });
 ipcRenderer.on('anzen:chunk', (_e, m) => { const h = handlers.get(m.id); if (h) h.chunk(m.b64); });

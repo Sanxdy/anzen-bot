@@ -101,6 +101,13 @@ def ensure_node_modules():
 def electron_build(ver, icon):
     """Wrap the frozen backend and the web shell into the app. `--publish never` keeps it local: a
     release is a separate, deliberate step."""
+    # electron-builder stamps the version it finds in package.json, so the two are put in step before
+    # the build and not after it — otherwise the first build after a version bump ships the old one.
+    pkg = os.path.join(ELECTRON, "package.json")
+    d = json.load(open(pkg))
+    if d.get("version") != ver:
+        d["version"] = ver
+        json.dump(d, open(pkg, "w"), indent=2)
     cmd = ["npx", "electron-builder", "--publish", "never"]
     if sys.platform == "darwin":
         cmd += ["--mac"]
@@ -110,13 +117,6 @@ def electron_build(ver, icon):
     else:
         cmd += ["--linux"]
     run(cmd, cwd=ELECTRON)
-    # electron-builder names the artefacts itself; the version it stamps comes from package.json, so
-    # keep the two in step.
-    pkg = os.path.join(ELECTRON, "package.json")
-    d = json.load(open(pkg))
-    if d.get("version") != ver:
-        d["version"] = ver
-        json.dump(d, open(pkg, "w"), indent=2)
 
 
 def main():

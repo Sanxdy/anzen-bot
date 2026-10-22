@@ -27,8 +27,24 @@ def check(name, ok, extra=""):
     (PASS if ok else FAIL).append(name)
     print(("  PASS " if ok else "  FAIL ") + name + (f"  {extra}" if extra and not ok else ""))
 
+ACC = []          # the accounts this case set, as the chat that owns them would hold them
+def routes():
+    """What a turn passes: the accounts belong to the chat, and a browser call that names none gets
+    none — there is no machine-wide fallback to inherit from."""
+    return S._route_pairs({"accounts": ACC})
 def set_browser(**kw):
+    """The rows belong to a chat now, so the settings are only how this suite spells the setup; the
+    roster carries them too, which is what a real turn in a bot's own chat reads."""
+    global ACC
+    if "accounts" in kw:
+        ACC = kw["accounts"]
+        bots = S.load_bots()
+        for b in bots: b["browser"] = [dict(a) for a in ACC]
+        S.save_bots(bots)
     s = S.load_settings(); s.setdefault("browser", {}).update(kw); S.save_settings(s)
+
+def rec(): return {"browser": ACC}
+def route(url, account=None): return S.BROWSER._route(url, S._own_routes(rec()), account)
 
 def stop(b):
     """End a browser's thread the way a restart does — the sentinel it drains closes its own
@@ -69,10 +85,6 @@ def main():
     check("an account with no name is dropped, not guessed at",
           S._route_pairs({"accounts": [{"name": "", "sites": "x.com"}, {"name": "A", "sites": "y.com"}]})
           == {"y.com": ["A"]})
-    check("a sign-in lands on the account's own first site",
-          S.account_site("X Promo") == "https://x.com", S.account_site("X Promo"))
-    check("  ...and an account with no site has nowhere to land",
-          S.account_site("Not Signed In Yet") == "" and S.account_site("nobody") == "")
     # A row's button belongs to the *row*, not to the account name. Two rows can name the same
     # account — the user's own setup had "Zenpilot.Pro" for x.com and again for threads.com — and the
     # name alone can only ever answer with whichever row was written first, so clicking Open window
@@ -90,16 +102,16 @@ def main():
 
     b = S.Browser()
     check("the site's own host routes to its profile",
-          b._route("https://x.com/home") == "X Promo")
+          route("https://x.com/home") == "X Promo")
     check("www and a port do not change the answer",
-          b._route("https://www.x.com:443/") == "X Promo")
+          route("https://www.x.com:443/") == "X Promo")
     check("a subdomain follows its parent domain",
-          b._route("https://mobile.x.com/status/1") == "X Promo")
+          route("https://mobile.x.com/status/1") == "X Promo")
     check("a parent domain does not swallow an unrelated one",
-          b._route("https://notx.com/") is None)
+          route("https://notx.com/") is None)
     check("a site nobody routed has no profile",
-          b._route("https://example.com/") is None)
-    check("an empty or scheme-less URL has no profile", b._route("") is None)
+          route("https://example.com/") is None)
+    check("an empty or scheme-less URL has no profile", route("") is None)
 
     # ---- two accounts on one site: the bug this fixes ----
     # FPL keeps one account per browser session, so two teams are two saved profiles — and both have
@@ -112,11 +124,11 @@ def main():
           S._route_pairs()["fantasy.premierleague.com"] == ["Gmail FPL", "Yahoo FPL"],
           str(S._route_pairs()))
     check("the first account is the default, and the other can be named",
-          b._route("https://fantasy.premierleague.com/") == "Gmail FPL"
-          and b._route("https://fantasy.premierleague.com/", account="Yahoo FPL") == "Yahoo FPL")
+          route("https://fantasy.premierleague.com/") == "Gmail FPL"
+          and route("https://fantasy.premierleague.com/", account="Yahoo FPL") == "Yahoo FPL")
     check("an account that does not cover the site is never handed it",
-          b._route("https://fantasy.premierleague.com/", account="X Promo") is None)
-    mbrief = S.browser_brief()
+          route("https://fantasy.premierleague.com/", account="X Promo") is None)
+    mbrief = S.browser_brief(rec())
     check("the brief names every account on a shared site, and says how to choose",
           "Gmail FPL for fantasy.premierleague.com" in mbrief
           and "Yahoo FPL for fantasy.premierleague.com" in mbrief
@@ -125,7 +137,7 @@ def main():
     # fresh threads: without the copy a `browser_open` sharing a step fell back to the machine-wide
     # table, so a room's own accounts were lost.
     real_exec = S.exec_tool
-    S._WORK.routes = S._room_routes({"browser": [{"name": "Gmail FPL", "sites": "fantasy.premierleague.com"},
+    S._WORK.routes = S._own_routes({"browser": [{"name": "Gmail FPL", "sites": "fantasy.premierleague.com"},
                                                  {"name": "Yahoo FPL", "sites": "fantasy.premierleague.com"}]})
     try:
         S.exec_tool = lambda bid, name, args: (getattr(S._WORK, "routes", None), [])
@@ -212,13 +224,16 @@ def main():
             self.send_header("Set-Cookie", "anzen_probe=signed-in; Path=/; Max-Age=86400")
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
         def log_message(self, *a): pass
-    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    # Threading, because a browser leaves its socket to this page open: one-threaded, that idle
+    # connection holds the loop and `srv.shutdown()` at the end waits for it forever.
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     site = "http://127.0.0.1:%d/" % srv.server_address[1]
     other = site.replace("127.0.0.1", "localhost")
 
     b.start()
-    first = str(b.call("open", url=site))
+    first = str(b.call("open", routes=routes(), url=site))
     check("the first visit is not signed in yet", "no-cookie" in first, first[:200])
     wd = str(b.call("eval", expression="navigator.webdriver"))
     check("the account's browser does not announce itself as automated — the flag Google reads",
@@ -233,7 +248,7 @@ def main():
     check("the profile folder was made on disk", os.path.isdir(S.own_profile_dir("X Promo")))
     check("the account shows as open while its browser is up", "X Promo" in b.open_profiles())
     # ...and a different account is a different browser, so it never sees the first one's cookies.
-    other_read = str(b.call("open", url=other))
+    other_read = str(b.call("open", routes=routes(), url=other))
     check("a second account is a separate browser, with its own cookies",
           "no-cookie" in other_read, other_read[:200])
     # ...including when both accounts cover the SAME site. Two profiles are two persistent contexts,
@@ -242,8 +257,8 @@ def main():
     # never visited this host, so the two answers can only come from two sessions.
     set_browser(accounts=[{"name": "X Promo", "sites": "127.0.0.1"},
                           {"name": "FB Page", "sites": "127.0.0.1"}])
-    x1 = str(b.call("open", url=site, account="X Promo"))
-    f1 = str(b.call("open", url=site, account="FB Page"))
+    x1 = str(b.call("open", routes=routes(), url=site, account="X Promo"))
+    f1 = str(b.call("open", routes=routes(), url=site, account="FB Page"))
     check("two accounts on one site are each reachable, and each is its own session",
           "anzen_probe=signed-in" in x1 and "no-cookie" in f1, x1[:120] + " | " + f1[:120])
     check("  ...and both profiles are up at the same time",
@@ -255,14 +270,14 @@ def main():
 
     # ---- the point: the cookie a page set is still there in the next run ----
     b2 = S.Browser(); b2.start()
-    kept = str(b2.call("open", url=site))
+    kept = str(b2.call("open", routes=routes(), url=site))
     check("the cookie a page set is still there in the next run — the sign-in survives",
           "anzen_probe=signed-in" in kept, kept[:200])
 
     # ---- the user is told to close the sign-in window when done; that must not brick the account ----
     b2.call("_probe_quit", name="X Promo")             # the user quits that account's browser
     check("a profile the user quit is launched again, not handed back dead",
-          "anzen_probe=signed-in" in str(b2.call("open", url=site)))
+          "anzen_probe=signed-in" in str(b2.call("open", routes=routes(), url=site)))
     stop(b2)
 
     # ---- Sign in must land on the site, not on a blank window ----
@@ -288,7 +303,7 @@ def main():
     set_browser(accounts=[{"name": "X Promo", "sites": "x.com, twitter.com"},
                           {"name": "FB Page", "sites": "facebook.com, localhost"}],
                 mode="profiles", profile="default", headless=True)
-    b3.call("open", url=site)
+    b3.call("open", routes=routes(), url=site)
     anon_ua = str(b3.call("eval", expression="navigator.userAgent"))
     check("the throwaway browser does not announce itself as headless either",
           "HeadlessChrome" not in anon_ua and "Chrome/" in anon_ua, anon_ua)
@@ -307,14 +322,14 @@ def main():
     check("a restart closes the browsers the old thread owned, instead of leaking them",
           not browsers_on(folder), browsers_on(folder)[:1])
     check("  ...and the account still works afterwards",
-          "anzen_probe=signed-in" in str(b3.call("open", url=site)))
+          "anzen_probe=signed-in" in str(b3.call("open", routes=routes(), url=site)))
     stop(b3)
 
     # ---- the bots must be told which sites open signed in, or they never use them ----
     # The accounts live only in Settings, so a bot asked to manage Threads and Facebook cannot find
     # out that an account covers them. This drives a real turn with a stubbed model and reads the
     # system prompt that was actually sent.
-    brief = S.browser_brief()
+    brief = S.browser_brief(rec())
     check("the brief names each account and the sites it covers",
           "X Promo for" in brief and "FB Page for" in brief
           and "x.com" in brief and "facebook.com" in brief, brief)
@@ -375,7 +390,7 @@ def main():
     # Many accounts must not be able to crowd the prompt: the extras are counted, not listed.
     set_browser(mode="profiles",
                 accounts=[{"name": "Acct %02d" % i, "sites": "site%02d.example" % i} for i in range(60)])
-    long_brief = S.browser_brief()
+    long_brief = S.browser_brief(rec())
     check("a user with many accounts cannot crowd out the prompt",
           len(long_brief) < S.BROWSER_BRIEF_CHARS + 700, len(long_brief))
     check("  ...and the ones that did not fit are counted, not silently dropped",
@@ -461,11 +476,11 @@ def main():
         t0 = truth()
         check("an account that was never opened is not signed in",
               t0["exists"] is False and t0["signed_in"] is not True, str(t0))
-        b4.call("open", url=plain, timeout=180)
+        b4.call("open", routes=routes(), url=plain, timeout=180)
         t1 = truth()
         check("a window opened but not logged into is not signed in",
               t1["up"] is True and t1["signed_in"] is False, str(t1))
-        b4.call("open", url=login, timeout=180)
+        b4.call("open", routes=routes(), url=login, timeout=180)
         t2 = truth()
         check("SIGNED IN is known while the window is still open — Chrome keeps cookies in memory "
               "until it closes, so this can only come from asking the browser itself",
@@ -478,12 +493,12 @@ def main():
               t3["up"] is False, str(t3))
         # And the bot must be told the same truth the user sees.
         check("the brief says signed in once the sign-in is real",
-              "(signed in)" in S.browser_brief(), S.browser_brief()[:200])
+              "(signed in)" in S.browser_brief(rec()), S.browser_brief(rec())[:200])
     finally:
         stop(b4); S.BROWSER = keep_browser; S.AUTH_COOKIES.pop("127.0.0.1", None); lsrv.shutdown()
     check("a site we cannot judge is called unconfirmed in the brief, not signed in",
-          "not confirmed" in S.browser_brief() and "(signed in)" not in S.browser_brief(),
-          S.browser_brief()[:200])
+          "not confirmed" in S.browser_brief(rec()) and "(signed in)" not in S.browser_brief(rec()),
+          S.browser_brief(rec())[:200])
 
     srv.shutdown()
 

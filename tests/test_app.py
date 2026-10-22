@@ -339,6 +339,17 @@ def main():
         pg.eval_on_selector("#dock", "e=>e.click()"); pg.wait_for_timeout(400)
         st1 = pg.eval_on_selector("#hStatus", "e=>e.textContent")
         check("dock poke does not change the state", st0 == st1, f"{st0}->{st1}")
+        # The bubble is the face's, not the corner's: it lives inside the dock so it follows the face,
+        # and it names who the face is — the one thing a picture cannot say.
+        pg.hover("#dockPoke"); pg.wait_for_timeout(250)
+        tip = pg.evaluate("()=>{const t=document.getElementById('dockTip');"
+                          "return {inDock: t.parentElement.id==='dock', on: t.classList.contains('on'),"
+                          "text: t.textContent, name: document.getElementById('hName').textContent}}")
+        check("the mascot's bubble belongs to the face", tip["inDock"] and tip["on"], str(tip))
+        check("...and it says whose face it is, and what it is doing",
+              " · " in tip["text"] and
+              tip["text"].split(" · ")[0] in (tip["name"].split()[-1], "Mochi"), str(tip))
+        pg.mouse.move(4, 4); pg.wait_for_timeout(200)
 
         # ---- 4. settings: 15 tabs, each renders ----
         pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(500)
@@ -435,6 +446,22 @@ def main():
         pg.wait_for_timeout(900)
         bots3 = pg.eval_on_selector_all("#bots .subbot .nm", "els=>els.map(e=>e.innerText.trim())")
         check("duplicate creates a copy", any("copy" in b for b in bots3), str(bots3))
+        check("no two bots in the sidebar share a name", len(bots3) == len(set(bots3)), str(bots3))
+
+        # ---- 6b. a name already in use is refused, out loud ----
+        pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(300)
+        pg.eval_on_selector("#tab-bots", "e=>e.click()"); pg.wait_for_timeout(250)   # Bots
+        pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(300)   # New bot
+        pg.eval_on_selector_all("#setPanel input", "els=>{els[0].value='designer';els[0].dispatchEvent(new Event('change'));}")
+        said = []
+        pg.once("dialog", lambda d: (said.append(d.message), d.accept()))
+        pg.eval_on_selector("#setPanel .btn.pri", "e=>e.click()"); pg.wait_for_timeout(900)   # Save bot
+        check("a bot may not take a name another one already has",
+              bool(said) and "designer" in said[0].lower(), str(said))
+        pg.eval_on_selector("#sClose", "e=>e.click()"); pg.wait_for_timeout(400)
+        bots4 = pg.eval_on_selector_all("#bots .subbot .nm", "els=>els.map(e=>e.innerText.trim())")
+        check("...and the refused bot left no row behind",
+              len(bots4) == len(set(bots4)) and not any(n.lower().startswith("designer 2") for n in bots4), str(bots4))
 
         # ---- 7. create a channel ----
         pg.eval_on_selector("#addChannel", "e=>e.click()"); pg.wait_for_timeout(400)
@@ -920,6 +947,130 @@ def main():
         pg.eval_on_selector("#compClose", "e=>e.click()"); pg.wait_for_timeout(300)
         check("computer panel closes", not pg.eval_on_selector("#comp", "e=>e.classList.contains('on')"))
 
+        # ---- 11a. take the bot's browser, then hand it back ----
+        # What is checked is the state machine the panel relies on: a gesture is refused until the
+        # panel takes the browser, the takeover is remembered by the server (the panel reads it back
+        # on every poll rather than trusting its own last click), and hand-back clears it again.
+        r = pg.evaluate("""async()=>{const j=(u,b)=>fetch(u,{method:'POST',
+                headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+            const before=await j('/api/computer/input',{kind:'click',fx:.5,fy:.5});
+            const take=await j('/api/computer/take',{on:true});
+            const pv=await (await fetch('/api/computer/preview')).json();
+            const give=await j('/api/computer/take',{on:false});
+            const pv2=await (await fetch('/api/computer/preview')).json();
+            const after=await j('/api/computer/input',{kind:'click',fx:.5,fy:.5});
+            return {before,take,human:pv.human,human2:pv2.human,give,after};}""")
+        check("the panel offers a takeover", pg.eval_on_selector("#compTake", "e=>e.textContent.trim()") == "Take over")
+        check("a gesture is refused until the panel takes the browser", r["before"]["ok"] is False, str(r["before"]))
+        check("taking over is remembered by the server", r["take"]["ok"] and r["human"] is True, str(r))
+        check("handing back clears it", r["give"]["ok"] and r["human2"] is False, str(r))
+        check("a gesture after hand-back is refused again", r["after"]["ok"] is False, str(r["after"]))
+
+        # ---- 11b. a bot on the web shows it in the chat, on its row, and in the header ----
+        # The turn is stood in for, so what is checked is the wiring: the step reads "using the
+        # browser" in the conversation and carries the way to the page, the mark lands on the bot's
+        # own row (inside its company, not on the company row), the header names it, and the turn's
+        # end takes all of it away rather than leaving a bot marked as browsing forever.
+        where = pg.evaluate("""()=>{
+            const sel=document.querySelector('#chans .bot.sel, #bots .bot.sel');
+            if(!sel) return null;
+            const id=sel.dataset.id;
+            if(id.includes('/')) return {orig:id, sid:id, bot:id.split('/').pop(), key:id};
+            if(sel.dataset.kind==='channel'){
+                const m=document.querySelector('#chans .sub .subbot[data-id^="'+id+'/"]');
+                return m?{orig:id, sid:id, bot:m.dataset.id.split('/').pop(), key:m.dataset.id}:null;
+            }
+            return {orig:id, sid:id, bot:id, key:id};}""")
+        check("the open chat has a row to mark", bool(where), str(where))
+        if where:
+            # A room hands each member's steps to that member's own chat, and a row is only on
+            # screen in the chat it belongs to — so the member's chat is where this turn is watched.
+            pg.evaluate("id=>{const n=document.querySelector('#chans .bot[data-id=\"'+id+'\"]');"
+                        "if(n) n.click()}", where["key"]); pg.wait_for_timeout(700)
+            web_turn = {"evs": []}
+            pg.route("**/api/chat", lambda r: r.fulfill(status=200, content_type="text/event-stream",
+                body="".join("data: " + json.dumps(e) + "\n\n" for e in web_turn["evs"])))
+            # The transcript is handed back to the saved record when a turn ends, so a step row lives
+            # only while the turn runs. Watching the transcript as it is drawn is therefore the only
+            # way to check what the user actually saw — and the Watch button is pressed from inside
+            # that callback, on the row while it is still on screen.
+            pg.evaluate("""()=>{
+                window.__web=[]; const seen=new WeakMap();
+                new MutationObserver(ms=>{
+                  for(const m of ms){
+                    const t=m.target.nodeType===1?m.target:m.target.parentElement;
+                    const row=t&&t.closest&&t.closest('.m.tool');
+                    if(row&&seen.has(row)){ seen.get(row).head=(row.querySelector('.h')||{}).textContent||''; continue; }
+                    for(const n of m.addedNodes){
+                      if(!(n.nodeType===1&&n.classList.contains('tool'))) continue;
+                      const who=(n.querySelector('.who')||{}).textContent||'';
+                      if(!/using the browser/.test(who)) continue;
+                      const r={who, head:(n.querySelector('.h')||{}).textContent||'',
+                               watch:!!n.querySelector('.tview')};
+                      seen.set(n,r); window.__web.push(r);
+                      if(r.watch){ n.querySelector('.tview').click();
+                        r.opened=document.querySelector('#comp').classList.contains('on'); }
+                    }
+                  }
+                }).observe(document.querySelector('#msgs'),{childList:true,subtree:true,characterData:true});
+            }""")
+            try:
+                web_turn["evs"] = [{"type": "status", "state": "working"},
+                    {"type": "tool", "agent": where["bot"], "name": "browser_open",
+                     "args": {"url": "https://example.com"}, "out": None, "id": "t1"}, {"type": "done"}]
+                pg.fill("#input", "look at the web"); pg.eval_on_selector("#btnSend", "e=>e.click()")
+                pg.wait_for_timeout(900)
+                marked = pg.evaluate("""()=>[...document.querySelectorAll('#bots .bot .web.on, #chans .bot .web.on')]
+                    .map(w=>w.closest('.bot').dataset.id)""")
+                check("a bot on the web is marked on its own row", where["key"] in marked, str(marked))
+                check("the mark is on no unrelated row", set(marked) <= {where["key"], where["sid"]}, str(marked))
+                check("the mark is a button you can press",
+                      pg.eval_on_selector("#chans .web.on, #bots .web.on", "e=>e.getAttribute('role')") == "button")
+                web = pg.evaluate("()=>window.__web")
+                check("the chat shows the browser step as 'using the browser'", bool(web), str(web))
+                check("...and the step names the page it opened",
+                      bool(web) and web[0]["head"] == "https://example.com", str(web[:1]))
+                check("...and carries the way to that page", bool(web) and web[0]["watch"], str(web[:1]))
+                check("pressing Watch on the step opens the computer panel",
+                      bool(web) and web[0].get("opened") is True, str(web[:1]))
+                # The chat's own header, not just the sidebar: this is the window you are reading
+                # while the turn runs, so it names what the bot is doing there.
+                check("the chat header says the bot is on the browser",
+                      pg.eval_on_selector("#chipWeb", "e=>e.classList.contains('on') && getComputedStyle(e).display!=='none'"))
+                pg.eval_on_selector("#compClose", "e=>e.click()"); pg.wait_for_timeout(300)
+                # The same call's result fills that row rather than drawing a second one, and the row
+                # then names the page by its title — what is on screen, not what was asked for.
+                web_turn["evs"] = [{"type": "tool", "agent": where["bot"], "name": "browser_open",
+                    "args": {"url": "https://example.com"}, "id": "t1",
+                    "out": json.dumps({"url": "https://example.com", "title": "Example Domain", "text": "hi"})},
+                    {"type": "done"}]
+                pg.fill("#input", "again"); pg.eval_on_selector("#btnSend", "e=>e.click()")
+                pg.wait_for_timeout(900)
+                again = pg.evaluate("()=>window.__web.slice(1).map(r=>r.head)")
+                check("the finished step names the page by its title", again == ["Example Domain"], str(again))
+                check("...and it is still one row, not a second one", len(again) == 1, str(again))
+                pg.eval_on_selector("#chipWeb", "e=>e.click()")
+                pg.wait_for_timeout(600)
+                check("pressing the header chip opens the computer panel",
+                      pg.eval_on_selector("#comp", "e=>e.classList.contains('on')"))
+                pg.eval_on_selector("#compClose", "e=>e.click()"); pg.wait_for_timeout(300)
+                pg.eval_on_selector("#chans .web.on, #bots .web.on", "e=>e.click()")
+                pg.wait_for_timeout(600)
+                check("pressing the mark opens the computer panel",
+                      pg.eval_on_selector("#comp", "e=>e.classList.contains('on')"))
+                web_turn["evs"] = [{"type": "final", "text": "read it"}, {"type": "done"}]
+                pg.fill("#input", "thanks"); pg.eval_on_selector("#btnSend", "e=>e.click()")
+                pg.wait_for_timeout(900)
+                check("the mark goes away when the turn ends",
+                      pg.evaluate("()=>!document.querySelector('#bots .web.on, #chans .web.on')"))
+                check("...and the chat header stops saying it",
+                      pg.eval_on_selector("#chipWeb", "e=>!e.classList.contains('on')"))
+            finally:
+                pg.unroute("**/api/chat")
+                pg.eval_on_selector("#compClose", "e=>e.click()"); pg.wait_for_timeout(300)
+                pg.evaluate("id=>{const n=document.querySelector('#chans .bot[data-id=\"'+id+'\"]');"
+                            "if(n) n.click()}", where["orig"]); pg.wait_for_timeout(700)
+
         # ---- 11b. PWA / installable app ----
         man = pg.evaluate("async()=>{const r=await fetch('manifest.webmanifest');return {ct:r.headers.get('content-type'),body:await r.json()}}")
         check("manifest served as manifest+json", "manifest" in (man["ct"] or ""), man["ct"])
@@ -1160,6 +1311,9 @@ def main():
         for gone in ("/api/browser/profiles", "/api/browser/launch"):
             code = pg.evaluate("async(u)=>(await fetch(u)).status", gone)
             check("the retired endpoint %s answers 404" % gone, code == 404, code)
+        # Those two 404s are this suite's own requests, and the console line they leave is not the app
+        # misbehaving — the checks below count console errors.
+        errors[:] = [e for e in errors if "404 (Not Found)" not in e]
 
         saved = pg.evaluate("async()=>await (await fetch('/api/browser/accounts',{method:'POST',"
                             "headers:{'Content-Type':'application/json'},"
@@ -1370,7 +1524,7 @@ def main():
         check("send button re-enabled after the turn", not pg.eval_on_selector("#btnSend", "e=>e.disabled"))
         check("card labels are single-line",
               all(h <= 20 for h in pg.eval_on_selector_all("#msgs .m .who", "els=>els.map(e=>Math.round(e.getBoundingClientRect().height))")))
-        check("no JS errors after a full turn", not errors, str(errors[:3]))
+        check("no JS errors after a full turn", not errors, str(errors[:3]) + " | " + str(badresp[:3]))
         # the turn wrote only into the suite's own room, so the user's transcript is untouched
         check("the turn left every other room alone",
               pg.evaluate("""async(r)=>{
@@ -1410,7 +1564,7 @@ def main():
             if(!/[/]api[/]chat([?]|$)/.test(String(u))) return window.__pf(u,o);
             let ctrl; const body=new ReadableStream({start(c){ctrl=c;}});
             const enc=new TextEncoder();
-            window.__turn={send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>ctrl.close()};
+            window.__turn={send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>{ctrl.enqueue(enc.encode('data: '+JSON.stringify({type:'done'})+'\\n\\n')); ctrl.close()}};
             return Promise.resolve(new Response(body,{status:200,headers:{'Content-Type':'text/event-stream'}}));
           };}""")
         pg.fill("#input", "switch-probe task")
@@ -1428,7 +1582,14 @@ def main():
         check("the composer stays open while its turn runs, so a task can be queued",
               not pg.eval_on_selector("#btnSend", "e=>e.disabled"))
         # Switch to a different chat while that turn is still streaming.
+        has_vt = pg.evaluate("()=>typeof document.startViewTransition==='function'")
+        pg.evaluate("""()=>{window.__vt=0; const o=document.startViewTransition &&
+            document.startViewTransition.bind(document);
+          if(o) document.startViewTransition=(cb)=>{window.__vt++; return o(cb);};}""")
         pg.evaluate(click_room, sw_rooms["b"]); pg.wait_for_timeout(600)
+        check("switching chats dissolves into the new transcript",
+              pg.evaluate("()=>window.__vt") == (1 if has_vt else 0),
+              "view transitions: %s, used %s" % (has_vt, pg.evaluate("()=>window.__vt")))
         check("switching chats does not scatter the running turn into the new chat",
               not pg.evaluate("()=>document.querySelector('#msgs').textContent.includes('switch-probe')"))
         check("the chat you switched to says the other one is working",
@@ -1476,7 +1637,7 @@ def main():
         pg.evaluate("()=>window.__turn.end()"); pg.wait_for_timeout(800)
         check("send is handed back when the turn ends",
               not pg.eval_on_selector("#btnSend", "e=>e.disabled"))
-        check("no JS errors while switching mid-turn", not errors, str(errors[:3]))
+        check("no JS errors while switching mid-turn", not errors, str(errors[:3]) + " | " + str(badresp[:3]))
         pg.evaluate("()=>{window.fetch=window.__pf}")
         # A turn that fails while you are in another chat must still leave its notice behind, and
         # must not leave it in the chat you were looking at.
@@ -1497,7 +1658,7 @@ def main():
         pg.evaluate(click_room, sw_rooms["a"]); pg.wait_for_timeout(500)
         check("coming back to a chat that failed still shows the notice",
               pg.evaluate("()=>document.querySelector('#msgs').textContent.includes('Could not reach the server')"))
-        check("no JS errors after a mid-turn switch and a failure", not errors, str(errors[:3]))
+        check("no JS errors after a mid-turn switch and a failure", not errors, str(errors[:3]) + " | " + str(badresp[:3]))
         pg.evaluate("()=>{window.fetch=window.__pf2}")
         # A stream that dies after the turn had begun is a different thing from one that never
         # started: the bot may still be working, and the notice must say so rather than show the
@@ -1542,7 +1703,7 @@ def main():
             window.__sent.push(JSON.parse(o.body).text);
             let ctrl; const body=new ReadableStream({start(c){ctrl=c;}});
             const enc=new TextEncoder();
-            window.__turns.push({send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>ctrl.close()});
+            window.__turns.push({send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>{ctrl.enqueue(enc.encode('data: '+JSON.stringify({type:'done'})+'\\n\\n')); ctrl.close()}});
             return Promise.resolve(new Response(body,{status:200,headers:{'Content-Type':'text/event-stream'}}));
           };}""")
         pg.fill("#input", "queue-probe one"); pg.eval_on_selector("#btnSend", "e=>e.click()")
@@ -1567,6 +1728,17 @@ def main():
         check("the steered task leaves the queue once the turn has it",
               pg.eval_on_selector("#queue", "e=>e.hidden"))
         check("steering starts no second turn", pg.evaluate("()=>window.__turns.length===1"))
+        # A steer interrupts an answer being written, and the turn takes the half-written bubble back
+        # with an empty `agent_text` — so the abandoned words do not sit under the answer that follows.
+        pg.evaluate("(ev)=>window.__turns[0].send(ev)",
+                    {"type": "agent_text", "agent": "x", "text": "half an answer", "delta": True})
+        pg.wait_for_timeout(200)
+        check("an answer is drawn while it is being written",
+              pg.evaluate("()=>document.querySelector('#msgs').textContent.includes('half an answer')"))
+        pg.evaluate("(ev)=>window.__turns[0].send(ev)", {"type": "agent_text", "agent": "x", "text": ""})
+        pg.wait_for_timeout(200)
+        check("an abandoned answer is taken back off the screen",
+              not pg.evaluate("()=>document.querySelector('#msgs').textContent.includes('half an answer')"))
         # A task left alone must run by itself when the turn it was queued behind finishes.
         pg.fill("#input", "queue-probe three"); pg.eval_on_selector("#btnSend", "e=>e.click()")
         pg.wait_for_timeout(250)
@@ -1606,7 +1778,7 @@ def main():
             if(window.__live) return window.__pfq(u,o);           // a real turn, so the server keeps it
             let ctrl; const body=new ReadableStream({start(c){ctrl=c;}});
             const enc=new TextEncoder();
-            window.__turns.push({send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>ctrl.close()});
+            window.__turns.push({send:ev=>ctrl.enqueue(enc.encode('data: '+JSON.stringify(ev)+'\\n\\n')), end:()=>{ctrl.enqueue(enc.encode('data: '+JSON.stringify({type:'done'})+'\\n\\n')); ctrl.close()}});
             return Promise.resolve(new Response(body,{status:200,headers:{'Content-Type':'text/event-stream'}}));
           };}""")
         pg.evaluate("(id)=>[...document.querySelectorAll('#bots .bot')].find(e=>e.dataset.id===id).click()", qf["src"])
@@ -1890,7 +2062,7 @@ def main():
         box = pg.eval_on_selector("#setPanel .lgprev .mc.img",
             "e=>{const r=e.getBoundingClientRect();return {w:Math.round(r.width),h:Math.round(r.height)}}")
         check("the logo preview is the row's size, not the image's natural size",
-              box["w"] == 46 and box["h"] == 46, str(box))
+              box["w"] == 52 and box["h"] == 52, str(box))
         check("no Remove button while the logo is only the repo's",
               pg.eval_on_selector_all("#setPanel .logofld button",
                   "els=>els.filter(b=>b.innerText.trim()==='Remove'&&b.offsetParent!==null).length") == 0)
@@ -1988,11 +2160,17 @@ def main():
         # The CHATS list is a second place a bot's face is shown, and it used to draw a generic
         # glyph there: setting a face changed the ROOMS row and nothing else. A direct chat now
         # paints the bot's own face; a room keeps its icon.
-        chatfaces = pg.evaluate("""()=>[...document.querySelectorAll('#chats li.chat')].map(li=>({
-            id: li.dataset.id, canvas: !!li.querySelector('canvas.ck.face')}))""")
-        direct = [c for c in chatfaces if "/" in c["id"]]
+        chatfaces = pg.evaluate("""async()=>{const c=await (await fetch('/api/config')).json();
+          const bots=new Set(c.bots.map(b=>b.id)), rooms=new Set(c.channels.map(x=>x.id));
+          return [...document.querySelectorAll('#chats li.chat')].map(li=>({
+            id: li.dataset.id, canvas: !!li.querySelector('canvas.ck.face'), room: rooms.has(li.dataset.id),
+            alive: bots.has(li.dataset.id.split('/').pop())}))}""")
+        # A chat is direct when it is not a room's own chat. Only a chat whose bot still exists has a
+        # face to draw: one left behind by a deleted bot keeps its row and its glyph, which is honest.
+        direct = [c for c in chatfaces if not c["room"] and c["alive"]]
         check("a direct chat in the chats list draws its bot's face",
-              len(direct) > 0 and all(c["canvas"] for c in direct), str(chatfaces[:4]))
+              len(direct) > 0 and all(c["canvas"] for c in direct),
+              str([c for c in direct if not c["canvas"]]))
         check("...and a room keeps its icon",
               all(not c["canvas"] for c in chatfaces if c["id"] == "company"), str(chatfaces[:4]))
         defaults = {f["id"].split("/").pop(): f["sp"] for f in faces
@@ -2014,6 +2192,21 @@ def main():
                     gone:before.filter(c=>!c.isConnected).length};}""")
         check("a face on screen is not re-drawn after an idle wake",
               idle["n"] > 0 and idle["same"] == idle["n"] and idle["gone"] == 0, str(idle))
+        # The canvases above survived a wake because `mountFace` carries them over. Everything else in
+        # the row did not: the rails are built from `innerHTML`, so a wake re-created every row and with
+        # it the company's logo `<img>` — a fresh decode and a fresh request, which is the flicker on
+        # the channel icon when the window came back. A wake that finds the same config now rebuilds
+        # nothing at all.
+        rows = pg.evaluate("""async()=>{
+            const all=()=>[...document.querySelectorAll('#chans > li, #bots > li, #chats > li')];
+            const before=all(); before.forEach((n,i)=>{ n.__rowTag=i; });
+            await window.anzenWake();
+            await new Promise(r=>setTimeout(r,600));
+            const after=all();
+            return {n:before.length, kept:after.filter(n=>n.__rowTag!==undefined).length,
+                    gone:before.filter(n=>!n.isConnected).length};}""")
+        check("a wake with nothing changed leaves the sidebar rows in place",
+              rows["n"] > 0 and rows["kept"] == rows["n"] and rows["gone"] == 0, str(rows))
         # Coucou's colour grading: a small face is ONE flat fill of the bot's colour, so the single
         # most common opaque pixel is exactly that colour and covers a big share of the face. The
         # gradient body it replaced had no colour that dominated — that is the pastel wash.
@@ -2370,7 +2563,7 @@ def main():
         check("clearing the pick goes back to the bot's own model",
               pg.eval_on_selector("#chipModel", "e=>e.textContent.trim()") == "Model: e2e/quick-model",
               pg.eval_on_selector("#chipModel", "e=>e.textContent"))
-        check("the menu closes once a model is picked", pg.eval_on_selector_all("#mmPop", "e=>e.length") == 0)
+        check("the menu closes once a model is picked", pg.eval_on_selector("#mmPop", "e=>e.hidden"))
 
         # ---- 18b. the Approval chip is a switch scoped to the chat, not a door to the Bots list ----
         # It used to open Settings → Bots (every bot you own). It must instead offer the levels in
@@ -2394,7 +2587,7 @@ def main():
           .find(x=>x.querySelector('b')&&x.querySelector('b').textContent==='Plan only');r.click()}""")
         pg.wait_for_timeout(600)
         check("picking a level closes the menu and names it on the chip",
-              pg.eval_on_selector_all("#apPop", "e=>e.length") == 0
+              pg.eval_on_selector("#apPop", "e=>e.hidden")
               and pg.eval_on_selector("#chipMem", "e=>e.textContent") == "Approval: Plan",
               pg.eval_on_selector("#chipMem", "e=>e.textContent"))
         check("the level sticks to the chat it was set on",
@@ -2506,6 +2699,10 @@ def main():
         SETF2 = os.path.join(DATA, "settings.json")
         snap2 = json.load(open(SETF2))
         try:
+            # Reloaded first: the checks below compare the panel with the file, and the suite writes
+            # settings through the API behind the app's back — a window that booted before those writes
+            # still holds the old copy, and the panel is right to show it.
+            pg.reload(wait_until="load"); pg.wait_for_timeout(900)
             pg.eval_on_selector("#btnSettings", "e=>e.click()"); pg.wait_for_timeout(400)
             pg.eval_on_selector("#tab-models", "e=>e.click()"); pg.wait_for_timeout(300)
             eng = pg.eval_on_selector("#setPanel", "e=>e.innerText")

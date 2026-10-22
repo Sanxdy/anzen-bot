@@ -37,6 +37,31 @@ A bot's own **Face picture** in its editor is the other way to give it a face. B
 
 A preset is a whole character, not a single picture: one frame per state, all cut out and aligned on the same head, so the bot keeps its size and its position when the state changes and when you swap one preset for another. Pick one per bot in **Settings → Bot faces**, shuffle a whole room in one click, or leave the bot as its own drawn mascot.
 
+### Preset clips: a character that moves
+
+A preset can also ship short video clips, which the face engine loops instead of swapping frames. Drop them in `faces/<id>/clips/`, as `.webm` or `.mp4`, with a name of up to 20 lowercase letters, digits or dashes. `GET /api/clips/<id>` lists the clips that exist; `GET /api/clip/<id>/<name>.<ext>` serves one.
+
+The drawn mascot has a clip folder too, and it is the one most people want: `faces/mochi/clips/`. That is the face of every room and of every bot with no preset and no picture, so one set there gives the corner character clips everywhere. A bot with a picture of its own keeps its picture — a clip is a whole character and would replace it.
+
+Four names are worth making, and they are the only four the engine asks for:
+
+| File | When it plays | Loops? |
+|---|---|---|
+| `idle.webm` | every resting state — idle, bored, waiting, asleep | yes |
+| `working.webm` | while a turn runs | yes |
+| `milestone-cape.webm` | a turn that used tools finishes | once |
+| `milestone-confetti.webm` | a whole plan is done | once |
+
+Any other state with no clip keeps its drawn or preset frames, so a partial set degrades rather than breaks.
+
+**Framing has to match, or the character jumps.** A clip is drawn in place of the whole face, scaled to 96% of the canvas keeping its aspect. The drawn mascot fills about 83% of the width and 68% of the height, with about 12% empty below it for the shadow. So in a 512×512 clip it wants to be about 425 px wide and about 350 px tall, its bottom edge about 62 px above the frame's bottom. Whichever dimension runs out first wins: the mascot in `faces/mochi/clips/` is taller than it is wide, so it comes out 378×430, and the height is what fills the frame. Get this wrong and the face visibly changes size the moment a clip starts or hands back.
+
+Draw them at 512×512 and 24fps, three to six seconds long, and make the loop seamless: the last frame has to meet the first. WebM with an alpha channel keeps the character cut out — this is not optional, because the corner sits on the app's background, and an MP4 without alpha shows as an opaque square. An MP4 needs a background colour that matches the app, which a theme switch will break.
+
+The four in `faces/mochi/clips/` are the whole mascot in one still, moved by arithmetic rather than redrawn: the character is cut out once, then rocked and squashed about its feet, so the loop meets itself exactly and nothing can drift out of frame. An image model asked for a second pose returns a different character, which reads as a morph mid-loop. They are 4 seconds each, about 1.2 MB in total.
+
+The corner face and the computer panel play clips. The small faces in the sidebar and the chat list draw frames only: twenty rows each decoding a video is a lot of work for a 52-pixel picture.
+
 ---
 
 ## 📌 Table of Contents

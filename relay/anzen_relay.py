@@ -214,8 +214,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "desktop": desktop() is not None})
         d = desktop()
         # Nothing behind the door: the phone is told so, and told it in a way that reads as "the
-        # app is not running" rather than as a fault of its own.
+        # app is not running" rather than as a fault of its own. The body is left unread, so this
+        # connection cannot carry another request: HTTP/1.1 keep-alive would parse the leftover
+        # body as the next request line and answer that instead — a 501 for a request nobody made.
         if d is None:
+            self.close_connection = True
             return self._json(503, {"error": "Anzen-bot is not running on your computer."})
         return self._forward(d)
 
@@ -237,7 +240,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         # outlive it. Nothing was read past the headers (the desktop speaks only once it has the
         # 101), so no bytes are lost by handing the raw socket on.
         sock = socket.socket(fileno=os.dup(self.connection.fileno()))
-        sock.settimeout(None)
+        # The desktop beats every BEAT_S, so a link that says nothing for IDLE_TIMEOUT is gone —
+        # and a read that waits forever cannot tell a quiet link from a half-open one (a slept
+        # laptop, a lost route, no FIN). Left waiting, the dead link stays registered and every
+        # phone request is forwarded into it and hangs until its own timeout.
+        sock.settimeout(IDLE_TIMEOUT)
         d = Desktop(WS(sock, mask=False))
         install(d)
         threading.Thread(target=lambda: (d.pump(), uninstall(d)), daemon=True).start()

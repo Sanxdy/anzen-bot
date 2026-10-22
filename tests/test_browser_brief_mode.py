@@ -28,7 +28,7 @@ def check(name, ok, extra=""):
 
 def brief(**b):
     s = S.load_settings(); s.setdefault("browser", {}).update(b); S.save_settings(s)
-    return S.browser_brief()
+    return S.browser_brief({"browser": b.get("accounts") or []})
 
 own_line = S.BROWSER_OWN_LINE.strip()
 
@@ -71,8 +71,10 @@ room = {"id": "promo", "browser": [{"name": "Threads me", "sites": "threads.com"
 rb = S.browser_brief(room)
 check("a room's brief names the room's account", "Threads me" in rb and "threads.com" in rb, rb)
 check("  ...and not the machine-wide one", "Global X" not in rb, rb)
-check("  ...and says the room is the scope", "this room is set up with accounts" in rb, rb)
-check("a chat outside a room still gets the machine-wide account", "Global X" in S.browser_brief())
+check("  ...and says the chat is the scope", "this chat is set up with accounts" in rb, rb)
+check("a chat with no accounts of its own is told it has none",
+      "no account is set up for this chat" in S.browser_brief({"browser": []}), S.browser_brief({"browser": []}))
+check("  ...and never hears about the machine-wide list", "Global X" not in S.browser_brief({"browser": []}))
 
 empty = S._norm_channels([{"id": "promo", "name": "Promo"}])[0]
 check("a room the file left without accounts gets an empty list", empty["browser"] == [], empty)
@@ -80,37 +82,51 @@ junk = S._norm_channels([{"id": "promo", "name": "Promo", "browser": [
     {"name": " Zenpilot.pro ", "sites": " x.com "}, {"sites": "y.com"}, "junk"]}])[0]
 check("a room's account rows keep only a name and sites, trimmed",
       junk["browser"] == [{"name": "Zenpilot.pro", "sites": "x.com"}], junk["browser"])
-check("a room with no accounts falls back to the machine-wide list",
-      S._room_routes({"browser": []}) is None)
-check("a room with accounts routes its own sites",
-      S._room_routes(room) == {"threads.com": ["Threads me"]}, S._room_routes(room))
+check("a record with no accounts routes nothing — it does not borrow the machine-wide list",
+      S._own_routes({"browser": []}) == {})
+check("a record with accounts routes its own sites",
+      S._own_routes(room) == {"threads.com": ["Threads me"]}, S._own_routes(room))
+check("a turn in a room uses the room's accounts",
+      S._turn_routes(room, {"browser": [{"name": "Bot acct", "sites": "b.com"}]})
+      == {"threads.com": ["Threads me"]})
+check("a turn in a bot's own chat uses the bot's accounts",
+      S._turn_routes(None, {"browser": [{"name": "Bot acct", "sites": "b.com"}]})
+      == {"b.com": ["Bot acct"]})
 
-# The accounts used to be one machine-wide list in Settings → Browser, a tab that is gone. Every room
-# must adopt that list once, or the setup the user already made would exist only as a fallback they
-# cannot see or edit from the room.
+# The accounts used to be one machine-wide list in Settings → Browser, a tab that is gone. A room
+# adopts that list once, or the setup the user already made would exist only as a fallback they cannot
+# see or edit from the room. Once is the whole point: re-seeding every record on every boot is what
+# made each new room and each new bot inherit the list as if the user had set it up there.
 S.save_channels([{"id": "promo", "name": "Promo"},
                  {"id": "mine", "name": "Mine", "browser": [{"name": "Own", "sites": "own.com"}]}])
+S.save_bots([{"id": "lead", "name": "Lead"}])
 S._migrate_room_browser()
 seeded = {c["id"]: c["browser"] for c in S.load_channels()}
 check("a room with no accounts adopts the machine-wide list on boot",
       seeded["promo"] == [{"name": "Global X", "sites": "x.com"}], seeded)
 check("  ...while a room that set its own keeps them",
       seeded["mine"] == [{"name": "Own", "sites": "own.com"}], seeded)
+check("  ...and no bot adopts it, so a bot's own chat starts with nothing",
+      S.load_bots()[0]["browser"] == [], S.load_bots()[0]["browser"])
+S.save_channels(S.load_channels() + [{"id": "new", "name": "New"}])
+S._migrate_room_browser()
+check("a room made afterwards starts with no accounts",
+      S.channel_by_id(S.load_channels(), "new")["browser"] == [])
 chs = S.load_channels()
 for c in chs:
     if c["id"] == "promo": c["browser"] = []
 S.save_channels(chs)
 S._migrate_room_browser()
 check("  ...and a list the user emptied later is not refilled on the next boot",
-      S.load_channels()[0]["browser"] == [], S.load_channels()[0]["browser"])
+      S.channel_by_id(S.load_channels(), "promo")["browser"] == [])
 
-B = S.BROWSER; rt = S._room_routes(room)
+B = S.BROWSER; rt = S._own_routes(room)
 check("the browser routes a room's site through the room's table",
       B._route("https://threads.com/home", rt) == "Threads me")
 check("  ...and does not fall back to the machine-wide account for another site",
       B._route("https://x.com/", rt) is None)
-check("a chat outside a room still routes through the machine-wide list",
-      B._route("https://x.com/") == "Global X")
+check("a caller with no table routes nothing, not the machine-wide account",
+      B._route("https://x.com/") is None)
 
 rp = S.browser_own_profiles([{"name": "Threads me", "sites": "threads.com"}])["profiles"]
 check("a room's account list shows only the room's accounts",
@@ -128,7 +144,7 @@ check("browser_open carries the room's routing table to the browser", seen.get("
 S._WORK.routes = None
 seen.clear()
 S.exec_tool("producer", "browser_open", {"url": "https://threads.com/"})
-check("  ...and a chat outside a room carries none, so the machine-wide list answers",
+check("  ...and a call with no table routes nothing, not the machine-wide list",
       seen.get("routes") is None, seen)
 seen.clear()
 S.exec_tool("producer", "browser_open", {"url": "https://threads.com/", "account": "Threads me"})

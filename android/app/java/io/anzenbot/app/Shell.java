@@ -92,6 +92,9 @@ final class Shell extends FrameLayout {
      * is the difference between this client and the `/?t=` link a browser needs.
      */
     void start(String url, String tok) {
+        // `loadUrl(url + "/")` and the same-origin test below both assume a bare origin; a caller that
+        // passes one with a trailing slash would load `//` and send every page to the phone's browser.
+        if (url.endsWith("/")) url = url.substring(0, url.length() - 1);
         if (started && url.equals(base) && tok.equals(token)) return;
         base = url; token = tok; started = true;
         CookieManager cm = CookieManager.getInstance();
@@ -143,7 +146,9 @@ final class Shell extends FrameLayout {
         return new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
                 Uri u = r.getUrl();
-                if (!r.isForMainFrame() || u.toString().startsWith(base)) return false;
+                // `base + "/"`, not `base`: a prefix test let a host that merely starts with the
+                // configured one — relay.example.com.evil.tld — load inside the app's own WebView.
+                if (!r.isForMainFrame() || u.toString().startsWith(base + "/")) return false;
                 open(u);           // anything that is not this server belongs to the phone's browser
                 return true;
             }

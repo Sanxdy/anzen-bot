@@ -73,7 +73,14 @@ class Router(BaseHTTPRequestHandler):
                     '"function":{"name":"finish","arguments":%s}}]}}]}\n\n'
                     % json.dumps(json.dumps({"summary": summary}))).encode(), False)
     def _route(self):
-        if MODE == "trickle":
+        if MODE.startswith("status_"):
+            # A router that refuses outright: a bad key, a body it will not take, a rate limit.
+            body = b'{"error":{"message":"refused"}}'
+            self.send_response(int(MODE.split("_")[1]))
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body); self.wfile.flush()
+        elif MODE == "trickle":
             # The shape that hung the turn: a warm socket, keepalive lines, no content, no [DONE].
             self._head(True)
             for _ in range(40):                     # 8s of it, then the stub gives up
@@ -787,6 +794,35 @@ finally:
 ok("a landing the router could not answer is asked exactly once",
    len(_asked2) == 1, "posts=%d" % len(_asked2))
 ok("...and the turn still names the work it did", "run_shell" in land3, land3)
+S._stalls.clear()
+
+print("--- a refusal that reads the same every time is not retried eleven times ---")
+# A bad key, a body the router will not take: the answer is identical on every send, so the full policy
+# only turned a clear "401" into three minutes of spinner before the user was told. The step that hit it
+# is the streamed one — the stream request is refused, and the one-shot fallback is what retries.
+def stream_against(mode, tries):
+    global MODE
+    MODE = mode; HITS[mode] = 0; S.MODEL_RETRIES = tries
+    t0 = time.time()
+    ev = list(S.chat_stream("stub", [{"role": "user", "content": "hi"}]))
+    return done_of(ev), HITS[mode], time.time() - t0
+
+done, hits, took = stream_against("status_401", 10)
+ok("a refused key costs two requests, not eleven", hits == 2, "requests=%d" % hits)
+ok("...and the turn is told the status the user has to fix", "401" in done["content"], done["content"])
+ok("...straight away", took < 3, "%.1fs" % took)
+done, hits, took = stream_against("status_429", 2)
+ok("a rate limit keeps its retries: it is about this moment, not the request",
+   hits == 4 and "429" in done["content"], "requests=%d %r" % (hits, done["content"]))
+
+# A router that is not running at all: no number of tries starts one, and the one retry that is worth it
+# covers a server still coming up.
+_s = socket.socket(); _s.bind(("127.0.0.1", 0)); _dead = _s.getsockname()[1]; _s.close()
+_live = S.ROUTER; S.ROUTER = "http://127.0.0.1:%d" % _dead; S.MODEL_RETRIES = 10
+try: out = S.chat("stub", [{"role": "user", "content": "hi"}])
+finally: S.ROUTER = _live
+ok("a router that is not listening is tried twice, not eleven times", out["attempts"] == 2, out)
+ok("...and the reason says what to check", "refused" in out["content"].lower(), out["content"])
 S._stalls.clear()
 
 print()

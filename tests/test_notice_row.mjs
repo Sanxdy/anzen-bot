@@ -33,7 +33,7 @@ const draw = (rows) => {
   const addCard = (...x) => calls.push(["card", ...x]);
   const addMsg = (...x) => calls.push(["msg", ...x]);
   const addTool = (...x) => calls.push(["tool", ...x]);
-  const S = { active: "chat-1" };
+  const S = { active: "chat-1", failNotes: {} };
   new Function("messages", "addCard", "addMsg", "addTool", "cleanBot", "ROUTE_LABEL", "S", "sink", body)(
     rows, addCard, addMsg, addTool, s => String(s == null ? "" : s), "Who's on it", S, null);
   return calls;

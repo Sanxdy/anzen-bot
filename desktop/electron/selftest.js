@@ -103,6 +103,9 @@ function probe(win) {
         chatScroll: (() => { const cl = q('#chats'); if (!cl) return null;
           const cs = getComputedStyle(cl);
           return { overflowY: cs.overflowY, maxHeight: cs.maxHeight, capped: cs.maxHeight !== 'none' }; })(),
+        // Nothing in the transcript may reach past it sideways: the hover pills are laid out even at
+        // opacity 0, so one anchored outward gave the whole panel a horizontal scrollbar.
+        hscroll: (() => { const m = q('#msgs'); return m ? m.scrollWidth - m.clientWidth : null; })(),
       };
       // An open chip popover has to sit above the transcript. In the glass themes the header is its
       // own stacking context, so a message bubble — positioned, and later in the tree — paints over

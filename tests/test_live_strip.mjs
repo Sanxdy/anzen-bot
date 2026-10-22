@@ -83,11 +83,11 @@ const clocked = new Map();
    `STEP_LABEL` with them — only the names they do *not* define are handed in as parameters. */
 const live = new Function("el", "$", "bot", "NAME", "chan", "S", "AV", "AVK", "clockStart",
   [escSrc, hueOfSrc, hueSpanSrc, toolHeadSrc, stepSrc, block].join("\n")
-  + "\nreturn {WORKING, liveEvent, workingRow, workingDrop, workingClear, firstSentence};")(
+  + "\nreturn {WORKING, liveEvent, workingRow, workingDrop, workingClear, workingPaint, firstSentence};")(
   (t, c) => node(c), sel => (sel === "#working" ? box : null), bot, NAME, chan, S, AV, AVK,
   n => clocked.set(n, (clocked.get(n) || 0) + 1));
 
-const rowOf = id => live.WORKING.get(id);
+const rowOf = id => live.WORKING.get("growth\u0000" + id);
 
 console.log("\n-- one line, said the way the transcript says it --");
 live.liveEvent("growth", { type: "agent", id: "atlas", name: "Atlas", state: "start" });
@@ -147,13 +147,20 @@ ok("a new turn brings its rows back", box.children.length === 1 && box.hidden ==
 S.active = "atlas";                                    // a 1:1 chat: its header already says this
 live.liveEvent("atlas", { type: "tool", agent: "atlas", name: "run_shell", args: { command: "ls" } });
 ok("a 1:1 chat has no strip", box.children.length === 1 && rowOf("atlas").act.textContent === "", rowOf("atlas").act.textContent);
-S.active = "growth";
+S.active = "growth"; live.workingPaint();
 live.liveEvent("growth", { type: "tool", agent: "atlas", name: "run_shell", args: { command: "ls" } });
 ok("...and the room draws its own again", rowOf("atlas").act.textContent === "— $ ls", rowOf("atlas").act.textContent);
+/* The bug this pins: a row only existed for the room on screen, so switching away and back lost it,
+   and a bot in a long silent step had nothing left to say it was still working. */
 S.active = "atlas";
 live.liveEvent("growth", { type: "tool", agent: "atlas", name: "run_shell", args: { command: "pwd" } });
-ok("an event for a room you are not looking at is not drawn", rowOf("atlas").act.textContent === "— $ ls", rowOf("atlas").act.textContent);
-S.active = "growth";
+ok("work in a room you are not looking at is still recorded", rowOf("atlas").act.textContent === "— $ pwd", rowOf("atlas").act.textContent);
+ok("...but is not shown under the chat you are in", rowOf("atlas").row.hidden === true && box.hidden === true);
+S.active = "growth"; live.workingPaint();
+ok("coming back shows what the bot is still doing, with no event needed",
+  rowOf("atlas").row.hidden === false && box.hidden === false && rowOf("atlas").act.textContent === "— $ pwd");
+live.workingClear("other");
+ok("another room's turn ending leaves this room's rows alone", !!rowOf("atlas") && box.hidden === false);
 live.liveEvent("growth", { type: "status", state: "working" });     // a room-level status names no bot
 ok("a status that names no bot is put on no row", box.children.length === 1, String(box.children.length));
 
@@ -166,7 +173,7 @@ ok("no full stop at all means the whole thing", live.firstSentence("checking the
 ok("and nothing means nothing", live.firstSentence("") === "" && live.firstSentence(null) === "");
 ok("the tool line is the transcript's own",
   toolHead("delegate", { role: "scout", task: "read the docs" }) === "→ Scout: read the docs");
-live.workingClear();
+live.workingClear("growth");
 ok("clearing leaves nothing at all", live.WORKING.size === 0 && box.children.length === 0 && box.hidden === true);
 
 console.log(`\n${pass} passed, ${fail} failed`);

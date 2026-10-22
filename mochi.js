@@ -134,7 +134,9 @@ export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeFrame = "") {
   /* Working is a closed loop of three frames and its mouth never moves: the mouth cycle is a
      talking tell, and a bot at its desk is not talking. */
   if (state === "working") {
-    if (ti % 3.7 < 0.22) return "work-closed";                                    // blink
+    /* No blink under reduced motion: `ti` is frozen at 0 there, so the window `0 < 0.22` is always
+       open and the face would wear the blink frame for as long as it worked. */
+    if (!REDUCED && ti % 3.7 < 0.22) return "work-closed";                        // blink
     if (Math.floor(ti / 2.3) % 2 === 0 && ti % 2.3 < 0.5) return "work-happy";   // every other window
     return Math.floor(ti / 0.22) % 2 ? "work-b" : "work-a";
   }
@@ -144,6 +146,9 @@ export function presetFrame(state, ti, mouthOpen, eyesOpen, pokeFrame = "") {
   return eyesOpen < 0.5 ? "closed" : "base";
 }
 const presetUrl = (id, frame) => `/api/preset/${encodeURIComponent(id)}/${frame}.webp`;
+/* A state with no clip of its own borrows `idle` only while the bot is at rest. A working bot with
+   no `working` clip must not sit there breathing at its desk: that state keeps its preset frames. */
+const RESTING = new Set(["idle", "bored", "sleeping", "waiting"]);
 
 
 /* per-state config — colours, behaviour and the feeling that goes with it */
@@ -154,6 +159,7 @@ export const STATES = {
   searching: { glow: "#6366F1", tint: 0.72, badge: null,       scan: 1,    mag: 1,   emotion: "curious", label: "searching" },
   approval:  { glow: "#F5A524", tint: 0.78, badge: "bang",     bounce: 1,  hand: 1,  emotion: "worried", label: "needs approval" },
   question:  { glow: "#22D3EE", tint: 0.75, badge: "question", bubble: 1,            emotion: "curious", label: "asking" },
+  waiting:   { glow: "#A78BFA", tint: 0.55, badge: null,       wait: 1,             emotion: "calm",    label: "waiting on a teammate" },
   finished:  { glow: "#34D399", tint: 0.35, badge: "dot",      stars: 1,             emotion: "happy",   label: "finished" },
   error:     { glow: "#F4505E", tint: 0.78, badge: "dot",      shake: 1,             emotion: "worried", label: "error" },
   sleeping:  { glow: "#94A2B8", tint: 0.32, badge: null,       breathe: 1, zz: 1,     emotion: "sleepy",  label: "sleeping" },
@@ -238,19 +244,24 @@ const SHAPES = {
 
 /* ---------------- cursor: every face follows the pointer ---------------- */
 const POINTER = { x: 0, y: 0, on: false };
-/* A rect is read once and reused until something that actually moves a face invalidates it (scroll,
-   resize, attach). Reading it per pointermove forced a layout on every event. */
-function invalidateRects() { for (const b of bots) b._rect = null; }
+/* One layout read per frame for the whole roster. A cached rect goes stale the moment a row is
+   re-rendered, reordered or slid in by a drawer — none of which is a scroll or a resize — and a
+   rect measured while the canvas was hidden (width 0) would stay zero for good. */
+let pointerQueued = 0;
 function applyPointer() {
   if (!POINTER.on) return;
   for (const b of bots) {
-    const r = b._rect || (b._rect = b.cv.getBoundingClientRect());
+    const r = b.cv.getBoundingClientRect();
     if (!r.width || !r.height) continue;
     /* divide by at least 160px so a small sidebar face tracks subtly instead of pinning */
     const span = Math.max(r.width, r.height, 160) * 0.9;
     b.lookAt((POINTER.x - (r.left + r.width / 2)) / span,
              (POINTER.y - (r.top + r.height / 2)) / span, true);
   }
+}
+function queuePointer() {
+  if (pointerQueued) return;
+  pointerQueued = requestAnimationFrame(() => { pointerQueued = 0; applyPointer(); });
 }
 function releasePointer() {
   POINTER.on = false;
@@ -274,6 +285,13 @@ export class MochiBot {
     this.imageClosed = opts.imageClosed || "";       // the same face with its eyes shut, for the blink
     this.preset = opts.preset || "";                 // a preset character: its frames replace the picture
     if (this.preset) { this.image = ""; this.imageClosed = ""; }
+    /* Clips are additive: a preset that also ships video plays the clip for its state and keeps its
+       frames for every state the clip set does not cover. Empty is the normal case. */
+    this.clips = opts.clips && typeof opts.clips === "object" ? opts.clips : {};
+    this._clipSet = opts.clips || null;              // what `skin` compares against, to keep a running clip
+    this._vids = new Map();                          // url -> { el, dead, blocked }
+    this._clipEl = null; this._onceEl = null; this._onceUrl = "";
+    this._hidden = typeof document !== "undefined" && !!document.hidden;
     this.cv.width = this.size * this.dpr; this.cv.height = this.size * this.dpr;
     this.R = this.size * 0.326;                      // body radius; the unit every offset is quoted in
     this.yaw = 0; this.pitch = 0; this.tilt = 0; this.roll = 0; this.open = 1;
@@ -293,7 +311,11 @@ export class MochiBot {
     this.emo = {}; for (const k of EMO_KEYS) this.emo[k] = EMOTIONS.calm[k];
     this._pokeLeft = 0;                              // how long the poke frame still shows
     this._pokeFrame = ""; this._pokes = 0; this._pokedAt = -99;
-    if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
+    /* A preset is stills on a clock, so a swap between two of them is a cut. The frame on screen and
+       the one it replaced are both kept, so the swap can be a dissolve instead. */
+    this._faceFrame = ""; this._faceCur = null; this._facePrev = null; this._fade = 1;
+    /* Only the frame it wears before its state lands: the other 20 are fetched as they are worn. */
+    if (this.preset) presetTextureFor(presetUrl(this.preset, "base"), this.size * this.dpr);
     this.setState(state, true);
   }
   /* ---- keyframe tweens (the Coucou anim() API) ---- */
@@ -344,7 +366,8 @@ export class MochiBot {
     this.anim("sx", [[1.16, 70, Ease.out], [0.95, 130, Ease.out], [1, 170, Ease.inOut]]);
   }
   doRoll(turns, ms) {
-    this.roll = 0;
+    /* Starts from the current angle: a roll already in flight carries on from where it is instead
+       of snapping upright first. The completion callback is what puts it back. */
     this.anim("roll", [[Math.PI * 2 * turns, ms, Ease.inOut]], () => { this.roll = 0; this.squash(); });
   }
   /* A fidget for a bot with nothing to do, so a quiet face is never a still image. */
@@ -369,7 +392,9 @@ export class MochiBot {
     this.state = s; this.cfg = STATES[s];
     if (this.cfg.emotion) this.setEmotion(this.cfg.emotion);
     if (instant) { this.tint = this.cfg.tint; this.glowA = this.cfg.tint > 0 ? 1 : 0.5; return; }
-    if (prev === s) return;
+    /* A second finish inside the first one's hold is a second piece of news, not a repeat: it gets
+       its own burst and roll. Every other state re-asserted is a no-op. */
+    if (prev === s && s !== "finished") return;
     const R = this.R;
     /* A picture fills its box edge to edge, so a spin swings its corners out of the canvas and the
        frame is cut on a hard diagonal; and it cannot be squashed or hopped like a blob. A head can
@@ -380,7 +405,7 @@ export class MochiBot {
       this.anim("sy", [[1.12, 500, Ease.inOut], [1, 500, Ease.inOut]]);   // stretch on waking
     switch (s) {
       case "finished":
-        if (!pic) this.doRoll(1, 950); break;
+        this._burst(); if (!pic) this.doRoll(1, 950); break;
       case "error": this.anim("ox", [[0.08 * R, 50, Ease.out], [-0.08 * R, 70, Ease.inOut],
                                      [0.05 * R, 70, Ease.inOut], [0, 90, Ease.out]]); break;
       case "approval":
@@ -394,11 +419,25 @@ export class MochiBot {
       default: if (prev !== "idle" || s !== "idle") this.blink();
     }
   }
+  /* A one-shot milestone (a cape, a burst of confetti): plays `clips[name]` once over whatever the
+     state would show, then hands back to it. No such clip, or reduced motion, and this is a no-op —
+     the preset path already handles that mode, and a milestone is motion by definition. */
+  playOnce(name) {
+    if (REDUCED) return;
+    const url = this.clips[name];
+    if (!url) return;
+    const rec = this._clipRec(url);
+    if (!rec || rec.dead) return;
+    this._onceEl = rec.el; this._onceUrl = url;
+    rec.el.loop = false;
+    try { rec.el.currentTime = 0; } catch (e) { /* no metadata yet: it starts from the top anyway */ }
+    this._syncClip();
+  }
   /* Re-skin a live bot: same canvas, same motion mid-flight, a different species, colour and
      wardrobe. Pass no colours to fall back to the plain Mochi body. The look is always replaced,
      never merged: the dock is re-skinned when you switch chats, and a room has no face of its own,
      so a missing look has to strip the previous bot's preset rather than leave it in the corner. */
-  skin(species, colors, look) {
+  skin(species, colors, look, clips) {
     if (SPECIES[species]) { this.species = species; this.sp = SPECIES[species]; }
     this.flat = (colors && colors.flat) || null;
     this.bodyTop = (colors && colors.bodyTop) || (colors && colors.flat) || "#EDEDEF";
@@ -409,7 +448,20 @@ export class MochiBot {
     this.preset = l.preset || "";
     this.image = this.preset ? "" : (l.image || "");
     this.imageClosed = this.preset ? "" : (l.imageClosed || "");
-    if (this.preset) for (const f of PRESET_FRAMES) presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
+    /* The clip set belongs to the face: a re-skin swaps it along with the character, and a re-skin
+       with none clears it. The old set's videos are paused and dropped, not left decoding. A re-skin
+       with the *same* set — the dock is re-skinned on every redraw — keeps them running; clearing
+       there restarted the clip each time the sidebar repainted. */
+    if (clips !== this._clipSet) {
+      this._clipSet = clips;
+      this.clips = clips && typeof clips === "object" ? clips : {};
+      this._onceEl = null; this._onceUrl = ""; this._clipEl = null;
+      for (const r of this._vids.values()) r.el.pause();
+      this._vids.clear();
+    }
+    /* A re-skin can land mid-dissolve, and the held frame belongs to the face that is going away. */
+    this._faceFrame = ""; this._faceCur = null; this._facePrev = null; this._fade = 1;
+    if (this.preset) presetTextureFor(presetUrl(this.preset, "base"), this.size * this.dpr);
   }
   /* The feeling on top of the state. Idle bots drift through their own moods. */
   setEmotion(e) {
@@ -464,6 +516,7 @@ export class MochiBot {
   }
   tick(dt) {
     this.t += dt;
+    this._syncClip();                             // one clip on screen, and only while it can be seen
     const ti = this.ti = REDUCED ? 0 : this.t;   // the idle clock: frozen, so nothing drifts, while `t` runs on
     const c = this.cfg, sp = this.sp, R = this.R;
     /* Two smoothing rates, straight from Coucou: the body settles in ~0.14s and the gaze
@@ -472,12 +525,18 @@ export class MochiBot {
     const kLook = 1 - Math.pow(0.0025, dt);
     const kGen  = 1 - Math.pow(0.0008, dt);
     this._stepTweens();
+    /* 0.14s: short enough that a state change still reads as a cut, long enough to cover a 0.13s
+       mouth frame so the cycle blends instead of stepping. */
+    if (this._fade < 1) this._fade = Math.min(1, this._fade + dt / 0.14);
     /* --- where to look: a bot absorbed in its state looks there and ignores the mouse —
        working faces its desk, thinking looks up, sleeping is asleep. The cursor is the
        idle fallback, not an override. */
     if (c.zz) { this._targetYaw = 0; this._targetPitch = 0.05; }
     else if (c.lookUp) { this._targetYaw = 0; this._targetPitch = -0.45; }
     else if (c.desk) { this._targetYaw = Math.sin(ti * 0.7) * 0.12; this._targetPitch = 0.12; }
+    /* Waiting is a slow look left and right: nothing to read, nothing to do, so the eyes wander
+       instead of fixing on the desk. Faster than that reads as searching, which has its own state. */
+    else if (c.wait) { this._targetYaw = Math.sin(ti * 0.75) * 0.42; this._targetPitch = 0.02; }
     else if (REDUCED) { this._targetYaw = 0; this._targetPitch = 0; }   // no cursor-following
     else if (this._cursorOn && this._cursor) { this._targetYaw = this._cursor.yaw; this._targetPitch = this._cursor.pitch; }
     else {
@@ -499,13 +558,16 @@ export class MochiBot {
     /* --- gaze --- */
     if (!this.locks.has("yaw"))   this.yaw   += (this._targetYaw   - this.yaw)   * kLook;
     if (!this.locks.has("pitch")) this.pitch += (this._targetPitch - this.pitch) * kLook;
-    if (!this.locks.has("tilt"))  this.tilt  += ((c.shake ? Math.sin(ti * 34) * 0.06 : 0) - this.tilt) * kGen;
+    if (!this.locks.has("tilt"))  this.tilt  += ((c.shake ? Math.sin(ti * 34) * 0.06
+      /* A portrait's gaze cannot wander — the whole picture is the face — so waiting tilts the head
+         slowly instead. Without it a preset bot waiting on a teammate looks exactly like an idle one. */
+      : c.wait && (this.preset || this.image) ? Math.sin(ti * 0.9) * 0.055 : 0) - this.tilt) * kGen;
     /* --- the species' own idle motion, in body-radius units so it scales with the face ---
        A bot wearing a face is a portrait, not a body: hopping, floating or bouncing one translates
        a whole photograph up and down, and nothing alive does that. It breathes instead — the chest
        rises and falls, slowly, and nothing else moves. */
     let oyT = 0, syT = 1, sxT = 1, oxT = 0;
-    const faceBot = !!(this.preset || this.image);
+    const faceBot = !!(this.preset || this.image || this._clipEl);   // a clip is a portrait too
     if (faceBot) syT = 1 + Math.sin(ti * 1.25) * 0.012;
     else {
       switch (sp.idle) {
@@ -558,18 +620,74 @@ export class MochiBot {
       } else this._blinkAt = 2.2 + Math.random() * 3.2;
     }
     this._particles(dt);
-    if (this._pokeLeft > 0) this._pokeLeft = Math.max(0, this._pokeLeft - dt);
+    if (this._pokeLeft > 0) {
+      this._pokeLeft = Math.max(0, this._pokeLeft - dt);
+      /* A poke sets its own feeling, and only the idle mood drift would ever take it back — so a
+         bot poked while working stayed excited for the rest of the turn. */
+      if (!this._pokeLeft && this.cfg.emotion) this.setEmotion(this.cfg.emotion);
+    }
+  }
+  /* A finish is the one moment a bot is allowed to be loud. It throws a ring of sparks out from its
+     head, drawn on a portrait too: the still has no body to hop, so without this the news is only a
+     colour change, and a colour change is what every other state already is. */
+  _burst() {
+    /* A culled face still gets its state changes — the app drives them — but nothing ticks it, so a
+       burst pushed here would never age: the list grew by 22 per finished turn for as long as the
+       face was off screen, and every one of them fired at once when it came back. */
+    if (REDUCED || this.vis === false) return;
+    const R = this.R, n = 22;
+    /* Thrown from a ring just outside the head, not from a point: a burst that starts at the centre
+       is still a tight cluster a quarter-second in, which reads as something on the face rather than
+       as something leaving it. A preset head fills its box, so its ring is measured against the box. */
+    const ring = this.preset || this.image ? this.size * 0.42 : R * 0.62,
+          ry = this.preset || this.image ? this.size * 0.36 : R * 0.5;
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2 + Math.random() * 0.2, sp = R * (1.3 + Math.random() * 1.1);
+      this.parts.push({ k: i % 2 ? "star" : "spark", b: 1,
+                        x: Math.cos(a) * ring, y: Math.sin(a) * ry - R * 0.1,
+                        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - R * 0.35,
+                        a: 1, s: 0.45 + Math.random() * 0.5 });
+    }
   }
   _particles(dt) {
     const c = this.cfg, e = this.emo;
+    /* A face fills its box, so a star or a sparkle would land on the picture — `_parts` discards
+       both. Not spawning them is the same picture for less work. The finish's burst is separate. */
+    const face = !!(this.preset || this.image);
     if (c.sweat && Math.random() < dt * 1.6) this.parts.push({ k: "drop", x: 40, y: -24, vy: 14, a: 1, s: 1 });
-    if (c.stars && Math.random() < dt * 2.2) this.parts.push({ k: "star", x: (Math.random() * 2 - 1) * 40, y: -30 - Math.random() * 12, vy: -6, a: 1, s: 0.5 + Math.random() * 0.6 });
-    if (e.smile > 0.75 && Math.random() < dt * 0.7) this.parts.push({ k: "spark", x: (Math.random() * 2 - 1) * 46, y: -22 - Math.random() * 14, vy: -8, a: 1, s: 0.4 + Math.random() * 0.5 });
+    if (!face) {
+      if (c.stars && Math.random() < dt * 2.2) this.parts.push({ k: "star", x: (Math.random() * 2 - 1) * 40, y: -30 - Math.random() * 12, vy: -6, a: 1, s: 0.5 + Math.random() * 0.6 });
+      if (e.smile > 0.75 && Math.random() < dt * 0.7) this.parts.push({ k: "spark", x: (Math.random() * 2 - 1) * 46, y: -22 - Math.random() * 14, vy: -8, a: 1, s: 0.4 + Math.random() * 0.5 });
+    }
     for (const p of this.parts) { p.y += p.vy * dt; if (p.vx) p.x += p.vx * dt;
       p.a -= dt * (p.k === "star" || p.k === "spark" ? 1.4 : p.k === "heart" ? 0.55 : 0.7); }
-    this.parts = this.parts.filter(p => p.a > 0);
+    if (this.parts.length) this.parts = this.parts.filter(p => p.a > 0);
   }
   _shape(ctx, rx, ry) { SHAPES[this.sp.body](ctx, rx, ry, this.ti); }
+  /* The silhouette is the same path five to eight times a frame — the glow, every fill, and every
+     clip — and it never moves except for the blob's breathing outline. Traced once into a Path2D,
+     which is user space, so a caller that translates first (the outfit) still clips against the
+     body. Without Path2D (older Safari) each call traces into the context as before. */
+  _bodyPath(rx, ry) {
+    if (typeof Path2D === "undefined") return null;
+    const key = this.sp.body + "|" + rx + "|" + ry;
+    if (this._bp && this._bp.key === key) return this._bp.p;
+    const p = new Path2D(), ops = { beginPath() {} };   // a fresh Path2D is already empty
+    for (const k of ["moveTo", "lineTo", "arc", "arcTo", "ellipse", "bezierCurveTo",
+                     "quadraticCurveTo", "closePath"]) ops[k] = (...a) => p[k](...a);
+    SHAPES[this.sp.body](ops, rx, ry, this.ti);
+    if (this.sp.body !== "blob") this._bp = { key, p };
+    return p;
+  }
+  _fillBody(ctx, style, rx, ry) {
+    ctx.fillStyle = style;
+    const p = this._bodyPath(rx, ry);
+    if (p) ctx.fill(p); else { this._shape(ctx, rx, ry); ctx.fill(); }
+  }
+  _clipBody(ctx, rx, ry) {
+    const p = this._bodyPath(rx, ry);
+    if (p) ctx.clip(p); else { this._shape(ctx, rx, ry); ctx.clip(); }
+  }
   draw() {
     const ctx = this.ctx, S = this.size, d = this.dpr, R = S * 0.326;
     const rx = R * 1.14, ry = R * 0.88, cx = S / 2, cy = S / 2 + R * 0.06;
@@ -586,9 +704,13 @@ export class MochiBot {
        picture at all uses. */
     /* A preset is the same idea with a frame per state: it is drawn in place of the picture, and a
        frame that has not decoded (or does not ship) falls back to the base frame. */
-    const presetFace = this._presetFace();
-    const tex = presetFace ? null : textureFor(this.image);
-    const face = presetFace || (tex && tex.cv);
+    /* A clip is drawn exactly where a preset frame is — same box, same breathing, same transform —
+       and the preset frames stand in until it is ready, or for any state the clip set does not
+       cover. */
+    const clip = this._clipFace();
+    const presetFace = clip ? null : this._presetFace();
+    const tex = clip || presetFace ? null : textureFor(this.image);
+    const face = clip || presetFace || (tex && tex.cv);
     ctx.save();
     ctx.translate(cx + this.ox, cy + this.oy);
     if (this.tilt || this.roll) ctx.rotate(this.tilt + this.roll);
@@ -609,31 +731,28 @@ export class MochiBot {
       if (this.glowA > 0.02) {
         ctx.save(); ctx.shadowColor = this.cfg.glow;
         ctx.shadowBlur = R * 0.9 * this.glowA; ctx.globalAlpha = 0.5 * this.glowA;
-        this._shape(ctx, rx, ry); ctx.fillStyle = this.cfg.glow; ctx.fill(); ctx.restore();
+        this._fillBody(ctx, this.cfg.glow, rx, ry); ctx.restore();
       }
       if (this.flat) {      /* Coucou's small-bot body: one flat fill, and none of the gradient, tint, shadow rim or
-         highlight a big mascot gets. Those are what wash the colour out at 46px — and a state
+         highlight a big mascot gets. Those are what wash the colour out at 52px — and a state
          tint would also hide the bot's colour, which is the only thing the row is saying. The
          glow behind it still rides the state, so the row lights up without losing its colour. */
-        this._shape(ctx, rx, ry); ctx.fillStyle = this.flat; ctx.fill();
+        this._fillBody(ctx, this.flat, rx, ry);
       } else {
-        const g = ctx.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
-        g.addColorStop(0, this.bodyTop); g.addColorStop(1, this.bodyBottom);
-        this._shape(ctx, rx, ry); ctx.fillStyle = g; ctx.fill();
+        const G = this._gradients(ctx, R, rx, ry);
+        this._fillBody(ctx, G.body, rx, ry);
+        /* The tint is a colour-to-transparent wash, so scaling it by `globalAlpha` is exact — and
+           it saves the one gradient that would otherwise change every frame. */
         if (this.tint > 0.01) {
-          const tg = ctx.createLinearGradient(0, ry, 0, -ry);
-          tg.addColorStop(0, hexA(this.cfg.glow, 0.72 * this.tint)); tg.addColorStop(1, hexA(this.cfg.glow, 0));
-          this._shape(ctx, rx, ry); ctx.fillStyle = tg; ctx.fill();
+          ctx.save(); ctx.globalAlpha = 0.72 * this.tint;
+          this._fillBody(ctx, G.tint, rx, ry);
+          ctx.restore();
         }
-        const sg = ctx.createRadialGradient(0, 0, R * 0.15, 0, 0, R * 1.25);
-        sg.addColorStop(0, "rgba(0,0,0,0)"); sg.addColorStop(0.6, "rgba(0,0,0,0)"); sg.addColorStop(1, "rgba(0,0,0,0.2)");
-        this._shape(ctx, rx, ry); ctx.fillStyle = sg; ctx.fill();
-        const hg = ctx.createRadialGradient(rx * 0.34, -ry * 0.46, 0, rx * 0.34, -ry * 0.46, R * 0.42);
-        hg.addColorStop(0, "rgba(255,255,255,0.55)"); hg.addColorStop(1, "rgba(255,255,255,0)");
-        this._shape(ctx, rx, ry); ctx.fillStyle = hg; ctx.fill();
+        this._fillBody(ctx, G.shade, rx, ry);
+        this._fillBody(ctx, G.hi, rx, ry);
       }
       if (this.cfg.scan) {
-        ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
+        ctx.save(); this._clipBody(ctx, rx, ry);
         const sx = this.scanX * rx;
         const lg = ctx.createLinearGradient(sx - 10, 0, sx + 10, 0);
         lg.addColorStop(0, "rgba(255,255,255,0)"); lg.addColorStop(0.5, "rgba(255,255,255,0.5)"); lg.addColorStop(1, "rgba(255,255,255,0)");
@@ -645,10 +764,28 @@ export class MochiBot {
     }
     ctx.restore();
 
-    this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry, !!presetFace);
+    this._props(ctx, cx + this.ox, cy + this.oy, R, rx, ry, !!face);
     if (this.badgeS > 0.02) this._badge(ctx, cx + this.ox, cy + this.oy, R);
     this._parts(ctx, cx + this.ox, cy + this.oy);
     ctx.restore();
+  }
+  /* The body's four gradients, built once and kept. Nothing in them moves between frames — size,
+     colours and the state's glow are the whole key — so a re-skin is the only thing that rebuilds
+     them, and the per-frame cost of a repaint is the fills themselves. */
+  _gradients(ctx, R, rx, ry) {
+    const key = this.size + "|" + this.bodyTop + "|" + this.bodyBottom + "|" + this.cfg.glow;
+    if (this._g && this._g.key === key) return this._g;
+    const body = ctx.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
+    body.addColorStop(0, this.bodyTop); body.addColorStop(1, this.bodyBottom);
+    const tint = ctx.createLinearGradient(0, ry, 0, -ry);
+    tint.addColorStop(0, hexA(this.cfg.glow, 1)); tint.addColorStop(1, hexA(this.cfg.glow, 0));
+    const shade = ctx.createRadialGradient(0, 0, R * 0.15, 0, 0, R * 1.25);
+    shade.addColorStop(0, "rgba(0,0,0,0)"); shade.addColorStop(0.6, "rgba(0,0,0,0)"); shade.addColorStop(1, "rgba(0,0,0,0.2)");
+    const hi = ctx.createRadialGradient(rx * 0.34, -ry * 0.46, 0, rx * 0.34, -ry * 0.46, R * 0.42);
+    hi.addColorStop(0, "rgba(255,255,255,0.55)"); hi.addColorStop(1, "rgba(255,255,255,0)");
+    const desk = ctx.createLinearGradient(0, ry * 0.84, 0, ry * 0.84 + R * 0.28);
+    desk.addColorStop(0, "#43434F"); desk.addColorStop(1, "#2A2A34");
+    return (this._g = { key, body, tint, shade, hi, desk });
   }
   _ears(ctx, R, rx, ry) {
     /* The spring's lag, not a smoothed derivative: ears swing back when the head turns
@@ -718,6 +855,82 @@ export class MochiBot {
     return { mouthY, mouthTop, eyeMinY, eyeMaxY,
              knee: Math.max(R * 0.12, (eyeMaxY - eyeMinY) * 0.14) };
   }
+  /* ---------------- clips ----------------
+     A preset that also ships video. The clip for the current state is drawn through `_facePic`, in
+     the same box as a preset frame, so the fit and the breathing are the same geometry. A change
+     from one clip to another is a cut, like the preset path: a cross-fade between two videos would
+     need a second decoder per face and would read as a cut anyway. */
+  _clipUrl() {
+    const c = this.clips;
+    if (this._onceUrl) return this._onceUrl;
+    return c[this.state] || (RESTING.has(this.state) ? c.idle : "") || "";
+  }
+  /* The video for a URL, created on first use. A clip that fails to load is dead for the rest of
+     the session: retrying it would hammer the server, and a quiet fallback to the preset frames
+     beats a console full of errors. */
+  _clipRec(url) {
+    let rec = this._vids.get(url);
+    if (rec) return rec;
+    if (typeof document === "undefined" || !document.createElement) return null;
+    const el = document.createElement("video");
+    rec = { el, dead: false, blocked: false };
+    this._vids.set(url, rec);
+    el.muted = true; el.playsInline = true; el.preload = "auto";
+    el.setAttribute?.("playsinline", "");
+    el.loop = true;
+    el.addEventListener("error", () => {
+      rec.dead = true;
+      if (this._onceEl === el) { this._onceEl = null; this._onceUrl = ""; }
+      if (this._clipEl === el) { el.pause(); this._clipEl = null; }
+    });
+    /* A one-shot hands back to the state the moment it ends. */
+    el.addEventListener("ended", () => {
+      if (this._onceEl !== el) return;
+      this._onceEl = null; this._onceUrl = "";
+      el.loop = true;
+      try { el.currentTime = 0; } catch (e) { /* nothing to rewind */ }
+      this._syncClip();
+    });
+    el.src = url;
+    return rec;
+  }
+  _clipPlay(rec) {
+    const el = rec.el;
+    if (rec.blocked || !el.paused) return;
+    const p = el.play();
+    /* Autoplay can still be refused; retrying every frame would only churn promises. */
+    if (p && p.catch) p.catch(() => { rec.blocked = true; });
+  }
+  /* Keep exactly one clip playing, and only while the face is on screen and the tab is visible.
+     Runs once a tick, not once a draw: a pause/play pair per frame would restart the decoder. */
+  _syncClip() {
+    const cur = this._clipEl;
+    if (this._hidden) { if (cur && !cur.paused) cur.pause(); return; }
+    const url = REDUCED ? "" : this._clipUrl();
+    const rec = url ? this._clipRec(url) : null;
+    const el = rec && !rec.dead ? rec.el : null;
+    if (el !== cur) {
+      if (cur) cur.pause();
+      this._clipEl = el;
+      if (el) {
+        /* A clip taking the face over is a cut: the preset frame it replaces must not be held to
+           dissolve back in when the state returns to the frames. */
+        this._facePrev = this._faceCur = null; this._faceFrame = ""; this._fade = 1;
+        el.loop = el !== this._onceEl;
+        this._clipPlay(rec);
+      }
+    } else if (el) this._clipPlay(rec);
+  }
+  /* A culled face pauses its video: a decoder running for a canvas nobody draws is pure cost. */
+  _pauseClip() { if (this._clipEl && !this._clipEl.paused) this._clipEl.pause(); }
+  /* The clip ready to draw, or null: until it decodes (or if it died) the preset frame or the drawn
+     bot stands in, exactly as it did before clips existed. */
+  _clipFace() {
+    if (REDUCED) return null;
+    const url = this._clipUrl();
+    const rec = url ? this._vids.get(url) : null;
+    return rec && !rec.dead && rec.el.readyState >= 2 ? rec.el : null;
+  }
   /* The preset frame for this instant, or the base frame while the chosen one is still decoding or
      does not exist. Null until even the base lands, so the bot keeps its drawn self for that first
      frame instead of flashing an empty canvas. */
@@ -727,7 +940,14 @@ export class MochiBot {
                              this._pokeLeft > 0 ? this._pokeFrame : "");
     for (const f of [want, "base"]) {
       const t = presetTextureFor(presetUrl(this.preset, f), this.size * this.dpr);
-      if (t && t.cv) return t.cv;
+      if (!t || !t.cv) continue;
+      /* Tracked by frame name, not by texture: a name that has not decoded yet falls back to `base`,
+         and that fallback is a change like any other. The outgoing canvas is held for the fade. */
+      if (f !== this._faceFrame) {
+        this._facePrev = this._faceCur; this._faceCur = t.cv;
+        this._faceFrame = f; this._fade = 0;
+      }
+      return t.cv;
     }
     return null;
   }
@@ -738,12 +958,27 @@ export class MochiBot {
   /* The face's drawn size, in the bot's own units. The breathing scale pivots on the bottom of this
      box and `_facePic` draws into it, so the pivot and the picture can never disagree. */
   _faceBox(cv) {
-    const box = this.size * 0.96, s = Math.min(box / cv.width, box / cv.height);
-    return { w: cv.width * s, h: cv.height * s };
+    const cw = cv.videoWidth || cv.width, ch = cv.videoHeight || cv.height;
+    const box = this.size * 0.96, s = Math.min(box / cw, box / ch);
+    return { w: cw * s, h: ch * s };
   }
   _facePic(ctx, cv) {
     const { w, h } = this._faceBox(cv);
-    ctx.drawImage(cv, -w / 2, -h / 2, w, h);
+    /* A clip is a cut, like the preset path — no cross-fade between two videos. */
+    if ("videoWidth" in cv) { ctx.drawImage(cv, -w / 2, -h / 2, w, h); return; }
+    /* The frame just replaced fades out under the new one. `_fade` is advanced by `tick`, so the
+       dissolve runs on wall time: a state change reads as motion, and a 0.13s mouth cycle turns from
+       a slideshow into a continuous shape rather than four jumps a second. */
+    const a = clamp(this._fade, 0, 1);
+    if (a < 1 && this._facePrev && this._facePrev !== cv) {
+      const p = this._faceBox(this._facePrev);
+      ctx.save(); ctx.globalAlpha = 1 - a;
+      ctx.drawImage(this._facePrev, -p.w / 2, -p.h / 2, p.w, p.h);
+      ctx.restore();
+      ctx.save(); ctx.globalAlpha = a;
+      ctx.drawImage(cv, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    } else ctx.drawImage(cv, -w / 2, -h / 2, w, h);
     const shut = this.imageClosed ? textureFor(this.imageClosed) : null;
     if (shut && shut.cv) {
       const a = clamp((1 - this.open) / 0.45, 0, 1);
@@ -770,7 +1005,7 @@ export class MochiBot {
     const es = this.es;                                      // surprise pop: eyes widen for a beat
     const w = R * st.w * es, h = R * st.h * clamp(e.eye, 0, 1.4) * es;
     const bulge = this.sp.eyes === "bulge";
-    if (!bulge) { ctx.save(); this._shape(ctx, rx, ry); ctx.clip(); }
+    if (!bulge) { ctx.save(); this._clipBody(ctx, rx, ry); }
     for (const sd of [-1, 1]) {
       const F = this.eyeAt(sd, R, rx, ry);
       if (!F.vis) continue;
@@ -811,7 +1046,7 @@ export class MochiBot {
     if (!bulge) ctx.restore();
     /* brows: the strongest emotion signal, drawn over the eyes */
     if (Math.abs(e.brow) > 0.06) {
-      ctx.save(); if (!bulge) { this._shape(ctx, rx, ry); ctx.clip(); }
+      ctx.save(); if (!bulge) this._clipBody(ctx, rx, ry);
       ctx.strokeStyle = ink; ctx.lineWidth = R * 0.055; ctx.lineCap = "round";
       for (const sd of [-1, 1]) {
         const F = this.eyeAt(sd, R, rx, ry);
@@ -828,7 +1063,7 @@ export class MochiBot {
     const e = this.emo;
     if (e.eye < 0.12 && this.sp.eyes !== "screen") return;   // asleep: no mouth to speak of
     const mw = R * 0.40, my = this._faceGeom(R, rx, ry).mouthY;   // shares the eye/mouth split
-    ctx.save(); this._shape(ctx, rx, ry); ctx.clip();
+    ctx.save(); this._clipBody(ctx, rx, ry);
     ctx.strokeStyle = MC.INK; ctx.lineWidth = R * 0.055; ctx.lineCap = "round"; ctx.lineJoin = "round";
     if (e.open > 0.12) {
       const ow = mw * (0.42 + 0.55 * clamp(e.smile, -0.4, 1)), oh = R * (0.10 + 0.24 * e.open);
@@ -855,7 +1090,7 @@ export class MochiBot {
   /* Both garments live in the bottom band of the silhouette: this engine's body *is* the head, so
      there is no neck to hang a scarf on — the mouth sits at 0.56ry and the cloth has to start under
      it. Everything is drawn before the face, so an open mouth still lands on top of a scarf.
-     They are sized to be *seen* at 46px, which is the size that matters: a garment drawn at the
+     They are sized to be *seen* at 52px, which is the size that matters: a garment drawn at the
      silhouette's own scale is a two-pixel sliver once the sidebar shrinks it. */
   _outfit(ctx, R, rx, ry) {
     const o = OUTFITS[this.outfit];
@@ -867,7 +1102,7 @@ export class MochiBot {
     /* The mantle is the one garment meant to break the outline — a cape that stopped at the body's
        edge would be a bib. Everything else is clipped to the silhouette. */
     const clipped = this.outfit !== "mantle";
-    if (clipped) { ctx.save(); this._shape(ctx, rx, ry); ctx.clip(); }
+    if (clipped) { ctx.save(); this._clipBody(ctx, rx, ry); }
     if (this.outfit === "scarf") {
       ctx.fillStyle = o.ink;
       ctx.beginPath(); rr(ctx, -rx * 0.86, ry * 0.60, rx * 1.72, R * 0.36, R * 0.17); ctx.fill();
@@ -1010,13 +1245,14 @@ export class MochiBot {
     ctx.restore();
   }
   /* ---------- scene props ---------- */
-  _props(ctx, cx, cy, R, rx, ry, preset) {
+  _props(ctx, cx, cy, R, rx, ry, face) {
     const c = this.cfg;
     ctx.save(); ctx.translate(cx, cy);
     /* A preset's frame is the whole scene: its work frames already have the laptop, its gestures
        already have the hand, and its head fills the box, so a thought bubble would land on the
-       face. Its frames carry the state on their own. */
-    if (!preset) {
+       face. Its frames carry the state on their own. An introduced picture is the same box: a
+       desk or a magnifier drawn round it lands on the photo. */
+    if (!face) {
       if (c.bubble) this._bubble(ctx, R, rx, ry);
       if (c.mag)    this._mag(ctx, R, rx, ry);
       if (c.hand)   this._hand(ctx, R, rx, ry);
@@ -1085,8 +1321,7 @@ export class MochiBot {
   _desk(ctx, R, rx, ry) {
     const t = this.ti;
     const dw = rx * 2.15, dh = R * 0.28, dy = ry * 0.84;
-    const g = ctx.createLinearGradient(0, dy, 0, dy + dh);
-    g.addColorStop(0, "#43434F"); g.addColorStop(1, "#2A2A34");
+    const g = this._gradients(ctx, R, rx, ry).desk;
     ctx.beginPath(); rrect(ctx, -dw / 2, dy, dw, dh, R * 0.09); ctx.fillStyle = g; ctx.fill();
     ctx.beginPath(); rrect(ctx, -dw / 2, dy, dw, R * 0.055, R * 0.03); ctx.fillStyle = "rgba(255,255,255,0.09)"; ctx.fill();
     const lw = R * 0.70, lh = R * 0.46, ly = dy - R * 0.02;
@@ -1107,10 +1342,11 @@ export class MochiBot {
   }
   _badge(ctx, cx, cy, R) {
     const kind = this.cfg.badge, col = this.cfg.glow, s = this.badgeS;
-    /* -0.72R is just outside a drawn body; a preset's head fills the box, so the same offset puts the
-       badge on its cheek. Sit in the canvas corner instead, inset by a share of the box so the glyph
-       (a fixed size in pixels) still clears the edge on a 46px sidebar row. */
-    const k = this.preset ? this.size / 2 - Math.max(6, this.size * 0.09) : R * 0.72;
+    /* -0.72R is just outside a drawn body; a face fills the box — a preset frame or an introduced
+       picture alike — so the same offset puts the badge on its cheek. Sit in the canvas corner
+       instead, inset by a share of the box so the glyph (a fixed size in pixels) still clears the
+       edge on a 52px sidebar row. */
+    const k = this.preset || this.image ? this.size / 2 - Math.max(6, this.size * 0.09) : R * 0.72;
     ctx.save(); ctx.translate(cx - k, cy - k); ctx.scale(s, s); ctx.fillStyle = col;
     const now = this.ti;
     if (kind === "dots") for (let i = 0; i < 3; i++) {
@@ -1131,10 +1367,13 @@ export class MochiBot {
   }
   _parts(ctx, cx, cy) {
     /* The offsets below are quoted in pixels for the drawn body, which leaves a margin round itself.
-       A preset head fills the box, so any of them lands on hair or cheek — and its frames already
-       carry the expression, so it gets none of them. */
-    if (this.preset) return;
+       A face — a preset's frame or an introduced picture, both of which fill the box — would take any
+       of them on hair or cheek, so it gets none of them. A finish's burst is the exception: it is
+       thrown outward, so it reads as confetti round the head rather than as something on it. */
+    const face = !!(this.preset || this.image);
+    if (face && !this.parts.some(p => p.b)) return;
     for (const p of this.parts) {
+      if (face && !p.b) continue;
       ctx.save(); ctx.globalAlpha = clamp(p.a, 0, 1); ctx.translate(cx + p.x, cy + p.y);
       if (p.k === "star") { ctx.fillStyle = "#F7B32B"; star(ctx, 7 * p.s); }
       else if (p.k === "spark") { ctx.fillStyle = "#FFF0B8"; star(ctx, 5 * p.s); }
@@ -1328,18 +1567,25 @@ export function textureFor(url) {
 /* ---------------- preset frames: a character's own pictures ----------------
    These already carry real alpha, so nothing is keyed out: the white-backdrop fill above would push
    every antialiased edge toward white and leave a halo. Decoded once per character, not per bot: a
-   roster wearing the same preset shares one set. The size is bucketed to what the canvas can show,
-   because 21 frames held at full resolution is 22 MB per character and a 46px sidebar row cannot
-   spend it. The whole square is kept, not a tight crop: the frames are head-aligned, and a crop
-   would shift the head. */
+   roster wearing the same preset shares one set. A frame is decoded at the canvas's own pixel size
+   (capped at 512), because 21 frames at full resolution is 22 MB per character and a 52px sidebar
+   row cannot spend it — and rounding every request up to a power of two spent 512 on both a 210px
+   panel at 2x and a 104px dock at 3x. The whole square is kept, not a tight crop: the frames are
+   head-aligned, and a crop would shift the head. */
 const PTEX = new Map();
+/* Frames come and go with the state, and a re-skin leaves the old character's set behind, so the
+   map is capped and the least recently asked-for entry goes. Map order is the LRU: a hit is deleted
+   and re-set, so the first key is always the coldest. */
+const PTEX_MAX = 32;
 export const presetTextureFor = (url, px = 512) => {
   if (!url) return null;
-  px = Math.min(512, 2 ** Math.ceil(Math.log2(Math.max(32, px))));
+  px = Math.min(512, Math.max(32, Math.round(px)));
   const key = url + "|" + px;
-  if (PTEX.has(key)) return PTEX.get(key);
+  const hit = PTEX.get(key);
+  if (hit) { PTEX.delete(key); PTEX.set(key, hit); return hit; }
   const rec = { cv: null };
   PTEX.set(key, rec);
+  if (PTEX.size > PTEX_MAX) PTEX.delete(PTEX.keys().next().value);
   if (typeof document === "undefined") return rec;   // no canvas (a test, or a headless pass)
   const img = new Image();
   img.onload = () => {
@@ -1374,27 +1620,76 @@ export const presetTextureFor = (url, px = 512) => {
    change still lands, because a face that never updated would be a worse lie than a short tween. */
 const REDUCED = typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 const bots = new Set();
+/* A face that is not on screen still costs a tick and a full repaint: the sidebar keeps every row's
+   canvas when a chat is scrolled away, and a hidden dock keeps its own. The observer is native and
+   reports on its own schedule, so this adds no layout read to the frame — unlike `offsetParent`,
+   which would force one per bot per frame. A bot starts visible, because the first callback lands a
+   frame or two after `observe` and a face that never drew would flash empty. */
+const seen = typeof IntersectionObserver !== "undefined"
+  ? new IntersectionObserver(es => {
+      for (const e of es) { const b = e.target._bot; if (b) b.vis = e.isIntersecting; }
+      kick();                     // a face coming back on screen restarts a loop that stood down
+    }, { threshold: 0 })
+  : null;
 let last = performance.now(), running = false;
+function kick() {
+  if (running || !bots.size) return;
+  running = true; last = performance.now(); requestAnimationFrame(loop);
+}
 function loop(now) {
   const dt = Math.min((now - last) / 1000, 0.05); last = now;
-  for (const b of bots) { b.tick(dt); b.draw(); }
-  /* With no faces attached — mascot hidden, or the last chat closed — the loop stands down instead of
-     spinning a rAF forever; `attach` starts it again. */
-  if (!bots.size) { running = false; return; }
+  let any = false;
+  for (const b of bots) {
+    if (b.vis === false) { b._pauseClip(); continue; }
+    any = true; b.tick(dt); b.draw();
+  }
+  /* The loop stands down when there is nothing to draw — no faces attached (mascot hidden, last chat
+     closed), or every face culled (the dock hidden with no roster row on screen). Standing down only
+     on an empty set meant a hidden page could never go idle: the culled bots stayed in it, so the
+     frame ran forever with nothing to tick. `attach` and the observer both start it again. */
+  if (!any) { running = false; return; }
   requestAnimationFrame(loop);
 }
-/* The cursor drives every face, so the listener lives here, not in the app. */
+/* A browser zoom, a window dragged to another screen, or a dock measured while it was hidden all
+   leave the backing store at the old scale — the face is then drawn soft or cropped until a reload.
+   A box of 0 means the face is hidden, not that it shrank, so the last real size is kept. */
+function fitBots() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  for (const b of bots) {
+    const size = b.cv.clientWidth || b.size;
+    if (size === b.size && dpr === b.dpr) continue;
+    b.size = size; b.dpr = dpr; b.R = size * 0.326;
+    b.cv.width = size * dpr; b.cv.height = size * dpr;
+    b._g = null;                       // the gradient key carries the size it was built for
+  }
+}
+/* The cursor drives every face, so the listener lives here, not in the app. Scroll is captured on the
+   document, not heard on the window: an element's own scroll does not reach a window listener, and the
+   sidebar's list is its own scroll container — a face scrolled inside it kept its old centre and read
+   the pointer as somewhere it was not. Capture visits every ancestor, so one listener covers both. */
+if (typeof document !== "undefined") {
+  document.addEventListener("scroll", queuePointer, { passive: true, capture: true });
+  /* A hidden tab still decodes a playing video, and nothing is drawn there to watch it. */
+  document.addEventListener("visibilitychange", () => {
+    for (const b of bots) { b._hidden = !!document.hidden; b._syncClip(); }
+    kick();
+  });
+}
 if (typeof window !== "undefined") {
-  window.addEventListener("pointermove", e => { POINTER.x = e.clientX; POINTER.y = e.clientY; POINTER.on = true; applyPointer(); }, { passive: true });
-  window.addEventListener("scroll", () => { invalidateRects(); applyPointer(); }, { passive: true });
-  window.addEventListener("resize", () => { invalidateRects(); applyPointer(); });
+  window.addEventListener("pointermove", e => { POINTER.x = e.clientX; POINTER.y = e.clientY; POINTER.on = true; queuePointer(); }, { passive: true });
+  window.addEventListener("resize", () => { fitBots(); queuePointer(); });
   window.addEventListener("pointerleave", releasePointer);
   window.addEventListener("blur", releasePointer);
 }
 export function attach(canvas, state, opts) {
   const b = new MochiBot(canvas, state, opts);
   bots.add(b);
-  if (!running) { running = true; last = performance.now(); requestAnimationFrame(loop); }
+  if (seen) { canvas._bot = b; seen.observe(canvas); }
+  kick();
   return b;
 }
-export function detach(b) { bots.delete(b); }
+export function detach(b) {
+  b._pauseClip();
+  bots.delete(b);
+  if (seen && b.cv) { b.cv._bot = null; seen.unobserve(b.cv); }
+}

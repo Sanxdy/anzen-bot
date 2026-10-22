@@ -25,6 +25,7 @@ S.SESS_PATH = os.path.join(tmp, "sessions.json")
 S.LOGDIR = os.path.join(tmp, "logs"); os.makedirs(S.LOGDIR)
 S.TOKEN_PATH = os.path.join(tmp, "access_token")
 S.LAN_MARK = os.path.join(tmp, "lan")
+S.LAN = os.path.exists(S.LAN_MARK)                  # the import read the real dir; this suite's is empty
 S.RELAY_SECRET_PATH = os.path.join(tmp, "relay_secret")
 assert S.BOTS_PATH.startswith(tmp) and S.TOKEN_PATH.startswith(tmp), "test paths must point into tmp"
 assert S.RELAY_SECRET_PATH.startswith(tmp), "the relay secret must never be minted into the real data dir"

@@ -12,7 +12,7 @@ browser tool needs Playwright (optional).
 Run:  python3 server.py
 Env:  PORT, HOST, DATA_DIR, SANDBOX_DIR, ROUTER_URL, ROUTER_KEY, DEFAULT_MODEL, VISION_MODEL
 """
-import json, os, re, select, signal, socket, socketserver, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3, random, mimetypes
+import json, os, re, select, signal, socket, socketserver, subprocess, sys, threading, time, base64, queue, shlex, collections, atexit, urllib.request, urllib.error, uuid, datetime, ipaddress, io, shutil, zipfile, secrets, concurrent.futures, sqlite3, random, mimetypes, tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
@@ -47,6 +47,13 @@ if not os.path.isfile(os.path.join(SHELL, "index.html")):
     if os.path.isfile(os.path.join(_sib, "index.html")): SHELL = _sib
 MEMDIR = os.path.join(DATA, "memory")
 os.makedirs(DATA, exist_ok=True); os.makedirs(SANDBOX, exist_ok=True); os.makedirs(MEMDIR, exist_ok=True)
+# Every JSON in the data dir holds something private — the router key, connector secrets, the
+# transcript — and one written before `_save_json` asked for 0600 is still readable by every account
+# on the machine. Tightened once here rather than waiting for each to be rewritten.
+for _f in os.listdir(DATA):
+    if _f.endswith(".json"):
+        try: os.chmod(os.path.join(DATA, _f), 0o600)
+        except OSError: pass
 
 # ---------------------------------------------------------------- where the API answers
 # Bound to loopback (the default, and how the desktop app runs) only this machine can reach the
@@ -71,17 +78,21 @@ SOCK = os.environ.get("ANZEN_SOCK")
 # Nothing here listens for the internet, so there is no port to find and no router to configure: that
 # is the difference between this and a tunnel, which exposes this machine rather than meeting it.
 RELAY_SECRET_PATH = os.path.join(DATA, "relay_secret")
+_MINT_LOCK = threading.Lock()
 def _mint_token(path):
     """A shared secret that stands between a door and this app: read if it is there, else minted on
     first use and never rotated on its own — a client that has been set up must keep working."""
-    try:
-        t = open(path).read().strip()
-        if t: return t
-    except OSError: pass
-    t = secrets.token_urlsafe(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.write(fd, t.encode()); os.close(fd)
-    return t
+    # Under a lock: two first calls used to mint two secrets, and whichever lost the write race then
+    # handed out a token the file does not hold — a phone set up with it could never get in.
+    with _MINT_LOCK:
+        try:
+            t = open(path).read().strip()
+            if t: return t
+        except OSError: pass
+        t = secrets.token_urlsafe(32)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, t.encode()); os.close(fd)
+        return t
 def relay_secret(): return _mint_token(RELAY_SECRET_PATH)
 def lan_ip():
     """This machine's address on the local network, for the URL you type into the phone. The
@@ -157,10 +168,23 @@ IMAGE_MODELS = _image_models(CFG.get("image_model"))
 
 _lock = threading.Lock()
 OUT_UA = "AnzenBot/1.0"   # WAFs (e.g. Cloudflare 1010) 403 the default Python-urllib signature
+def _read_deadline(r, timeout):
+    """Read a whole response against one clock. `urlopen(...).read()` takes each chunk under a fresh
+    socket timeout, so a server that trickles bytes holds the call open far past `timeout` — the same
+    trap `_post` reads around."""
+    end = time.time() + timeout
+    out = []
+    while True:
+        chunk = r.read1(65536)
+        if not chunk: break
+        out.append(chunk)
+        if time.time() > end: raise socket.timeout("still sending after %ds" % timeout)
+    return b"".join(out)
 def fetch_models(timeout=30):
     """Ask the configured router/API key which models it actually serves."""
     req = urllib.request.Request(ROUTER + "/models", headers={"Authorization": "Bearer " + KEY, "User-Agent": OUT_UA})
-    d = json.load(urllib.request.urlopen(req, timeout=timeout))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(_read_deadline(r, timeout))
     items = d.get("data") or d.get("models") or []
     return sorted({(m.get("id") if isinstance(m, dict) else str(m)) for m in items if m})
 def save_models(ids):
@@ -183,7 +207,12 @@ def _load_json(path, default):
         return default
 def _save_json(path, obj, indent=2):
     with _lock:
-        tmp = path + ".tmp"; json.dump(obj, open(tmp, "w"), indent=indent); os.replace(tmp, path)
+        tmp = path + ".tmp"
+        # 0600: the default umask would make the key and the connector secrets readable by every
+        # account on this machine, and the file is never meant for anyone but this process.
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump(obj, f, indent=indent)
+        os.replace(tmp, path)
 def _migrate_image_model():
     """A saved image_model naming a route the router does not serve is the reason the tool drew
     nothing, so move it to a live one and write that back. Runs once at startup: the value is no
@@ -321,10 +350,12 @@ def load_settings():
         return json.loads(json.dumps(_SET["d"]))
 def save_settings(s):
     """Write settings through the cache, so the next `load_settings` sees this save and not the file
-    it replaced."""
-    with _SET_LOCK: _SET["d"] = s; _SET["path"] = SET_PATH
-    _save_json(SET_PATH, s)
-    sync_model_policy(s)
+    it replaced. The cache is published only once the write has landed: a failed write must not leave
+    readers believing a value that is not on disk."""
+    with _SET_LOCK:
+        _save_json(SET_PATH, s)
+        _SET["d"] = s; _SET["path"] = SET_PATH
+        sync_model_policy(s)
 
 def _public_connector_url(url):
     """Expose only a credential-free HTTPS base URL to the browser."""
@@ -362,6 +393,10 @@ def settings_public(s):
 
 # ---------------------------------------------------------------- bots
 BOTS_PATH = os.path.join(DATA, "bots.json")
+# The roster and the rooms are read-modify-write documents: two saves at once would each load the
+# same list and the second would drop the first one's change. Every route that rewrites either holds
+# this across the load and the save, the same shape `_RT_LOCK` gives routines.
+_DOC_LOCK = threading.Lock()
 # The reply language follows the user, and English is the default. This used to name Indonesian
 # first and only, which read as "reply in Indonesian" and primed the model toward it — an English
 # question would come back in Indonesian. Stated English-first, with another language only as the
@@ -463,6 +498,24 @@ def _fill(x, k, v):
     a deliberate `False`, `0` or `""` is left exactly as written."""
     if x.get(k) is None: x[k] = v
 
+def _unique_name(name, taken):
+    """A bot name nobody else in the roster has, `taken` being their lowercased names and updated
+    in place. Two bots called the same are indistinguishable in the sidebar and the chat list — the
+    id is what the app keys on, so nothing breaks, it is simply two rows saying the same word. An
+    import is where that happens: a playbook may repeat a name, and it may reuse one already here."""
+    base = (name or "").strip() or "Bot"
+    out, n = base, 2
+    while out.lower() in taken: out = "%s %d" % (base, n); n += 1
+    taken.add(out.lower())
+    return out
+
+def _unique_id(base, taken):
+    """An id nobody has claimed, `taken` updated in place. Same rule `_fill_id_name` uses."""
+    out, n = base, 2
+    while out in taken: out = "%s-%d" % (base, n); n += 1
+    taken.add(out)
+    return out
+
 def _fill_id_name(x, fallback, taken):
     """An id and a name for a record the file left without them.
 
@@ -481,10 +534,7 @@ def _fill_id_name(x, fallback, taken):
         x["name"] = x.get("name") or own.replace("-", " ").title()
         return x
     base = _slug(x.get("name"), fallback)
-    x["id"] = base
-    n = 2
-    while x["id"] in taken: x["id"] = "%s-%d" % (base, n); n += 1
-    taken.add(x["id"])
+    x["id"] = _unique_id(base, taken)
     x["name"] = x.get("name") or x["id"].replace("-", " ").title()
     return x
 
@@ -494,9 +544,14 @@ def _norm_bots(b):
     file with no `name`, and then stopped the app from booting."""
     known = CFG.get("models") or []
     taken = {x["id"] for x in b if x.get("id")}
+    names = set()
     for x in b:
         x.pop("mascot", None)   # avatars are emoji-on-colour now; mascot was the old key
         _fill_id_name(x, "bot", taken)
+        # A roster written before names were kept apart still has to load as one, so the later of
+        # two rows reading the same word steps aside here. Ids never change, so nothing on disk
+        # (a session, a logo, an avatar) is orphaned by it.
+        x["name"] = _unique_name(x["name"], names)
         _fill(x, "title", "Teammate"); _fill(x, "role", ""); _fill(x, "color", "blue")
         _fill(x, "approval", "ask"); _fill(x, "memory", True); _fill(x, "voice", "")
         _fill(x, "hidden", False); _fill(x, "pinned", False); _fill(x, "skills", [])
@@ -510,6 +565,9 @@ def _norm_bots(b):
         _fill(x, "outfit", ""); _fill(x, "accessory", ""); _fill(x, "avatar", 0)
         _fill(x, "avatar_closed", 0); _fill(x, "genface", ""); _fill(x, "genface_closed", "")
         _fill(x, "preset", "")
+        # The browser accounts this bot's own chat uses, as rows of {name, sites}. Empty means none:
+        # a bot made today starts with no logins, not with whatever another room happens to hold.
+        x["browser"] = _norm_accounts(x.get("browser"))
         # A record with no model, or one the current router does not serve, would 404 on every turn —
         # and `_agent_loop` reads `bot["model"]` unguarded, so a missing one is a TypeError mid-turn.
         _fill(x, "model", DEFAULT_MODEL)
@@ -547,8 +605,8 @@ def _norm_channels(c):
         # The colour of the room's letter avatar. Both clients default it, so this is only what the
         # row is drawn with before the user picks one — but it is a field they read, so it is filled.
         _fill(x, "color", "")
-        # The browser accounts this room's bots use, as rows of {name, sites}. Empty means "the
-        # machine-wide list", so a room that never set one keeps behaving exactly as it always did.
+        # The browser accounts this room's bots use, as rows of {name, sites}. Empty means none:
+        # a room made today starts with no logins and browses anonymously.
         x["browser"] = _norm_accounts(x.get("browser"))
     return c
 
@@ -573,17 +631,23 @@ def channel_by_id(chs, cid): return next((x for x in chs if x.get("id") == cid),
 
 def _migrate_room_browser():
     """The browser accounts used to be one machine-wide list set in Settings → Browser. That tab is
-    gone and the list belongs to a room now, so every room that never had one adopts the old list
-    once — otherwise the accounts the user set up would exist only as a fallback nobody can see.
-    `browser_seeded` records the adoption, so emptying a room's list later is a choice the next boot
-    does not undo."""
-    acc = _norm_accounts((load_settings().get("browser") or {}).get("accounts"))
-    if not acc: return
-    chs = load_channels(); changed = False
-    for ch in chs:
-        if ch.get("browser") or ch.get("browser_seeded"): continue
-        ch["browser"] = [dict(x) for x in acc]; ch["browser_seeded"] = True; changed = True
-    if changed: save_channels(chs)
+    gone and the list belongs to the room now, so a room that never had one adopts the old list
+    **once** — otherwise the accounts the user set up would exist only as a fallback nobody can see.
+
+    `seeded` records that one adoption, so a room made afterwards starts with nothing. That is the
+    point of the flag: seeding every record that lacks a list, on every boot, is what made each new
+    room and each new bot inherit the whole list as if the user had set it up there. Bots are never
+    seeded: a bot's own chat had no list before, and the fallback to this one was the bug."""
+    s = load_settings(); br = s.setdefault("browser", {})
+    if br.get("seeded"): return
+    acc = _norm_accounts(br.get("accounts"))
+    if acc:
+        chs = load_channels(); changed = False
+        for ch in chs:
+            if ch.get("browser") or ch.get("browser_seeded"): continue
+            ch["browser"] = [dict(x) for x in acc]; ch["browser_seeded"] = True; changed = True
+        if changed: save_channels(chs)
+    br["seeded"] = True; save_settings(s)
 
 def reorder(seq, ids, key=lambda x: x.get("id")):
     """Put `seq` in the order `ids` names. Anything the caller did not name keeps its relative
@@ -985,11 +1049,12 @@ def remove_skill(sid):
     if not any(s["id"] == sid for s in before): return False
     _save_json(SKILLS_FILE, [s for s in before if s["id"] != sid])
     shutil.rmtree(os.path.join(SKILLS_DIR, sid), ignore_errors=True)
-    bots = load_bots(); touched = False
-    for b in bots:
-        if sid in (b.get("skills") or []):
-            b["skills"] = [x for x in b["skills"] if x != sid]; touched = True
-    if touched: save_bots(bots)
+    with _DOC_LOCK:
+        bots = load_bots(); touched = False
+        for b in bots:
+            if sid in (b.get("skills") or []):
+                b["skills"] = [x for x in b["skills"] if x != sid]; touched = True
+        if touched: save_bots(bots)
     return True
 
 # ---------------------------------------------------------------- channel logos
@@ -1096,12 +1161,22 @@ def _save_image(dirpath, key, data_url, what="logo", cap=None):
     if not _logo_bytes_ok(blob, ext): return {"ok": False, "error": "that file is not really a " + ext.lstrip(".")}
     try:
         os.makedirs(dirpath, exist_ok=True)
+        # A name of its own: two saves of the same picture writing one `.tmp` would replace each
+        # other's half-written file, and the last `os.replace` would store the wrong bytes.
+        fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=key + ext + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f: f.write(blob)
+            os.replace(tmp, os.path.join(dirpath, key + ext))
+        except OSError:
+            try: os.remove(tmp)
+            except OSError: pass
+            raise
+        # The older format goes only after the new file is in place: removed first, a write that
+        # failed (a full disk) left the row with no image at all.
         for old in LOGO_MIME.values():
             if old != ext and os.path.isfile(os.path.join(dirpath, key + old)):
-                os.remove(os.path.join(dirpath, key + old))
-        tmp = os.path.join(dirpath, key + ext + ".tmp")
-        with open(tmp, "wb") as f: f.write(blob)
-        os.replace(tmp, os.path.join(dirpath, key + ext))
+                try: os.remove(os.path.join(dirpath, key + old))
+                except OSError: pass
     except OSError as e:
         return {"ok": False, "error": "could not save the %s: %s" % (what, e)}
     return {"ok": True, "file": key + ext}
@@ -1243,11 +1318,18 @@ PRESETS = [
     {"id": "cat-tuxedo", "label": "Cat (tuxedo)", "species": "cat"},
 ]
 PRESET_IDS = {p["id"] for p in PRESETS}
+# Clips are served for a preset, and for `mochi` — the drawn mascot every room and every bot without
+# a preset or a picture wears. One shared set there, because a clip is a whole character: the corner
+# the user watches is the drawn one far more often than it is a preset.
+CLIP_IDS = PRESET_IDS | {"mochi"}
 FACES_BATCH_PATH = os.path.join(FACES_DIR, "batch.json")
 FACE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
              ".webp": "image/webp", ".gif": "image/gif"}
 # One batch at a time: the router is slow, and two runs at once would assign bots from both.
 FACE_JOB = {"running": False, "done": 0, "total": 0, "error": "", "id": ""}
+# Guards the claim of `running` and nothing else. Two requests a moment apart both passed a bare
+# check before either set the flag, so both batches ran: double the image spend, two writers racing.
+FACE_JOB_LOCK = threading.Lock()
 # The body is gone, so expression and head angle are all that is left to vary per bot. Cycled, not
 # random, so a rerun of the same batch lands on the same faces.
 FACE_EXPRESSIONS = [
@@ -1333,22 +1415,23 @@ def shuffle_room_faces(cid, keep=True):
     chs = load_channels()
     c = channel_by_id(chs, cid)
     if not c: return None
-    bots = load_bots()
-    by_id = {b["id"]: b for b in bots}
-    members = [by_id[m] for m in (c.get("members") or []) if m in by_id]
-    if not members: return {"ok": True, "changed": 0, "kept": 0, "bots": []}
-    deck = [p["id"] for p in PRESETS]
-    random.shuffle(deck)
-    changed, kept, out = 0, 0, []
-    for i, b in enumerate(members):
-        if keep and (b.get("genface") or b.get("avatar")):
-            kept += 1; out.append(b["id"]); continue
-        b["preset"] = deck[i % len(deck)]
-        b["genface"] = ""; b["genface_closed"] = ""
-        if b.get("avatar"):
-            remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
-        changed += 1; out.append(b["id"])
-    save_bots(bots)
+    with _DOC_LOCK:
+        bots = load_bots()
+        by_id = {b["id"]: b for b in bots}
+        members = [by_id[m] for m in (c.get("members") or []) if m in by_id]
+        if not members: return {"ok": True, "changed": 0, "kept": 0, "bots": []}
+        deck = [p["id"] for p in PRESETS]
+        random.shuffle(deck)
+        changed, kept, out = 0, 0, []
+        for i, b in enumerate(members):
+            if keep and (b.get("genface") or b.get("avatar")):
+                kept += 1; out.append(b["id"]); continue
+            b["preset"] = deck[i % len(deck)]
+            b["genface"] = ""; b["genface_closed"] = ""
+            if b.get("avatar"):
+                remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
+            changed += 1; out.append(b["id"])
+        save_bots(bots)
     return {"ok": True, "changed": changed, "kept": kept, "bots": out}
 
 def _faces_prune(keep=()):
@@ -1394,9 +1477,10 @@ def _face_worker(batch_id, source_name, source, targets):
                     except Exception:
                         pass
                     made.append(r["file"])
-                    bots = load_bots()
-                    b = bot_by_id(bots, bid)
-                    if b: set_genface(b, r["file"]); save_bots(bots)
+                    with _DOC_LOCK:
+                        bots = load_bots()
+                        b = bot_by_id(bots, bid)
+                        if b: set_genface(b, r["file"]); save_bots(bots)
                     _save_json(FACES_BATCH_PATH, {"id": batch_id, "at": int(time.time()),
                                                   "source": source_name, "files": made})
             FACE_JOB["done"] = i + 1
@@ -1409,13 +1493,14 @@ def _face_worker(batch_id, source_name, source, targets):
         if made:
             # A bot whose face was pruned away goes back to its own drawn bot instead of pointing at
             # a file that is not there any more.
-            bots = load_bots()
-            for b in bots:
-                if b.get("genface") and b["genface"] not in made:
-                    b["genface"] = ""; b["genface_closed"] = ""
-            save_bots(bots)
+            with _DOC_LOCK:
+                bots = load_bots()
+                for b in bots:
+                    if b.get("genface") and b["genface"] not in made:
+                        b["genface"] = ""; b["genface_closed"] = ""
+                save_bots(bots)
         FACE_JOB["error"] = "" if made else (err or "the image model drew nothing")
-        FACE_JOB["running"] = False
+        with FACE_JOB_LOCK: FACE_JOB["running"] = False     # the same lock the claim took
 
 # ---------------------------------------------------------------- team import
 # BotMRR (botmrr.io) hands you a Markdown playbook: YAML frontmatter with an `agents:`
@@ -1583,44 +1668,58 @@ def llm_team(text):
     except Exception: return []
     return [x for x in items if isinstance(x, dict) and (x.get("name") or "").strip()][:12]
 def build_team(text):
-    """Turn pasted text into bots (and a room). Returns (created_bots, created_rooms)."""
+    """Turn pasted text into bots (and a room). Returns (created_bots, created_rooms).
+
+    Reading the paste — the playbook parse, and the model fallback when it is not one, which can take
+    a minute — happens before `_DOC_LOCK` is taken: every other writer of the same documents would
+    otherwise wait behind it and could hit the socket timeout. The lock covers the reload, the merge
+    and the two saves, so an edit made while the paste was being read still survives."""
     team = parse_team(text)
     agents = team["agents"] or llm_team(text)
     if not agents: return [], []
-    bots = load_bots(); used = {b["id"] for b in bots}; keymap = {}
     made = []
     for i, a in enumerate(agents):
         base = re.sub(r"[^a-z0-9]+", "-", (a.get("key") or a.get("name") or "bot").lower()).strip("-") or "bot"
-        bid, n = base, 2
-        while bid in used: bid = f"{base}-{n}"; n += 1
-        used.add(bid); keymap[(a.get("key") or "").lower()] = bid
         title = (a.get("title") or "Teammate").strip()
         emoji, skills = _role_hint(title)
-        name = (a.get("name") or bid.replace("-", " ").title()).strip()
-        made.append({"id": bid, "name": name, "title": title, "role": title,
+        made.append({"id": base, "name": (a.get("name") or "").strip() or base.replace("-", " ").title(),
+                     "title": title, "role": title,
                      "color": IMPORT_COLORS.get((a.get("color") or "").lower()) or IMPORT_PALETTE[i % len(IMPORT_PALETTE)],
                      "model": DEFAULT_MODEL, "approval": "ask", "memory": True, "voice": "",
-                     "instructions": (a.get("description") or ("You are " + name + ", " + title + ".")).strip(),
+                     "instructions": (a.get("description") or "").strip(),
                      "skills": skills, "tools_allow": None, "hidden": False, "pinned": False, "emoji": emoji})
-    bots.extend(_norm_bots(made)); save_bots(bots)   # the one shared definition, as for a single bot
-    rooms = []
-    for r in team["rooms"]:
-        rid = re.sub(r"[^a-z0-9]+", "-", (r.get("key") or r.get("name") or "room").lower()).strip("-") or "room"
-        members = [keymap[k.lower()] for k in (r.get("members") or []) if k.lower() in keymap] or [b["id"] for b in made]
-        # The room's own defaultResponder is the lead; a playbook that only names a `chiefOfStaff`
-        # (BotMRR writes both) still gets that bot in charge rather than whoever happened to be first.
-        lead = keymap.get((r.get("lead") or "").lower()) or keymap.get((team.get("chief") or "").lower())
-        rooms.append({"id": rid, "name": r.get("name") or rid.replace("-", " ").title(), "members": members,
-                      "mode": "lead", "lead": lead or members[0], "instructions": (r.get("bulletin") or "").strip(), "folder": ""})
-    if rooms:
-        chs = load_channels(); have = {c["id"] for c in chs}
-        for c in rooms:
-            while c["id"] in have: c["id"] += "-2"   # an imported room yields to the one already there
-            have.add(c["id"])
-        # ...and every field default comes from the one shared definition, so an imported room is
-        # whole in the file rather than repaired on every read.
-        chs.extend(_norm_channels(rooms))
-        save_channels(chs)
+    with _DOC_LOCK:
+        # Reloaded here rather than before the lock: the ids and names must be made unique against
+        # what the roster really holds now, not what it held when the paste was being read.
+        bots = load_bots(); used = {b["id"] for b in bots}
+        names = {(b.get("name") or "").strip().lower() for b in bots}
+        keymap = {}
+        for b, a in zip(made, agents):
+            b["id"] = _unique_id(b["id"], used)
+            b["name"] = _unique_name(b["name"], names)
+            # The default brief names the bot, so it is written after the name has settled.
+            if not b["instructions"]:
+                b["instructions"] = ("You are " + b["name"] + ", " + b["title"] + ".").strip()
+            keymap[(a.get("key") or "").lower()] = b["id"]
+        bots.extend(_norm_bots(made)); save_bots(bots)   # the one shared definition, as for a single bot
+        rooms = []
+        for r in team["rooms"]:
+            rid = re.sub(r"[^a-z0-9]+", "-", (r.get("key") or r.get("name") or "room").lower()).strip("-") or "room"
+            members = [keymap[k.lower()] for k in (r.get("members") or []) if k.lower() in keymap] or [b["id"] for b in made]
+            # The room's own defaultResponder is the lead; a playbook that only names a `chiefOfStaff`
+            # (BotMRR writes both) still gets that bot in charge rather than whoever happened to be first.
+            lead = keymap.get((r.get("lead") or "").lower()) or keymap.get((team.get("chief") or "").lower())
+            rooms.append({"id": rid, "name": r.get("name") or rid.replace("-", " ").title(), "members": members,
+                          "mode": "lead", "lead": lead or members[0], "instructions": (r.get("bulletin") or "").strip(), "folder": ""})
+        if rooms:
+            chs = load_channels(); have = {c["id"] for c in chs}
+            for c in rooms:
+                while c["id"] in have: c["id"] += "-2"   # an imported room yields to the one already there
+                have.add(c["id"])
+            # ...and every field default comes from the one shared definition, so an imported room is
+            # whole in the file rather than repaired on every read.
+            chs.extend(_norm_channels(rooms))
+            save_channels(chs)
     for b in made: new_session(b["id"], bot=b["id"], title=b["name"])
     for c in rooms: new_session(c["id"], bot=None, title=c["name"])
     return made, rooms
@@ -1751,17 +1850,76 @@ def _watching():
 def _unwatch(q):
     with _watch_lock: WATCH.discard(q)
 
+_WATCH_END = ("done", "error")
 def _fanout(ev):
     """Push one event to every open watcher. The writer is a running turn, so it never waits: a
-    watcher that has fallen behind is dropped (see _watching) rather than allowed to stall the turn."""
-    with _watch_lock: subs = list(WATCH)
-    for q in subs:
-        try: q.put_nowait(ev)
-        except queue.Full: pass
+    watcher that has fallen behind loses its oldest queued event rather than stalling the turn.
+
+    The end of a turn is the one thing that must never be lost: a client that misses `done` keeps
+    drawing the turn as running — its clock and step row stay live — and no later event will clear
+    it. So a full queue gives up its oldest delta for a `done`/`error`, and a `done`/`error` already
+    queued is not evicted by a later delta (it moves to the back instead). The queue is still the
+    bound, so a watcher that never reads costs 64 events, not a whole turn's tokens."""
+    end = ev.get("type") in _WATCH_END
+    with _watch_lock:
+        for q in list(WATCH):
+            try: q.put_nowait(ev)
+            except queue.Full:
+                # Under the lock, so no other producer can take the slot this one just freed.
+                try: old = q.get_nowait()
+                except queue.Empty: continue
+                if old.get("type") in _WATCH_END and not end: q.put_nowait(old)
+                else: q.put_nowait(ev)
 
 def _notify(sid, kind="chat"):
     """Tell every open watcher that one transcript moved."""
     _fanout({"type": kind, "session": sid})
+
+# What a turn is doing right now, for a client that was not there when it started. The watch stream
+# only carries what happens next, so a phone that opens a room mid-turn — or wakes after its screen
+# was off, or was reading another chat when the desktop began — learned nothing about work already in
+# flight: the room looked idle and Stop was not offered. `_broadcast` notes each event here as it
+# passes and `/api/history` hands the snapshot back with the transcript, so a client joining late
+# draws the same strip the one that started the turn is drawing.
+LIVE = {}
+_live_lock = threading.Lock()
+
+def _live_start(sid, turn):
+    with _live_lock: LIVE[sid] = {"turn": turn, "state": "", "bots": {}}
+
+def _live_end(sid, turn):
+    with _live_lock:
+        L = LIVE.get(sid)
+        if L and L.get("turn") == turn: LIVE.pop(sid, None)   # a newer turn owns the entry now
+
+def _live(sid):
+    """The snapshot, copied: a caller serializes it outside the lock while the turn keeps writing."""
+    with _live_lock:
+        L = LIVE.get(sid)
+        return None if not L else {"turn": L["turn"], "state": L["state"],
+                                   "bots": {k: dict(v) for k, v in L["bots"].items()}}
+
+def _live_note(sid, ev):
+    """One event folded onto its bot's snapshot, the way the client's `liveEvent` folds it onto a row."""
+    t = ev.get("type")
+    bid = ev.get("agent") or (ev.get("id") if t == "agent" else None)
+    with _live_lock:
+        L = LIVE.get(sid)
+        if not L: return
+        if t in ("final", "error"): L["bots"].clear(); return
+        if t == "status" and ev.get("state"): L["state"] = ev["state"]
+        if not bid: return
+        bots = L["bots"]
+        if t == "agent" and ev.get("state") == "done": bots.pop(bid, None); return
+        b = bots.setdefault(bid, {"phase": "working", "tool": "", "args": {}, "text": ""})
+        if t == "agent": b["phase"] = "working"
+        elif t == "status":
+            if ev.get("state"): b["phase"] = ev["state"]
+        elif t == "approval": b["phase"] = "approval"
+        elif t == "tool":
+            b["tool"] = ev.get("name") or ""; b["args"] = ev.get("args") or {}
+        elif t == "agent_text" and ev.get("text"):
+            b["text"] = ((b["text"] + ev["text"]) if ev.get("delta") else ev["text"])[-600:]
 
 def _broadcast(sid, turn, gen):
     """A turn's own events, mirrored to every watcher as they happen.
@@ -1774,15 +1932,22 @@ def _broadcast(sid, turn, gen):
     client renders them through the same handlers.
     """
     ended = False
+    _live_start(sid, turn)
     try:
         for ev in gen:
-            if ev.get("type") == "done": ended = True
+            if ev.get("type") == "done":
+                ended = True
+                # Before the client can ask: it reloads the moment `done` lands, and a snapshot that
+                # outlived the turn by a few microseconds would resurrect it as a phantom Stop.
+                _live_end(sid, turn)
+            _live_note(sid, ev)
             _fanout(dict(ev, session=sid, turn=turn))
             yield ev
     except Exception as e:
         _fanout({"type": "error", "msg": str(e), "session": sid, "turn": turn}); ended = True
         raise
     finally:
+        _live_end(sid, turn)
         if not ended: _fanout({"type": "done", "session": sid, "turn": turn})   # never leave a watcher mid-turn
 
 def new_session(sid, bot=None, title=None):
@@ -1798,17 +1963,19 @@ def new_session(sid, bot=None, title=None):
             d[sid] = {"bot": bot, "title": title or "Chat", "messages": [], "model": None,
                       "pending": None, "approval": None}
             _write_sessions(d)
-    return d[sid]
+        # Read back inside the lock too: a delete that lands between the unlock and this lookup pops
+        # the key and used to turn the call into a KeyError.
+        return d[sid]
 def load(sid):
-    d = _all_sessions()
-    if sid not in d:
+    # One lookup, not "in" then `[]`: a concurrent drop_session removes the key in between.
+    s = _all_sessions().get(sid)
+    if s is None:
         # A deleted session must not be re-created by a late turn read. The returned object is
         # deliberately ephemeral; save() rejects it while the tombstone is active.
         if sid in _DELETED_SESSIONS:
             return {"bot": None, "title": None, "messages": [], "model": None,
                     "pending": None, "approval": None}
         return new_session(sid, bot=sid)
-    s = d[sid]
     s.setdefault("messages", []); s.setdefault("pending", None); s.setdefault("model", None)
     s.setdefault("bot", None); s.setdefault("title", "Chat")
     # A session used to store DEFAULT_MODEL whether or not anyone had chosen it, which pinned every
@@ -1898,9 +2065,14 @@ def drop_session(sid, scoped=None):
         # A watcher looking at a chat that has just been deleted is told it is gone, so the other
         # device can leave it rather than sit on a transcript the server would happily re-create.
         for k in dead: _notify(k, "gone")
+        # ...and the files those chats had. One folder per chat, so a room's copy and a member's copy
+        # are separate folders and nothing a surviving chat draws from is touched. A turn still in
+        # flight may write one more file into a folder this just removed; it belongs to a chat that
+        # no longer exists, so it is left rather than chased.
+        for k in dead: shutil.rmtree(_upload_folder(k), ignore_errors=True)
 
 def clear_chat(sid):
-    """Start a new session for one chat: the transcript goes, nothing else does.
+    """Start a new session for one chat: the transcript and its attachments go, nothing else does.
 
     Memory is not part of a session — it lives in `data/memory/<bot>.md` and is read fresh on every
     turn — and neither is a bot's work log, so both survive. That is the whole point: a cleared chat
@@ -1914,6 +2086,10 @@ def clear_chat(sid):
         if sid not in _all_sessions(): return True   # nothing to clear, and no phantom session invented
         st = load(sid); st["messages"] = []; st["pending"] = None; st.pop("ctx", None); save(sid, st)
         ctx_pop(sid)                                 # a new session starts its context panel over too
+        # The files the old transcript pointed at go with it: no message is left to draw them, and
+        # the folder would otherwise grow for the life of the install. The lock above is the turn's
+        # own, so nothing is writing there.
+        shutil.rmtree(_upload_folder(sid), ignore_errors=True)
     finally:
         lock.release()
     return True
@@ -2120,12 +2296,24 @@ def _in_sandbox(path):
     root = os.path.realpath(work_dir())    # both ends resolved, so a symlinked data dir still matches
     raw = (path or "").strip()
     p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(root, raw))
-    if p == root or p.startswith(root + os.sep): return p
-    # This turn's attachments live outside the repo (a room's repo is the user's own), so they are
-    # the one other place a bot may read — otherwise it is handed a file path it cannot open.
-    up = getattr(_WORK, "uploads", None)
-    up = os.path.realpath(up) if up else ""
-    return p if up and (p == up or p.startswith(up + os.sep)) else None
+    inside = p == root or p.startswith(root + os.sep)
+    if not inside:
+        # This turn's attachments live outside the repo (a room's repo is the user's own), so they are
+        # the one other place a bot may read — otherwise it is handed a file path it cannot open.
+        up = getattr(_WORK, "uploads", None)
+        up = os.path.realpath(up) if up else ""
+        inside = bool(up and (p == up or p.startswith(up + os.sep)))
+    # The store `run_shell` and `_file_path` refuse is refused here too: a bot whose folder is a
+    # parent of the app dir would otherwise read the pairing token and rewrite settings through its
+    # file tools, which take no approval card. A folder *above* the store is refused the whole store;
+    # a folder that is the store itself — the desktop app's own folder — is refused only its own
+    # files, or the rule would refuse every write the app makes.
+    data = os.path.realpath(DATA)
+    store = {os.path.join(data, n) for n in ("access_token", "relay_secret", "config.json", "settings.json")}
+    in_store = p == data or p.startswith(data + os.sep)
+    if inside and (p in store or (in_store and data.startswith(root + os.sep))):
+        return None
+    return p if inside else None
 def _data_bytes(s):
     """Decode a `data:<type>;base64,<payload>` URL, or None if it is not one."""
     if not isinstance(s, str) or not s.startswith("data:") or "," not in s: return None
@@ -2174,10 +2362,18 @@ def _save_uploads(sid, items):
         fn = "%d-%s" % (int(time.time() * 1000), re.sub(r"[^A-Za-z0-9._-]", "_", name) or "file")
         try:
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, fn), "wb") as f: f.write(raw)
+            # `xb`, not `wb`: two files with one name in one message get the same millisecond stamp,
+            # and the second used to overwrite the first while both records pointed at it.
+            for n in range(100):
+                p = os.path.join(d, fn if not n else "%d-%s" % (n, fn))
+                try:
+                    with open(p, "xb") as f: f.write(raw)
+                    break
+                except FileExistsError: continue
+            else: continue
         except OSError: continue
         out.append({"name": name, "size": len(raw), "type": str(it.get("type") or "")[:120],
-                    "path": os.path.join(d, fn), "url": "/api/upload/" + os.path.basename(d) + "/" + fn})
+                    "path": p, "url": "/api/upload/" + os.path.basename(d) + "/" + os.path.basename(p)})
     return out
 def _attachments_note(atts, shown=()):
     """The task as the bot reads it, plus what came with it. A picture that rode in the message needs
@@ -2190,8 +2386,11 @@ def _attachments_note(atts, shown=()):
             lines.append("- %s (%s) — a picture attached to this message; you can already see it. Do "
                          "not call read_file on it." % (a["name"], _kb(a["size"])))
         elif (a.get("type") or "").startswith("image/") or os.path.splitext(p)[1].lower() in IMG_EXT:
-            lines.append("- %s (%s) — a picture too large to attach; ask the user for a smaller one."
-                         % (a["name"], _kb(a["size"])))
+            # Not shown has two causes — over the inline limit, or a fifth picture in one message — and
+            # only one of them is about size, so the note says neither. The path stays: a tool that
+            # takes a file still has one to take.
+            lines.append("- %s (%s) — %s (a picture the model was not shown; ask the user to send it on "
+                         "its own if you need to see it)" % (a["name"], _kb(a["size"]), p))
         else:
             lines.append("- %s (%s) — %s (read_file for text, run_shell for an archive, a PDF or media)"
                          % (a["name"], _kb(a["size"]), p))
@@ -2200,6 +2399,29 @@ def _kb(n):
     if n < 1024: return "%d B" % n
     if n < 1024 * 1024: return "%.1f KB" % (n / 1024.0)
     return "%.1f MB" % (n / 1048576.0)
+def _send_file(path, name=None):
+    """A file a bot sends to the chat, copied into this chat's upload folder and returned as the
+    attachment record the transcript draws — the one shape a picture, a video, a document and an
+    archive all take. The page draws a picture or plays a video from it; anything else downloads.
+
+    A copy, not a move: the bot's tools keep working on the original, and the upload folder is the
+    only place `/api/upload/` serves from, so what a bot sent is still there when the chat is
+    reopened. `_in_sandbox` checks the path, so a bot can send what is in its working folder or what
+    the user attached — never an arbitrary file on the machine."""
+    p = _in_sandbox(path)
+    if not p or not os.path.isfile(p): return None, "no such file in your working folder: %s" % (path or "")
+    n = os.path.getsize(p)
+    if n > MAX_UPLOAD:
+        return None, "%s is %s — a message can carry up to %d MB" % (os.path.basename(p), _kb(n), MAX_UPLOAD // 1_000_000)
+    d = getattr(_WORK, "uploads", None) or _upload_folder("chat")
+    nm = os.path.basename((name or p).replace("\\", "/"))[:120] or "file"
+    fn = "%d-%s" % (time.time_ns(), re.sub(r"[^A-Za-z0-9._-]", "_", nm) or "file")
+    try:
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(p, os.path.join(d, fn))
+    except OSError as e: return None, "could not send %s: %s" % (nm, e)
+    return {"name": nm, "size": n, "type": mimetypes.guess_type(nm)[0] or "",
+            "path": os.path.join(d, fn), "url": "/api/upload/" + os.path.basename(d) + "/" + fn}, ""
 SHELL_OUT_CAP = 6000        # characters of output a bot is shown
 SHELL_READ_CAP = 1 << 20    # bytes actually buffered before the rest is dropped
 def run_shell(cmd, timeout=45):
@@ -2223,9 +2445,21 @@ def run_shell(cmd, timeout=45):
         return f"(error: {e})", 1
     try: pgid = os.getpgid(p.pid)
     except Exception: pgid = None
+    sid = getattr(_WORK, "sid", None)      # the turn this command is running for, if it is a turn's
     buf = bytearray(); fd = p.stdout.fileno(); deadline = time.time() + timeout; rc = None
     while True:
         left = deadline - time.time()
+        if sid and sid in STOP:
+            # Stop means stop, including a command already running: waiting for a 600s install to
+            # finish before the turn could land is the "Stop does nothing" the button used to be.
+            rc = 130
+            try: os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                try: p.kill()
+                except Exception: pass
+            try: p.wait(timeout=5)
+            except Exception: pass
+            break
         if left <= 0:                                          # over the clock: kill the whole tree
             rc = 124
             try: os.killpg(pgid, signal.SIGKILL)
@@ -2249,6 +2483,7 @@ def run_shell(cmd, timeout=45):
     try: p.stdout.close()
     except Exception: pass
     text = bytes(buf).decode("utf-8", "replace")
+    if rc == 130: return "(stopped by the user)", 130
     if rc == 124: return f"(timed out after {timeout}s)", 124
     return (text[:SHELL_OUT_CAP] or "(no output)"), rc
 # Classification is deliberately stricter than the shell grammar. The command still runs through
@@ -2454,6 +2689,10 @@ def _host(u):
     h = (urlparse(u or "").netloc or "").split(":")[0].lower()
     return h[4:] if h.startswith("www.") else h
 
+# How long a bot's browser step waits for a person to hand the page back. Long enough for someone
+# to finish a login or a captcha by hand, short enough that a panel left open overnight does not park
+# a turn for ever — see `Browser._park`.
+HUMAN_WAIT = 600
 class Browser:
     """One browser owned by a dedicated thread. We launch it ourselves, with a saved profile folder
     per account, so the bots reuse logins you made once by hand."""
@@ -2462,6 +2701,7 @@ class Browser:
         self.thread = None; self.ok = False; self.err = ""; self.url = ""; self.title = ""
         self.mode = "profiles"; self.last_try = 0.0
         self.owner = ""                             # the bot whose page is the one on screen (see _computer_scope)
+        self.human = ""                             # set while a person is driving the page from the panel
         self.page = None                            # set by _attach; stays None in profiles mode until a site needs one
         # Everything Playwright hands us belongs to the thread that made it: the sync API refuses to
         # be touched from any other one, and refuses a second driver in the same one. A restart runs
@@ -2469,6 +2709,7 @@ class Browser:
         # the throwaway browser and the saved profiles are all kept per thread and closed by the
         # thread that made them.
         self._thr = {}                              # thread -> {"pp": driver, "hb": browser, "hpage": page, "ctxs": {}}
+        self._call_lock = threading.RLock()         # one page for every chat: see `call`
     def _mine(self):
         """This thread's own Playwright holdings, made on first use."""
         return self._thr.setdefault(threading.current_thread(), {"pp": None, "hb": None, "hctx": None, "hpage": None, "ctxs": {}})
@@ -2488,18 +2729,17 @@ class Browser:
         # can touch them.
         self.start()
         return {"ok": self.ok, "mode": self.mode, "err": self.err}
-    def _routes(self): return _route_pairs()
     def _route(self, url, routes=None, account=None):
         """The profile a site belongs to, or None for a site nobody routed. The exact host wins, then
         each parent domain in turn, so one `x.com=<profile>` line also covers `mobile.x.com`.
-        `routes` is the room's own table when the caller has one; the machine-wide list is the
-        fallback, and the call comes from the turn's thread with the room already resolved.
+        `routes` is the table of the room or bot the call belongs to; a caller that names none gets
+        no accounts at all rather than somebody else's list.
         `account` picks one of the several accounts that can cover a site — without it the first one
         set up answers. An account that does not cover the site answers None: it must not be handed
         another account's session just because it was named."""
         h = _host_key(url)
         if not h: return None
-        r = routes if routes is not None else self._routes(); parts = h.split(".")
+        r = routes or {}; parts = h.split(".")
         for i in range(len(parts) - 1):
             cand = ".".join(parts[i:])
             names = r.get(cand)
@@ -2557,8 +2797,11 @@ class Browser:
         until something asks for it again, so liveness is asked of the browser itself: `pages` is a
         local list that goes empty rather than raising, but `is_connected()` tells the truth."""
         out = set()
-        for m in self._thr.values():
-            for n, ent in m["ctxs"].items():
+        # Both levels are copied first: a restart adds a slot on the new browser thread and pops one on
+        # the old, and this reads from a request thread — walking the live dicts raised "dictionary
+        # changed size during iteration". `list()` is one C call, so nothing can run mid-copy.
+        for m in list(self._thr.values()):
+            for n, ent in list(m["ctxs"].items()):
                 try:
                     if ent[0].browser is None or ent[0].browser.is_connected(): out.add(n)
                 except Exception: pass
@@ -2626,11 +2869,18 @@ class Browser:
                 # the next thread's browsers live in its own slot and are never touched from here.
                 self._close_persistent()
                 break
-            fn, args, res, ev, owner = job
+            fn, args, res, ev, owner, human = job
             # Ownership is recorded here, on the browser's own thread, rather than by the caller: it
             # is the same thread that sets `self.page`, so the two can never disagree about whose
             # screen this is. It is what the Computer panel is scoped by — see `_computer_scope`.
             if owner: self.owner = owner
+            # A person who took the browser in the panel is the only one driving it. A bot's call
+            # while that is true is answered, not queued: the turn reads why and can say so, where a
+            # silent wait would look like a hung browser. Only the panel's own calls carry `_human`.
+            why = self._gated(human)
+            if why:
+                res["out"] = why
+                ev.set(); continue
             # No browser yet: the port had nothing on it, or no profile was open. Try again now —
             # whatever was missing may have appeared since — but not on every poll, so a browser
             # that is simply not running is not re-connected to every couple of seconds.
@@ -2642,20 +2892,71 @@ class Browser:
             # In profiles mode nothing is launched until a site needs it, so these three can be the
             # first call of a turn with no page behind them yet. Say so in words rather than raising
             # an AttributeError the bot reads as a browser failure.
-            if fn not in ("open", "profile_open", "preview", "profile_cookies") and not getattr(self, "page", None):
+            if fn not in ("open", "profile_open", "preview", "profile_cookies", "take", "give",
+                          "human_input") and not getattr(self, "page", None):
                 res["out"] = "(no page is open yet — call browser_open first)"; ev.set(); continue
             try: res["out"] = getattr(self, fn)(**args)
             except Exception as e: res["out"] = f"(browser error: {e})"
             ev.set()
+    def _gated(self, human):
+        """Why a call may not run right now, or "" if it may.
+
+        The browser thread's backstop, for a job that was queued just before the person took over.
+        The ordinary path never reaches it: `call` parks the bot until they hand the browser back,
+        so the bot resumes its step rather than being told its step was dropped."""
+        if self.human and not human:
+            return ("(the person has taken the browser in the Computer panel — do not retry; "
+                    "say what you were doing and wait for them to hand it back)")
+        return ""
+    def _park(self):
+        """Wait here while a person is driving the page. True if the bot may go on, False if the turn
+        was stopped while it waited.
+
+        Deliberately *outside* `_call_lock`: the panel's own gestures go through `call` too, so a bot
+        holding the lock while it waited would lock the person out of the page they just took — the
+        one deadlock this feature could have. `HUMAN_WAIT` is the ceiling for a panel left open and
+        forgotten; the bot is then told, in words, what happened to its step."""
+        sid = getattr(_WORK, "sid", None)
+        waited = 0.0
+        while self.human:
+            if sid and sid in STOP: return False
+            if waited >= HUMAN_WAIT: return False
+            time.sleep(0.25); waited += 0.25
+        return True
     def call(self, fn, timeout=90, **args):
+        # Every chat drives the same `self.page`, and `open` swaps it. Two turns running at once would
+        # take each other's site away mid-step, so calls are serialized here. A turn is several calls,
+        # so this keeps a page per call — not per chat; a real page per chat is the upgrade.
+        if not args.get("_human"):
+            # A bot's step waits for the person to finish, then runs. That is what handing the
+            # browser back means: the turn carries on from where it was paused, with no message
+            # needed from the user. The panel's own calls skip this — they are the person.
+            if not self._park():
+                sid = getattr(_WORK, "sid", None)
+                if sid and sid in STOP: return "(stopped by the user)"
+                return ("(the person kept the browser for %d minutes — say what you were doing and "
+                        "ask whether to continue)" % (HUMAN_WAIT // 60))
+        with self._call_lock:
+            return self._call(fn, timeout, **args)
+    def _call(self, fn, timeout=90, **args):
         self.start()
         if not (self.thread and self.thread.is_alive()):
             return "(browser unavailable: " + (self.err or "playwright not installed") + ")"
         # `_owner` is the bot this call is on behalf of, and it rides with the job instead of being
-        # written from here so the browser thread is the only writer of `self.owner`.
+        # written from here so the browser thread is the only writer of `self.owner`. `_human` marks
+        # the panel's own calls, the only ones allowed through while a person is driving.
         owner = args.pop("_owner", "")
-        res = {}; ev = threading.Event(); self.q.put((fn, args, res, ev, owner))
-        if not ev.wait(timeout): return "(browser timeout)"
+        human = bool(args.pop("_human", False))
+        res = {}; ev = threading.Event(); self.q.put((fn, args, res, ev, owner, human))
+        # A Stop gives the turn back its thread at once instead of holding it for the call's own
+        # timeout: a page that never loads is exactly when Stop is pressed. The job itself finishes on
+        # the browser thread (Playwright cannot be interrupted from another one) and its answer is
+        # simply not waited for.
+        sid = getattr(_WORK, "sid", None)
+        deadline = time.time() + timeout
+        while not ev.wait(0.25):
+            if sid and sid in STOP: return "(stopped by the user)"
+            if time.time() >= deadline: return "(browser timeout)"
         return res.get("out", "(no output)")
     def _snap(self):
         try: txt = self.page.inner_text("body")
@@ -2776,6 +3077,14 @@ class Browser:
         self._settle(tries=8)
         return self._snap()
     def type(self, selector, text):
+        # A password box is the one field a bot must never fill: the login is the person's, and an
+        # account that is set up arrives already signed in. Refused in code, because the prompt's
+        # "never type a password" is a suggestion and this is not.
+        try: secret = self.page.locator(selector).evaluate("e => e.type === 'password'")
+        except Exception: secret = False
+        if secret:
+            return ("(refused — %s is a password field. The person has to fill it in, or sign in once "
+                    "in the Computer panel; a saved account opens already logged in.)" % selector)
         self.page.fill(selector, text); self.page.wait_for_timeout(200); return f"typed into {selector}"
     def press(self, key):
         self.page.keyboard.press(key); self._settle(tries=8); return self._snap()
@@ -2783,15 +3092,40 @@ class Browser:
         self.page.go_back(wait_until="domcontentloaded", timeout=30000); return self._snap()
     def shot(self): return self._png(self.page.screenshot())
     def _png(self, raw): return "data:image/png;base64," + base64.b64encode(raw).decode()
+    def take(self): self.human = "1"; return ""
+    def give(self): self.human = ""; return ""
+    def human_input(self, kind, fx=0.0, fy=0.0, text="", key="", dy=0):
+        """One input from the person, forwarded to the page the bot is on.
+
+        Positions arrive as a fraction of the viewport, not as pixels: the panel shows a screenshot
+        scaled into a fixed frame, and the image is device pixels while the page is CSS pixels — a
+        fraction is the same number in both, whatever the display's scale factor."""
+        if not self.human: return "(take the browser first)"
+        if not getattr(self, "page", None): return "(no page is open yet)"
+        p = self.page
+        vp = p.viewport_size or {"width": 1280, "height": 820}
+        x = max(0, min(vp["width"] - 1, round(float(fx) * vp["width"])))
+        y = max(0, min(vp["height"] - 1, round(float(fy) * vp["height"])))
+        if kind == "click": p.mouse.click(x, y)
+        elif kind == "wheel": p.mouse.wheel(0, float(dy))
+        elif kind == "type": p.keyboard.type(str(text))
+        elif kind == "key": p.keyboard.press(str(key))
+        elif kind == "back": p.go_back(wait_until="domcontentloaded", timeout=30000)
+        elif kind == "reload": p.reload(wait_until="domcontentloaded", timeout=30000)
+        else: return "(unknown input %s)" % kind
+        return ""
     def preview(self, force=False):
         """What the Computer panel shows, as JSON: the page the bot is on, as a live screenshot.
         This never touches `self.page`, so watching a turn cannot move the bot off its target.
         `force` is the panel's Refresh — it re-shoots even when the panel poll would have."""
         if not getattr(self, "page", None):
+            # `human` is reported even with no page: the panel follows the server's answer, and a
+            # page that closed while a person was driving must not leave the panel saying they are.
             return json.dumps({"png": "", "url": "", "title": "", "err":
-                               "no page is open yet — ask a bot to browse, or open a profile window below"})
+                               "no page is open yet — ask a bot to browse, or open a profile window below",
+                               "human": bool(self.human)})
         return json.dumps({"png": self._png(self.page.screenshot()), "url": self.page.url,
-                           "title": self.page.title(), "err": ""})
+                           "title": self.page.title(), "err": "", "human": bool(self.human)})
     def save(self, selector="img", wait_ms=60000):
         """Wait for `selector`, then download what it points at (img / video / canvas) as a data URL.
         This is the 'wait for the attachment, then download it' step of the free web route."""
@@ -2840,13 +3174,15 @@ def _route_pairs(b=None):
             if h and name not in out.setdefault(h, []): out[h].append(name)
     return out
 
-def _room_routes(ch):
-    """The routing table a room's own accounts make, or None when the room defines none — in which
-    case the machine-wide list still answers, so a room that never set one behaves as it always has.
-    A room with accounts routes only through them: the whole point is that a bot in that room uses
-    the account the room names, without being told which one to use."""
-    acc = (ch or {}).get("browser") or []
-    return _route_pairs({"accounts": acc}) if acc else None
+def _own_routes(rec):
+    """The routing table a room's — or a bot's own chat's — accounts make. Empty is empty: a record
+    with no accounts browses anonymously rather than borrowing another record's list, so a room or
+    bot made today starts with nothing inherited."""
+    return _route_pairs({"accounts": (rec or {}).get("browser") or []})
+
+def _turn_routes(channel, bot):
+    """Whose accounts a turn uses: the room's when it runs in one, else the bot's own."""
+    return _own_routes(channel if channel else bot)
 
 def profile_id(name):
     """The folder basename a profile name reduces to — a profile's *identity*, since the folder is
@@ -2973,15 +3309,6 @@ def first_site(sites):
         if u.netloc: return "%s://%s%s" % (u.scheme, u.netloc, u.path)
     return ""
 
-def account_site(name):
-    """The address an account's sign-in lands on, for a caller that has only the name — the first
-    site routed to it. Two rows can share a name, so this can only ever be the first of them; the row
-    a button was clicked in is the one that knows, and it uses `first_site`. Empty when nothing is
-    routed to the name, and then there is nowhere to land."""
-    for h, names in _route_pairs().items():
-        if name in names: return "https://" + h
-    return ""
-
 # The cookie names a site only hands out once you are actually signed in. A site gives a brand-new
 # visitor tracking and consent cookies, so "this profile has cookies" would call a window that was
 # merely opened "signed in" — which is the exact lie this replaced. The *name* is the evidence.
@@ -3035,7 +3362,9 @@ def _live_cookie_rows(name):
     it. Asked of the browser thread, because Playwright belongs to it. None (not []) when the answer
     could not be had — a browser busy with a bot must not read as "this account is not signed in"."""
     try:
-        out = BROWSER.call("profile_cookies", timeout=6, name=name)
+        # `_human`: this is the settings page asking on the person's behalf. A bot's step waits for
+        # them to finish, but a row they are looking at must not hang until they hand the browser back.
+        out = BROWSER.call("profile_cookies", timeout=6, name=name, _human=True)
     except Exception:
         return None
     return out if isinstance(out, list) else None
@@ -3111,24 +3440,24 @@ def browser_own_profiles(accounts=None):
             "channel": (b.get("channel") or "auto"), "channel_in_use": browser_channel(),
             "channels": installed_channels(), "profiles": out}
 
-def browser_brief(ch=None):
+def browser_brief(rec=None):
     """What a bot cannot find out for itself: which sites open already signed in. The accounts are the
-    user's setup and live only in Settings, so without this a bot asked to manage Threads and Facebook
-    has no way to know an account covers them — it tries to log in by hand, or reads a login wall as
-    "impossible" and stops. Every site not named here opens in a blank throwaway browser, which is the
-    honest answer for a search or a public page.
+    user's setup and live in the chat's Computer panel, so without this a bot asked to manage Threads
+    and Facebook has no way to know an account covers them — it tries to log in by hand, or reads a
+    login wall as "impossible" and stops. Every site not named here opens in a blank throwaway
+    browser, which is the honest answer for a search or a public page.
 
-    `ch` is the room the turn runs in. A room with its own accounts is described by those and nothing
-    else, because those are the only ones its bots can route through — naming the machine-wide list
-    there would tell a bot about an account it cannot use."""
+    `rec` is the room the turn runs in, or the bot itself when the chat is with one bot. Its accounts
+    are the only ones the turn can route through, so they are the only ones described — a record with
+    no accounts is briefed as having none, never as borrowing another chat's list."""
     b = load_settings().get("browser") or {}
     mode = (b.get("mode") or "own").lower()
-    room = (ch or {}).get("browser") or []
-    rows = browser_own_profiles(room if room else None)["profiles"] if mode == "profiles" else []
+    room = (rec or {}).get("browser") or []
+    rows = browser_own_profiles(room)["profiles"] if mode == "profiles" else []
     named = [(p["name"], p["hosts"], p["signed_in"]) for p in rows if p["hosts"]]
     if not named:
-        return ("\n\nBrowsing: " + ("this room's accounts name no sites yet" if room
-                                    else "no account is set up") +
+        return ("\n\nBrowsing: " + ("the accounts set up for this chat name no sites yet" if room
+                                    else "no account is set up for this chat") +
                 ", so every site opens in a blank throwaway browser "
                 "with no cookies. That is the right way to search the web or read a public page; a "
                 "page that needs a login will show its login wall, and no account covers it."
@@ -3154,8 +3483,7 @@ def browser_brief(ch=None):
     pick = (" Where a site is listed for more than one account, pass the account name as `account` "
             "to `browser_open` to drive that one; without it the first listed is used."
             if any(c > 1 for c in claims.values()) else "")
-    return ("\n\nBrowsing: " + ("this room is set up with accounts — " if room
-                                else "the user has set up accounts — ") + "; ".join(shown) +
+    return ("\n\nBrowsing: this chat is set up with accounts — " + "; ".join(shown) +
             ". `browser_open` one of those sites and it opens in that account's own browser, already "
             "logged in: never try to log in or type a password yourself. Any other site opens in a "
             "blank throwaway browser with no cookies — that is the right way to search the web or read "
@@ -3165,14 +3493,16 @@ def open_own_profile(name, sites=None):
     """Open one profile's window so you can sign in to it. The bot drives that same window
     afterwards, so a sign-in done here is a sign-in done for the bot: nothing is logged in twice, and
     the cookies are on disk for the next run. `sites` is the row that was clicked, so the window lands
-    on the site that row names rather than on the first site routed to the account."""
+    on the site that row names, and a row that names none opens a blank window rather than borrowing
+    another chat's site."""
     name = (name or "").strip() or "default"
     if not getattr(BROWSER, "ok", False) or BROWSER.mode != "profiles":
         return {"ok": False, "err": "switch the browser to “Own browser — saved profiles” first"}
     try: os.makedirs(own_profile_dir(name), exist_ok=True)
     except OSError as e: return {"ok": False, "err": "could not make the profile folder: %s" % e}
-    url = first_site(sites) or account_site(name)
-    out = BROWSER.call("profile_open", name=name, url=url, timeout=180)
+    url = first_site(sites)
+    # `_human`: a press in the panel, so it must not wait behind the panel's own take-over.
+    out = BROWSER.call("profile_open", name=name, url=url, timeout=180, _human=True)
     return {"ok": not str(out).startswith("("), "out": str(out)[:300]}
 
 # ---------------------------------------------------------------- model client
@@ -3372,6 +3702,7 @@ def chat(model, messages, tools=None, max_tokens=None, tool_choice="auto", timeo
     t0 = time.time()
     for attempt in range(1, tries + 1):
         stalled = False                # whatever failed *last* is what this call reports
+        final = False                  # a failure no retry can change
         if attempt > 1:
             # Give up on retrying before starting another attempt rather than after it: what this
             # bounds is how long the step may keep *trying*, and an attempt already begun is allowed to
@@ -3402,8 +3733,17 @@ def chat(model, messages, tools=None, max_tokens=None, tool_choice="auto", timeo
             # with the configured default so one bad model cannot kill the whole turn.
             if e.code == 404 and model != DEFAULT_MODEL and DEFAULT_MODEL not in tried:
                 tried.append(model); model = DEFAULT_MODEL; body["model"] = DEFAULT_MODEL; continue
+            # A refusal of the request itself — a bad key, a body the router will not take — reads the
+            # same every time it is sent, and the full policy turned a clear "401" into three minutes
+            # of spinner before the user was told. 408 and 429 are about this moment, not the request,
+            # so they keep their retries.
+            final = 400 <= e.code < 500 and e.code not in (408, 429)
         except Exception as e:
             last = str(e)[:200]
+            # Nothing is listening at that address, or the name does not resolve: no number of
+            # retries starts a server, and the single retry that is worth it covers a router that is
+            # still coming up.
+            final = isinstance(e, urllib.error.URLError) and attempt >= 2
             # A timeout is not a special case any more. An attempt that timed out sent nothing, so a
             # retry cannot duplicate an answer nobody has seen, and a router that went quiet once often
             # answers the next try — retrying it is exactly the case this policy is for. It is still
@@ -3411,6 +3751,7 @@ def chat(model, messages, tools=None, max_tokens=None, tool_choice="auto", timeo
             # gets, instead of as a bare error string.
             stalled = isinstance(e, (socket.timeout, TimeoutError)) or isinstance(
                 getattr(e, "reason", None), (socket.timeout, TimeoutError))
+        if final: break
     # `attempts` is how many tries were actually *made*, which is not always the policy's number: the
     # failure budget can stop a step short of it, and a report that claims tries it never made is
     # exactly the kind of number the user cannot act on (see `_model_failure_note`).
@@ -3815,7 +4156,8 @@ def media_models():
     """Which models the router advertises as able to emit images / videos."""
     try:
         req = urllib.request.Request(ROUTER + "/models", headers={"Authorization": "Bearer " + KEY, "User-Agent": OUT_UA})
-        items = json.load(urllib.request.urlopen(req, timeout=30)).get("data") or []
+        with urllib.request.urlopen(req, timeout=30) as r:
+            items = json.loads(_read_deadline(r, 30)).get("data") or []
     except Exception:
         return {"image": [], "video": []}
     img = [m["id"] for m in items
@@ -3865,6 +4207,9 @@ TOOL_SCHEMAS = {
  "generate_image": _fn("generate_image","Draw an image from a text prompt and save it in the sandbox. The picture is shown in the chat.",
                    {"prompt":{"type":"string","description":"what to draw, in English"},
                     "filename":{"type":"string","description":"optional, e.g. hero.png"}}, ["prompt"]),
+ "send_file":  _fn("send_file","Send a file to the chat: a picture, a video, an audio clip, a PDF, a document, an archive — anything you made or found. It is drawn in the conversation (a picture shows, a video and an audio clip play, the rest downloads) and it stays there when the chat is reopened. Use it whenever the user asked for a file, a picture or a video.",
+                   {"path":{"type":"string","description":"the file to send, inside your working folder, e.g. report.pdf"},
+                    "name":{"type":"string","description":"optional, the name the reader sees"}}, ["path"]),
  "browser_open": _fn("browser_open","Open a URL and return the page's url, title and visible text. Which sites open already signed in, and which open anonymously, is set out under “Browsing” in your instructions — this tool does what that says. When a site is listed for more than one account, pass `account` to choose which one drives the page; without it the first listed is used. Use it for public pages instead of curl.",
                    {"url":{"type":"string"},
                     "account":{"type":"string","description":"optional, the account name to use when the site is covered by more than one (see Browsing)"}}, ["url"]),
@@ -3918,9 +4263,9 @@ TOOL_SCHEMAS = {
  "finish":     _fn("finish","Finish your turn with a short, concrete report of what you did.",
                    {"summary":{"type":"string"}}, ["summary"]),
 }
-ALL_TOOLS = ["run_shell","read_file","write_file","list_files","generate_image","browser_open","browser_read","browser_click",
+ALL_TOOLS = ["run_shell","read_file","write_file","list_files","generate_image","send_file","browser_open","browser_read","browser_click",
              "browser_type","browser_press","browser_back","browser_eval","browser_see","browser_save","memory_update","use_skill","delegate","lucent_api","finish"]
-DEFAULT_TOOLS = {b["id"]: (ALL_TOOLS if b["id"] != "producer" else ["delegate","lucent_api","memory_update","use_skill","finish"]) for b in DEFAULT_BOTS}
+DEFAULT_TOOLS = {b["id"]: (ALL_TOOLS if b["id"] != "producer" else ["delegate","send_file","lucent_api","memory_update","use_skill","finish"]) for b in DEFAULT_BOTS}
 
 # Plan-only mode: the bot investigates with read-only tools and reports a plan, then stops. Nothing
 # that changes the world is offered, so "plan" cannot quietly turn into "do" — the user approves the
@@ -4583,14 +4928,20 @@ class MCPClient:
     def why(self): return self.t.why()
 
     def start(self):
-        r = self.t.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {},
-                                          "clientInfo": {"name": "anzen-bot", "version": "1.0"}})
-        if r.get("error"): raise MCPError(_mcp_err(r["error"]))
-        info = (r.get("result") or {}).get("serverInfo") or {}
-        self.info = " ".join(x for x in (info.get("name"), info.get("version")) if x)
-        self.t.notify("notifications/initialized", {})
-        self.list_tools()
-        return self
+        try:
+            r = self.t.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {},
+                                              "clientInfo": {"name": "anzen-bot", "version": "1.0"}})
+            if r.get("error"): raise MCPError(_mcp_err(r["error"]))
+            info = (r.get("result") or {}).get("serverInfo") or {}
+            self.info = " ".join(x for x in (info.get("name"), info.get("version")) if x)
+            self.t.notify("notifications/initialized", {})
+            self.list_tools()
+            return self
+        except BaseException:
+            # A handshake that fails still leaves the spawned child and its pump threads behind, and
+            # this client is the only owner of them — nothing else will ever close them.
+            self.close()
+            raise
 
     def list_tools(self):
         r = self.t.request("tools/list", {})
@@ -4837,6 +5188,10 @@ def exec_tool(bid, name, args):
         with open(p, "wb") as f: f.write(raw)
         return ("drew %s (%d bytes) with %s" % (fn, os.path.getsize(p), used),
                 [{"type": "image", "png": data_url, "note": prompt[:200]}])
+    if name == "send_file":
+        att, why = _send_file(args.get("path", ""), args.get("name"))
+        if not att: return "(%s)" % why, []
+        return ("sent %s to the chat (%s)" % (att["name"], _kb(att["size"])), [{"type": "file", "att": att}])
     if name.startswith("browser_"):
         # Every browser call a bot makes is made on that bot's behalf, so the screen it leaves behind
         # is attributed to it: one browser serves every chat, and this is what lets the Computer panel
@@ -4863,7 +5218,11 @@ def exec_tool(bid, name, args):
             if raw is None: return "(browser_save returned no usable data)", []
             with open(p, "wb") as f: f.write(raw)
             note = "saved %s (%d bytes) from the page" % (fn, os.path.getsize(p))
-            if data.startswith("data:video"): return note + " -- video file, open it from the sandbox", []
+            # What was saved is sent to the chat, so it is still there after a reload — a video used
+            # to be saved and only mentioned, and a picture was a live card that a redraw wiped.
+            att, why = _send_file(p)
+            if att: return note, [{"type": "file", "att": att}]
+            if data.startswith("data:video"): return note + " -- could not send it: " + why, []
             return note, [{"type": "image", "png": data, "note": fn}]
         if name == "browser_read":   return bcall("read"), []
         if name == "browser_click":  return bcall("click", selector=args.get("selector", "")), []
@@ -4967,20 +5326,25 @@ def _exec_parallel(bid, calls):
     turn's working folder, because that lives in a thread-local and a fresh thread would otherwise
     fall back to the shared sandbox."""
     wd = work_dir(); base = getattr(_WORK, "base", None); up = getattr(_WORK, "uploads", None)
-    routes = getattr(_WORK, "routes", None)
+    routes = getattr(_WORK, "routes", None); sid = getattr(_WORK, "sid", None)
     def one(call):
-        _WORK.dir = wd; _WORK.base = base; _WORK.uploads = up; _WORK.routes = routes
+        _WORK.dir = wd; _WORK.base = base; _WORK.uploads = up; _WORK.routes = routes; _WORK.sid = sid
         _, name, args = call
+        if sid and sid in STOP: return ("(not run: the user stopped the turn)", [])
         try: return exec_tool(bid, name, args)
         except Exception as e: return ("(the tool %s failed: %s)" % (name, e), [])
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(calls))) as ex:
         return list(ex.map(one, calls))
 
-def wait_approval(sid, ev=None, max_wait=900):
+# How long an approval card waits for an answer. It is a question to a person, so it has its own
+# budget and is not measured against the turn's clock: with no turn clock set (the default) the
+# remainder is ~0, which made the card an auto-deny for anyone who stepped away for half a minute.
+APPROVAL_WAIT = 900
+def wait_approval(sid, ev=None, max_wait=APPROVAL_WAIT):
     """Block until the user answers the approval card, or the turn is stopped. Polled rather than a
     single wait so a Stop pressed while the card is up releases the turn instead of leaving it parked
-    for the full fifteen minutes. `max_wait` is capped by the caller to the turn's own time budget, so
-    a card raised late in a turn cannot park it for another fifteen minutes past that budget.
+    for the full fifteen minutes. `max_wait` is the card's own budget, independent of the turn's
+    (see APPROVAL_WAIT).
     `ev` is the waiter the caller already registered before showing the card — see the call site: the
     slot must exist before the card is on screen, or an answer that lands in that gap is read as a
     denial (see `/api/approve`) and the turn then sits on the full deadline for nothing."""
@@ -5214,7 +5578,7 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
     wd = work_dir()
     chunks.append(("System prompt", ("\n\nYour working directory is " + wd + ". Every shell command and file tool runs there — "
                "do not guess other paths." if wd != SANDBOX else
-               "\n\nYour working directory is the shared sandbox: " + SANDBOX + ".") + TOOL_DOC + browser_brief(ch_now) + "\n\n" + LANG))
+               "\n\nYour working directory is the shared sandbox: " + SANDBOX + ".") + TOOL_DOC + browser_brief(ch_now or bot) + "\n\n" + LANG))
     if planning: chunks.append(("System prompt", PLAN_BRIEF))
     sk = [s for s in all_skills() if s["id"] in (bot.get("skills") or [])]
     if sk:
@@ -5315,10 +5679,28 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
             msgs, dropped = fit_messages(messages, budget)
             if (trimmed or dropped) and not told:
                 told = True; yield {"type": "context", "dropped": trimmed or dropped, "limit": budget}
-        msg = None
+        msg = None; spoke = False; cut = ""
         for kind, val in chat_stream(model, msgs, tools=tools):
-            if kind == "delta": yield {"type": "agent_text", "agent": bid, "text": val, "delta": True}
+            if kind == "delta":
+                spoke = True
+                yield {"type": "agent_text", "agent": bid, "text": val, "delta": True}
+                # Stop and a steer both take effect on the answer being written, not after it. Stop
+                # used to be read only at the top of a step, so a long answer — the case the button
+                # exists for — kept arriving for another minute after the click.
+                if sid in STOP: cut = "stop"; break
+                # A steer typed while the bot is writing reaches it *now*: the answer being written is
+                # dropped and the next step starts with the steer in front of it. A steer is an
+                # interruption, not a place in the queue. The step it cuts short decided nothing, so
+                # there is no call to answer for and no report to keep.
+                if STEER.get(sid): cut = "steer"; break
             else: msg = val
+        if cut == "stop": stopped = True; break      # the turn lands below, with no wrap-up call
+        if msg is None:
+            # Cut short for a steer. The half-written answer goes with it — an empty `agent_text` is
+            # how the page clears the bubble it was typing into — and the next step opens with the
+            # steer in front of the bot.
+            if spoke: yield {"type": "agent_text", "agent": bid, "text": ""}
+            continue
         ctx_note(sid, parts, msgs, msg.get("usage"), budget, model)   # measured from the request just sent
         content = (msg["content"] or "").strip()
         # `[model error: …]` is the client's own marker, not the bot speaking — it must not become the
@@ -5448,6 +5830,8 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result[:6000]})
         else:
             for ci, (tc, name, args) in enumerate(calls):
+                # Stop pressed between calls: the ones after it are not run at all.
+                if sid in STOP: break
                 if name == "delegate":
                     sub = args.get("role", ""); subtask = args.get("task", "")
                     sb = bot_by_id(bots, sub)
@@ -5517,10 +5901,9 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                             yield {"type": "approval", "agent": bid, "cmd": cmd}
                             yield {"type": "status", "state": "approval"}
                             st2 = load(sid); st2["pending"] = {"cmd": cmd, "agent": bid}; save(sid, st2)
-                            # The card gets at least 30s of its own: near the end of a long turn the
-                            # remaining budget is ~0, and a one-second deadline is not a question, it is
-                            # an auto-deny that flashes a card the user never had a chance to answer.
-                            ok = wait_approval(sid, ev, max_wait=max(30, budget_s - (time.time() - t0)))
+                            # The card gets its own budget (APPROVAL_WAIT): it waits for a person, so
+                            # what is left of the turn's clock must not shorten it.
+                            ok = wait_approval(sid, ev, max_wait=APPROVAL_WAIT)
                         finally:
                             # `wait_approval` pops the slot on the normal path; this covers the one gap
                             # that does not reach it — a save that throws between registering the waiter
@@ -5561,6 +5944,10 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                     for ev in extra: yield {**ev, "agent": bid}   # a screenshot belongs to its bot
                     yield {"type": "tool", "id": tc.get("id"), "agent": bid, "name": name, "args": args, "out": result[:1800]}
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result[:6000]})
+        if sid in STOP:
+            # Stop arrived while this step's calls were running: the turn lands now instead of taking
+            # another step, and `_wrap_up(quick=True)` means it lands without a model call.
+            stopped = True; break
         if done:
             # `finish` ends the turn, so a steer that arrived while the bot was calling it is the same
             # case as the one above: hand it over and keep going rather than close on top of it.
@@ -5718,9 +6105,12 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
     # readable by this turn's file tools (see `_in_sandbox`). Set for every turn, not only one that
     # carries a file, so a screenshot from an earlier message can still be opened.
     _WORK.uploads = _upload_folder(sid)
-    # The room's browser accounts ride with the turn, so a `browser_open` inside it routes through
-    # this room's list without the bot being told an account name. None = use the machine-wide list.
-    _WORK.routes = _room_routes(channel)
+    # The browser accounts ride with the turn, so a `browser_open` inside it routes through the list
+    # that owns this chat — the room's, or the bot's own — without the bot being told an account name.
+    _WORK.routes = _turn_routes(channel, bot_by_id(bots, solo))
+    # Which chat this thread is working for, so a long call — a command, a page that never loads —
+    # can see the Stop pressed on that chat and let go of it (see `run_shell`, `BROWSER.call`).
+    _WORK.sid = sid
     ctx_saved = False        # set once a save has already carried the ctx chip, so `finally` need not repeat it
     try:
         st = load(sid)
@@ -5772,6 +6162,12 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
                 # Kept as a `notice` row, which the redraw draws exactly as the live card drew it.
                 if ev.get("type") == "notice" and (ev.get("text") or "").strip():
                     ran.append({"role": "notice", "content": ev["text"], "ts": time.time()})
+                # A file the bot sent is kept as a message with it attached, so reopening the chat still
+                # shows the picture or plays the video instead of leaving a "sent report.pdf" tool row.
+                if ev.get("type") == "file" and ev.get("att"):
+                    ran.append({"role": "assistant",
+                                "who": (bot_by_id(bots, ev.get("agent") or solo) or {}).get("name") or solo,
+                                "content": "", "attachments": [ev["att"]], "ts": time.time()})
                 yield ev
             # The lead delegated, so say who is doing it. A lead that simply answered has nothing to
             # hand off and gets no card — the old "Plan: answer directly." was a plan of nothing, and
@@ -5811,6 +6207,7 @@ def _run_turn_inner(sid, text, bots, settings, channel=None, solo=None, quote=No
         _WORK.dir = None                                     # the next turn in this thread starts clean
         _WORK.base = None
         _WORK.uploads = None
+        _WORK.sid = None
 
 def mentioned_members(text, members, bots):
     """The member ids `text` names with @, in member order. A mention is @name or @id, matched
@@ -5912,6 +6309,7 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
             for row in reversed(room_said):
                 if row.get("who") == who: row["took"] = took; break
     for m in targets:
+        if sid in STOP: break                # Stop: the members still waiting are not started
         yield {"type": "agent", "id": m, "name": bot_by_id(bots, m)["name"], "state": "start"}
         engaged.append(bot_by_id(bots, m)["name"])
         # A member's turn is a task in Lucent, assigned to that member in the room's project. Its
@@ -5959,6 +6357,13 @@ def _channel_turn(sid, text, channel, bots, settings, raw=None, jobs=None, image
             # like the hand-off, so reopening the room still says why a bot went quiet.
             if t == "notice" and (ev.get("text") or "").strip():
                 room_said.append({"role": "notice", "content": ev["text"], "ts": time.time()})
+            # A file a bot sends is a message to the room, not machinery: someone asked for it. So it is
+            # drawn here (no `to`) and kept in the room's record, and the member's own chat keeps its
+            # copy like the rest of that member's work.
+            if t == "file" and ev.get("att"):
+                room_said.append({"role": "assistant", "who": who, "content": "",
+                                  "attachments": [ev["att"]], "ts": time.time()})
+                _work_note(work, chat_of(bid), ev, bid, bots)
             yield ev
         _work_save(work)
         yield {"type": "agent", "id": m, "name": bot_by_id(bots, m)["name"], "state": "done"}
@@ -6015,11 +6420,15 @@ def _work_note(work, nid, ev, bid, bots):
                                          "args": ev.get("args") or {}, "out": ev.get("out") or ""})
     elif t == "agent_text":
         if ev.get("delta"): return                 # the pieces of a message being typed, not messages
+        if not (ev.get("text") or "").strip(): return   # an empty one only clears a bubble being typed
         work.setdefault(nid, []).append({"role": "assistant", "who": name, "content": ev.get("text", "")})
     elif t == "context":
         n = ev.get("dropped", 0)
         work.setdefault(nid, []).append({"role": "sys", "content": "compressed %d earlier step%s to fit the context window"
                                          % (n, "" if n == 1 else "s")})
+    elif t == "file" and ev.get("att"):
+        work.setdefault(nid, []).append({"role": "assistant", "who": name, "content": "",
+                                         "attachments": [ev["att"]]})
 
 def _work_save(work):
     """One write per chat, once the bot's run is over — a turn's worth of notes, not one write per
@@ -6065,7 +6474,20 @@ _RT_LOCK = threading.Lock()
 MAX_ROUTINES = 50
 MAX_ROUTINES_AT_ONCE = 4
 _RT_LIVE = [0]                 # routine turns running, guarded by _RT_LOCK
+# Records already reported as unrunnable. A hand-edited file can hold one without its prompt or
+# session, and it can never run — but it is still "due" every tick, so without this it would be
+# marked run, dispatched, and print a traceback every 30 seconds for ever.
+_RT_BAD = set()
+def _runnable(r):
+    """Can this record ever produce a turn? Its prompt and session are what a turn is made of."""
+    if isinstance(r.get("prompt"), str) and r["prompt"].strip() \
+            and isinstance(r.get("session"), str) and r["session"].strip(): return True
+    if repr(r.get("id")) not in _RT_BAD:
+        _RT_BAD.add(repr(r.get("id")))
+        print("routine %s: no prompt or session, skipped" % r.get("id"))
+    return False
 def _due(r, now):
+    if not _runnable(r): return False
     if r.get("paused"): return False
     every = r.get("every")
     if every: return now - r.get("last", 0) >= every
@@ -6108,9 +6530,10 @@ def _run_routine(r, bots, settings, chs):
     """One routine's turn, on its own thread. A long job must not starve the tick or the other
     routines — the scheduler's only job is to decide what is due."""
     try:
-        sid = r["session"]
+        if not _runnable(r): return
+        sid = r.get("session")
         ch, solo = resolve_session(sid, r.get("bot"), chs, bots)
-        gen = _broadcast(sid, "", _run_turn(sid, r["prompt"], bots, settings, channel=ch, solo=solo, who="Routine"))
+        gen = _broadcast(sid, "", _run_turn(sid, r.get("prompt"), bots, settings, channel=ch, solo=solo, who="Routine"))
         for _ in gen: pass
     except Exception as e: print("routine %s:" % r.get("id"), e)
     finally:
@@ -6237,6 +6660,10 @@ def watch_stream(handler):
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # A keep-alive connection whose client goes silent — a tab closed without its FIN, a phone that
+    # slept — otherwise pins its handler thread in `readline` for ever. The streams are unaffected:
+    # `_bound_writes` gives a live one its own, shorter bound once the headers are out.
+    timeout = 60
     def log_message(self, *a): pass
     def _req_token(self):
         """The token the caller presents: the header the companion app sends, or the cookie the app
@@ -6385,11 +6812,18 @@ class H(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "that upload is larger than %d MB"
                         % (MAX_BODY_BYTES // 1_000_000)}, 413)
             return None
-        try: return json.loads(self.rfile.read(n) or b"{}")
-        except Exception: return {}
+        # A body that arrives short — the phone lost wifi mid-upload, a proxy closed early — does not
+        # parse. Answering it as `{}` made a dropped connection look like a request with no fields,
+        # and `/api/chat` then died on a missing `text`. Say the body was bad instead.
+        try: body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            self._json({"ok": False, "error": "the request body is not valid JSON"}, 400); return None
+        if not isinstance(body, dict):
+            self._json({"ok": False, "error": "the request body must be a JSON object"}, 400); return None
+        return body
     def _sid(self, body): return body.get("session") or body.get("bot") or "producer"
     def _bots_public(self, bots):
-        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar","avatar_closed","genface","genface_closed","preset")} for b in bots]
+        out = [{k: b.get(k) for k in ("id","name","title","role","color","emoji","face","model","approval","memory","voice","hidden","pinned","skills","instructions","tools_allow","outfit","accessory","avatar","avatar_closed","genface","genface_closed","preset","browser")} for b in bots]
         # A record written before these keys existed still answers with them, so the client never
         # has to guess whether a missing key means "none" or "this bot is older than the feature".
         for x in out:
@@ -6514,6 +6948,9 @@ class H(BaseHTTPRequestHandler):
                                             else st.get("approval")),
                                "approval_own": own,
                                "approval_kind": "room" if in_channel else "bot",
+                               # A turn already running when this client asked is not in `messages`
+                               # yet, so without this the chat reads as idle and Stop is not offered.
+                               "live": _live(sid),
                                "ctx": st.get("ctx")})
         if u.path == "/api/state":
             known = [b["id"] for b in load_bots()] + [c["id"] for c in load_channels()]
@@ -6541,27 +6978,59 @@ class H(BaseHTTPRequestHandler):
                                "channel": b.get("channel") or "auto", "channels": installed_channels(),
                                "running": BROWSER.ok, "err": BROWSER.err})
         if u.path == "/api/browser/own":
-            # `?room=` scopes the list to a room's own accounts, which is what its editor draws.
+            # `?room=` and `?bot=` scope the list to that room's — or that bot's own chat's —
+            # accounts, which is what its editor draws. Neither: the machine-wide list, for the
+            # settings page. A record with no accounts answers with an empty list, not the default.
             rid = q.get("room", [""])[0]
             if rid:
                 ch = channel_by_id(load_channels(), rid)
                 if not ch: return self._json({"ok": False, "err": "unknown room"})
-                return self._json(browser_own_profiles(ch["browser"]))
+                return self._json(browser_own_profiles(ch.get("browser") or []))
+            bid = q.get("bot", [""])[0]
+            if bid:
+                b = bot_by_id(load_bots(), bid)
+                if not b: return self._json({"ok": False, "err": "unknown bot"})
+                return self._json(browser_own_profiles(b.get("browser") or []))
             return self._json(browser_own_profiles())
         if u.path.startswith("/api/upload/"):
             # An attachment the user sent, drawn back in the transcript. Both halves of the URL are
             # shape-checked before either becomes a path, so no request can reach outside the one
             # folder its own chat wrote to.
             parts = u.path[len("/api/upload/"):].split("/")
-            if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9._-]{1,200}", x) for x in parts):
+            if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9._-]{1,200}", x) for x in parts) \
+                    or any(x in (".", "..") for x in parts):
                 return self.send_error(404)
-            p = os.path.join(SANDBOX, "_uploads", parts[0], parts[1])
+            root = os.path.join(SANDBOX, "_uploads")
+            p = os.path.realpath(os.path.join(root, parts[0], parts[1]))
+            # The shape check alone lets `..` through, so containment is the rule that counts: a name
+            # that resolves outside the chat's own folder is not an upload.
+            if os.path.dirname(p) != os.path.realpath(os.path.join(root, parts[0])):
+                return self.send_error(404)
             if not os.path.isfile(p): return self.send_error(404)
-            try: blob = open(p, "rb").read()
+            try: size = os.path.getsize(p)
             except OSError: return self.send_error(404)
             ctype = mimetypes.guess_type(p)[0] or "application/octet-stream"
-            self.send_response(200); self.send_header("Content-Type", ctype)
+            # A video or an audio clip is played by the browser's own player, and that player asks for
+            # byte ranges (Safari will not play a clip without them, and nothing can be scrubbed). So
+            # a Range request is answered with 206 and just the bytes asked for.
+            start, end, part = 0, size - 1, False
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+            if m and size:
+                a, b = m.group(1), m.group(2)
+                if a: start, end = int(a), int(b) if b else size - 1
+                elif b: start = max(0, size - int(b))
+                end = min(end, size - 1)
+                if start > end or start >= size: return self.send_error(416)
+                part = True
+            try:
+                with open(p, "rb") as f:
+                    f.seek(start); blob = f.read(end - start + 1)
+            except OSError: return self.send_error(404)
+            self.send_response(206 if part else 200)
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Accept-Ranges", "bytes")
+            if part: self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
             # Inline only for what the page itself draws; everything else downloads under its own
             # name rather than replacing the app with a PDF viewer or a stray HTML file.
             disp = "inline" if ctype.startswith(("image/", "text/plain", "video/", "audio/")) else "attachment"
@@ -6623,6 +7092,56 @@ class H(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "private, max-age=3600")
             self.end_headers(); self.wfile.write(blob); return
+        if u.path.startswith("/api/clips/"):
+            # Which clips a face has. An id with no clips folder is the normal case, not an error:
+            # the client plays frames then, exactly as it did before clips existed.
+            pid = u.path[len("/api/clips/"):]
+            if pid not in CLIP_IDS: return self.send_error(404)
+            d = os.path.join(PRESET_DIR, pid, "clips")
+            out = {}
+            # Sorted, so `.webm` — the recommended format — wins a name that exists in both formats.
+            for name in sorted(os.listdir(d) if os.path.isdir(d) else []):
+                m = re.fullmatch(r"([a-z0-9-]{1,20})\.(webm|mp4)", name)
+                if m: out[m.group(1)] = "/api/clip/%s/%s" % (pid, name)
+            return self._json({"ok": True, "clips": out})
+        if u.path.startswith("/api/clip/"):
+            # A clip is an app asset like a preset frame: the two parts are matched whole and the id
+            # is checked against CLIP_IDS, so the URL can never become a path outside PRESET_DIR.
+            m = re.fullmatch(r"/api/clip/([a-z][a-z-]{0,30})/([a-z0-9-]{1,20})\.(webm|mp4)", u.path)
+            if not m or m.group(1) not in CLIP_IDS: return self.send_error(404)
+            p = os.path.join(PRESET_DIR, m.group(1), "clips", m.group(2) + "." + m.group(3))
+            if not os.path.isfile(p): return self.send_error(404)
+            try: size = os.path.getsize(p)
+            except OSError: return self.send_error(404)
+            # A looping video is fetched in ranges by some browsers, and one that ignores the range
+            # stalls on a cold cache. One range only; anything else is answered as unsatisfiable.
+            start, end, part = 0, size - 1, False
+            rng = (self.headers.get("Range") or "").strip()
+            if rng:
+                r = re.fullmatch(r"bytes=(\d*)-(\d*)", rng)
+                a, b = (r.group(1), r.group(2)) if r else ("", "")
+                if a: start, end = int(a), int(b) if b else size - 1
+                elif b: start = max(0, size - int(b))
+                end = min(end, size - 1)
+                if not r or not size or start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers(); return
+                part = True
+            try:
+                with open(p, "rb") as f:
+                    f.seek(start); blob = f.read(end - start + 1)
+            except OSError: return self.send_error(404)
+            self.send_response(206 if part else 200)
+            self.send_header("Content-Type", "video/" + m.group(3))
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Accept-Ranges", "bytes")
+            if part: self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers(); self.wfile.write(blob); return
         if u.path.startswith("/api/avatar/"):
             # Same shape as the logo route: the bot is looked up by id first, so the URL never
             # becomes a path and only a stored bot's own avatar can ever be served. `?closed=1`
@@ -6649,16 +7168,19 @@ class H(BaseHTTPRequestHandler):
             owners, _ = _computer_scope(q.get("sid", [""])[0])
             if owners is not None and BROWSER.owner not in owners:
                 who = bot_by_id(load_bots(), BROWSER.owner) if BROWSER.owner else None
-                return self._json({"png": "", "url": "", "title": "",
+                return self._json({"png": "", "url": "", "title": "", "human": bool(BROWSER.human),
+                                   "owner": BROWSER.owner,
                                    "err": ("%s is using the computer — not this chat's bot" % who["name"]) if who
                                           else "this chat's bot is not using the computer"})
             # Always through call(), even with no browser: that is what retries the attach, so a
             # profile opened after the panel was first drawn shows up on the next poll by itself.
-            d = BROWSER.call("preview", timeout=30, force=q.get("force", [""])[0] in ("1", "true"))
+            d = BROWSER.call("preview", timeout=30, force=q.get("force", [""])[0] in ("1", "true"),
+                             _human=True)
             try: d = json.loads(d)
             except Exception: d = {"png": "", "url": BROWSER.url, "title": BROWSER.title, "err": str(d)}
             return self._json({"png": d.get("png", ""), "url": d.get("url", ""),
-                               "title": d.get("title", ""), "err": d.get("err", "")})
+                               "title": d.get("title", ""), "err": d.get("err", ""),
+                               "human": bool(d.get("human")), "owner": BROWSER.owner})
         if u.path == "/api/files":
             sid = q.get("session", q.get("bot", [""]))[0]
             root, label = _file_root(sid)
@@ -6701,7 +7223,7 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path.startswith("/api/") and not self._authorized(): return self.send_error(403)
         body = self._body()
-        if body is None: return          # too large; the refusal has already been sent
+        if body is None: return          # refused; the reply has already been sent
         if u.path == "/api/chat":
             sid = self._sid(body); text = body.get("text"); bots = load_bots(); settings = load_settings()
             ch, solo = resolve_session(sid, body.get("bot"), load_channels(), bots)
@@ -6709,6 +7231,13 @@ class H(BaseHTTPRequestHandler):
             # Attachments are written to disk before the turn starts, so the paths the bot is told
             # about already exist by the time its first tool call runs.
             atts = _save_uploads(sid, body.get("attachments"))
+            # A message is text, files, or both. A body that lost its text on the way (a truncated
+            # upload) used to reach the turn as `None` and die there, after `sse()` had already
+            # answered 200 — the user saw a red card and the attachments vanished.
+            if not isinstance(text, str):
+                if not atts:
+                    return self._json({"ok": False, "error": "a message needs text or an attachment"}, 400)
+                text = ""
             return sse(self, _broadcast(sid, turn, _run_turn(sid, text, bots, settings, channel=ch, solo=solo,
                                        quote=_clean_quote(body.get("quote")), fwd=bool(body.get("fwd")),
                                        attachments=atts)))
@@ -6720,7 +7249,8 @@ class H(BaseHTTPRequestHandler):
             except (TypeError, ValueError): keep = 0     # a stray string is "keep nothing", not a 500
             ok = truncate_chat(sid, keep)
             if not ok: return self._json({"ok": False, "error": "a turn is running in this chat"}, 409)
-            return self._json({"ok": True, "messages": load(sid).get("messages") or []})
+            # `peek`, not `load`: truncating a chat this server does not have must not mint one.
+            return self._json({"ok": True, "messages": peek(sid).get("messages") or []})
         if u.path == "/api/chat/steer":
             # Steering is only steering if a turn is there to steer *and* still able to take it:
             # `STEER[sid]` exists for exactly as long as that chat's turn does, and stops counting the
@@ -6745,13 +7275,21 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True, "stopping": False})
         if u.path == "/api/approve":
             sid = self._sid(body); allow = bool(body.get("allow"))
-            a = APPROVAL.get(sid)                  # a second answer (a double-click, two devices) must
-            if a:                                  # not 500 on an entry the first answer already popped
+            a = APPROVAL.get(sid)                  # a second answer (a double-click, two devices) is
+            if a:                                  # normally still here, and must not 500 on it
                 a["allow"] = allow; a["event"].set()
                 return self._json({"ok": True, "resolved": True})
             st = load(sid)
             if st.get("pending"):
-                st["pending"] = None; st["messages"].append({"role":"assistant","content":"(command denied by user)"}); save(sid, st)
+                st["pending"] = None
+                # ...but the turn pops the entry the moment the first answer wakes it, so a second
+                # answer can land here instead. With allow=True that card was already allowed and
+                # ran: the turn is gone, so there is nothing to deny, and a denial note would have
+                # the transcript say the command was refused when it was not.
+                if not allow: st["messages"].append({"role":"assistant","content":"(command denied by user)"})
+                save(sid, st)
+                if not allow: return self._json({"ok": True, "denied": True})
+                return self._json({"ok": True, "resolved": True})
             return self._json({"ok": True, "denied": not allow})
         if u.path == "/api/skills/scan":
             data = _data_bytes(body.get("data") or "")
@@ -6783,6 +7321,8 @@ class H(BaseHTTPRequestHandler):
             if problems:
                 return self._json({"ok": False, "problems": problems,
                                    "error": "this playbook is not the structure we accept"})
+            # `build_team` takes `_DOC_LOCK` itself, for the merge only: the paste may be read by a
+            # model, and holding the lock across that parked every other writer of the same documents.
             made, rooms = build_team(text)
             if not made: return self._json({"ok": False, "error": "could not find any agents in that text"})
             return self._json({"ok": True, "created": [b["name"] + " (" + b["title"] + ")" for b in made],
@@ -6790,66 +7330,95 @@ class H(BaseHTTPRequestHandler):
                                "bots": self._bots_public(load_bots()),
                                "channels": load_channels()})
         if u.path == "/api/bot":
-            bots = load_bots(); b = dict(body.get("bot") or {})
-            bid = b.get("id") or _slug(b.get("name"), "bot")
-            b["id"] = bid
-            existing = bot_by_id(bots, bid)
-            if existing: existing.update(b)
-            else:
-                b.setdefault("emoji", "🤖")      # a new bot gets a face even if the caller named none
-                bots.append(_norm_bots([b])[0])  # ...and every other field, from the one shared list
-            save_bots(bots)
+            with _DOC_LOCK:
+                bots = load_bots(); b = dict(body.get("bot") or {})
+                given = b.get("id") or ""                      # an edit says which bot it is; a create does not
+                bid = given or _slug(b.get("name"), "bot")
+                b["id"] = bid
+                existing = bot_by_id(bots, bid)
+                # A name another bot already answers to is refused, not suffixed: the user typed it, so
+                # the panel should say why it did not take rather than quietly put "Builder 2" in the
+                # sidebar. Renames go through here too, so it is the same rule for a new bot and an edit.
+                # `existing and not given` is a create whose name slugs onto a bot that is already here —
+                # that used to fall into the edit branch and overwrite it.
+                nm = (b.get("name") or "").strip().lower()
+                clash = next((x for x in bots if x.get("id") != bid and (x.get("name") or "").strip().lower() == nm), None) if nm else None
+                if clash or (existing and not given):
+                    return self._json({"ok": False, "error": "Another bot is already called \"%s\". Pick a name of its own."
+                                       % (clash or existing)["name"].strip()})
+                if existing: existing.update(b)
+                else:
+                    b.setdefault("emoji", "🤖")      # a new bot gets a face even if the caller named none
+                    bots.append(_norm_bots([b])[0])  # ...and every other field, from the one shared list
+                save_bots(bots)
             return self._json({"ok": True, "bot": b, "bots": self._bots_public(bots)})
         if u.path == "/api/bot/delete":
-            bid = body.get("id"); bots = [b for b in load_bots() if b["id"] != bid]; save_bots(bots)
-            chs = load_channels()
-            for c in chs:
-                c["members"] = [m for m in c["members"] if m != bid]
-                # A room left pointing at a lead that no longer exists could never take a message
-                # (its turn named a bot that was not there). Hand the lead to a surviving member.
-                if c.get("lead") not in c["members"]:
-                    c["lead"] = c["members"][0] if c["members"] else None
-            save_channels(chs)
+            with _DOC_LOCK:
+                bid = body.get("id"); bots = [b for b in load_bots() if b["id"] != bid]; save_bots(bots)
+                chs = load_channels()
+                for c in chs:
+                    c["members"] = [m for m in c["members"] if m != bid]
+                    # A room left pointing at a lead that no longer exists could never take a message
+                    # (its turn named a bot that was not there). Hand the lead to a surviving member.
+                    if c.get("lead") not in c["members"]:
+                        c["lead"] = c["members"][0] if c["members"] else None
+                save_channels(chs)
             drop_session(bid, "bot")   # a deleted bot leaves no orphan conversation behind
             remove_avatar(bid)         # ...and no orphan avatar file either
             return self._json({"ok": True, "bots": self._bots_public(bots)})
         if u.path == "/api/bot/duplicate":
-            bid = body.get("id"); bots = load_bots(); src = bot_by_id(bots, bid)
-            if src:
-                cp = json.loads(json.dumps(src)); cp["id"] = bid + "-copy"; cp["name"] = src["name"] + " copy"
-                bots.append(cp); save_bots(bots)
+            with _DOC_LOCK:
+                bid = body.get("id"); bots = load_bots(); src = bot_by_id(bots, bid)
+                if src:
+                    # The copy's id is the source's plus "-copy", which is already taken the second time
+                    # the same bot is duplicated — two records under one id. Both it and the name step
+                    # aside, so a third copy is "X copy 3" and not a second "X copy".
+                    cp = json.loads(json.dumps(src))
+                    cp["id"] = _unique_id(bid + "-copy", {b["id"] for b in bots})
+                    cp["name"] = _unique_name(src["name"] + " copy", {(b.get("name") or "").strip().lower() for b in bots})
+                    # The saved browser logins are keyed by account name on this machine, not by bot:
+                    # copied, the new bot would inherit a login the user never gave it and both would
+                    # drive one profile. It starts with none, as a bot made today does.
+                    cp["browser"] = []
+                    # The picture is a file under data/avatars named by the bot's id, so the copy has
+                    # no file of its own. Dropping the reference falls back to the face it shares with
+                    # the source; kept, it would point at a URL that 404s.
+                    cp["avatar"] = 0; cp["avatar_closed"] = 0
+                    bots.append(cp); save_bots(bots)
             return self._json({"ok": True, "bots": self._bots_public(bots)})
         if u.path == "/api/channel":
-            chs = load_channels(); c = dict(body.get("channel") or {})
-            # These are derived on read, not stored. A client that echoes a channel back (the editor
-            # does) would otherwise write them into channels.json as if they were real settings.
-            for k in ("logo", "logo_src", "logo_rel", "folder_ok"): c.pop(k, None)
-            # The id is a slug and nothing else: it names the session, the row, and now the logo
-            # file on disk, so an id from the client must never be able to reach outside data/logos.
-            cid = re.sub(r"[^a-z0-9]+", "-",
-                         (c.get("id") or c.get("name") or "room").lower()).strip("-")[:48]
-            if not cid: return self._json({"ok": False, "error": "a channel needs a name"})
-            c["id"] = cid
-            # A folder that does not exist would silently fall back to the shared sandbox, which is
-            # exactly the mixing this feature exists to prevent — so refuse it up front instead.
-            if c.get("folder", "").strip() and not resolve_folder(c["folder"]):
-                return self._json({"ok": False, "error": "no folder at " + c["folder"].strip() +
-                                   " — check the path (or leave it blank for the shared sandbox)"})
-            ex = channel_by_id(chs, cid)
-            if ex: ex.update(c)
-            else:
-                # A room created without a team starts with the whole roster, as it always has.
-                c.setdefault("members", [b["id"] for b in load_bots()])
-                # ...and `name`, `mode`, `lead` and the rest come from the one shared list, so a
-                # create can never again write a record the loader has to repair (or crash on).
-                chs.append(_norm_channels([c])[0])
-            # One pass over the whole list, so an updated record is shaped by the same rules a loaded
-            # one is — the browser rows included, which is where a hand-sent field could otherwise land.
-            chs = _norm_channels(chs)
-            save_channels(chs)
+            with _DOC_LOCK:
+                chs = load_channels(); c = dict(body.get("channel") or {})
+                # These are derived on read, not stored. A client that echoes a channel back (the editor
+                # does) would otherwise write them into channels.json as if they were real settings.
+                for k in ("logo", "logo_src", "logo_rel", "folder_ok"): c.pop(k, None)
+                # The id is a slug and nothing else: it names the session, the row, and now the logo
+                # file on disk, so an id from the client must never be able to reach outside data/logos.
+                cid = re.sub(r"[^a-z0-9]+", "-",
+                             (c.get("id") or c.get("name") or "room").lower()).strip("-")[:48]
+                if not cid: return self._json({"ok": False, "error": "a channel needs a name"})
+                c["id"] = cid
+                # A folder that does not exist would silently fall back to the shared sandbox, which is
+                # exactly the mixing this feature exists to prevent — so refuse it up front instead.
+                if c.get("folder", "").strip() and not resolve_folder(c["folder"]):
+                    return self._json({"ok": False, "error": "no folder at " + c["folder"].strip() +
+                                       " — check the path (or leave it blank for the shared sandbox)"})
+                ex = channel_by_id(chs, cid)
+                if ex: ex.update(c)
+                else:
+                    # A room created without a team starts with the whole roster, as it always has.
+                    c.setdefault("members", [b["id"] for b in load_bots()])
+                    # ...and `name`, `mode`, `lead` and the rest come from the one shared list, so a
+                    # create can never again write a record the loader has to repair (or crash on).
+                    chs.append(_norm_channels([c])[0])
+                # One pass over the whole list, so an updated record is shaped by the same rules a loaded
+                # one is — the browser rows included, which is where a hand-sent field could otherwise land.
+                chs = _norm_channels(chs)
+                save_channels(chs)
             return self._json({"ok": True, "channels": chs})
         if u.path == "/api/channel/delete":
-            cid = body.get("id"); chs = [c for c in load_channels() if c["id"] != cid]; save_channels(chs)
+            with _DOC_LOCK:
+                cid = body.get("id"); chs = [c for c in load_channels() if c["id"] != cid]; save_channels(chs)
             drop_session(cid, "channel"); remove_logo(cid)     # a deleted company leaves no logo behind
             return self._json({"ok": True, "channels": chs})
         if u.path == "/api/nav/order":
@@ -6858,16 +7427,19 @@ class H(BaseHTTPRequestHandler):
             ids = [str(i) for i in (body.get("ids") or [])]
             kind = body.get("kind")
             if kind == "members":
-                chs = load_channels(); c = channel_by_id(chs, body.get("id") or "")
-                if not c: return self._json({"ok": False, "error": "unknown room"})
-                c["members"] = reorder(c.get("members") or [], ids, key=lambda m: m)
-                save_channels(chs)
+                with _DOC_LOCK:
+                    chs = load_channels(); c = channel_by_id(chs, body.get("id") or "")
+                    if not c: return self._json({"ok": False, "error": "unknown room"})
+                    c["members"] = reorder(c.get("members") or [], ids, key=lambda m: m)
+                    save_channels(chs)
                 return self._json({"ok": True, "channels": channels_public(chs)})
             if kind == "channels":
-                chs = reorder(load_channels(), ids); save_channels(chs)
+                with _DOC_LOCK:
+                    chs = reorder(load_channels(), ids); save_channels(chs)
                 return self._json({"ok": True, "channels": channels_public(chs)})
             if kind != "bots": return self._json({"ok": False, "error": "nothing to reorder"})
-            bots = reorder(load_bots(), ids); save_bots(bots)
+            with _DOC_LOCK:
+                bots = reorder(load_bots(), ids); save_bots(bots)
             return self._json({"ok": True, "bots": self._bots_public(bots)})
         if u.path == "/api/logo":
             chs = load_channels(); c = channel_by_id(chs, body.get("id") or "")
@@ -6885,39 +7457,44 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True, "logo": lg["v"], "logo_src": lg["source"],
                                "logo_rel": lg["rel"], "removed": True})
         if u.path == "/api/avatar":
-            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
-            if not b: return self._json({"ok": False, "error": "unknown bot"})
-            r = set_avatar(b, body.get("data"))
-            if r["ok"]:
-                save_bots(bots)
-                r.update({"avatar": b["avatar"], "avatar_src": avatar_state(b)["source"]})
+            with _DOC_LOCK:
+                bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+                if not b: return self._json({"ok": False, "error": "unknown bot"})
+                r = set_avatar(b, body.get("data"))
+                if r["ok"]:
+                    save_bots(bots)
+                    r.update({"avatar": b["avatar"], "avatar_src": avatar_state(b)["source"]})
             return self._json(r)
         if u.path == "/api/avatar/remove":
-            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
-            if not b: return self._json({"ok": False, "error": "unknown bot"})
-            remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0; save_bots(bots)
+            with _DOC_LOCK:
+                bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+                if not b: return self._json({"ok": False, "error": "unknown bot"})
+                remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0; save_bots(bots)
             return self._json({"ok": True, "avatar": 0})
         if u.path == "/api/avatar/transform":
-            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
-            if not b: return self._json({"ok": False, "error": "unknown bot"})
+            if not bot_by_id(load_bots(), body.get("id") or ""):
+                return self._json({"ok": False, "error": "unknown bot"})
             # An image-to-image call is 30-60s of real work at the router, so the timeout is long on
-            # purpose: cutting it short would turn a slow picture into a failure.
+            # purpose: cutting it short would turn a slow picture into a failure. Both drawings run
+            # outside `_DOC_LOCK`, which is taken again to store the result.
             data_url, used = gen_image(avatar_prompt(body.get("species"), body.get("color")),
                                        image=body.get("data") or "", timeout=180)
             if not data_url: return self._json({"ok": False, "error": used})
-            r = set_avatar(b, data_url)
-            if not r["ok"]: return self._json(r)
             # The shut-eye frame is drawn from the open one, so the blink lines up. Best effort:
             # without it the picture simply does not blink.
-            try:
-                shut, _ = gen_image(face_closed_prompt(), image=data_url, timeout=180)
+            shut = ""
+            try: shut, _ = gen_image(face_closed_prompt(), image=data_url, timeout=180)
+            except Exception: pass
+            with _DOC_LOCK:
+                bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+                if not b: return self._json({"ok": False, "error": "unknown bot"})
+                r = set_avatar(b, data_url)
+                if not r["ok"]: return self._json(r)
                 bid = _logo_id(b["id"])
                 if shut and bid:
                     c = _save_image(AVATAR_DIR, bid + "-closed", shut, "avatar")
                     if c.get("ok"): b["avatar_closed"] = avatar_state(b)["closed_v"]
-            except Exception:
-                pass
-            save_bots(bots)
+                save_bots(bots)
             return self._json({"ok": True, "avatar": b["avatar"], "avatar_closed": b["avatar_closed"]})
         if u.path == "/api/faces/source":
             r = _save_image(FACES_DIR, "src", body.get("data"), "image", cap=6 << 20)
@@ -6926,48 +7503,60 @@ class H(BaseHTTPRequestHandler):
             _save_json(FACES_BATCH_PATH, st)
             return self._json({"ok": True, "source": r["file"]})
         if u.path == "/api/faces/generate":
-            if FACE_JOB["running"]: return self._json({"ok": False, "error": "the faces are still being drawn"})
-            st = faces_batch()
-            if not st["source"]: return self._json({"ok": False, "error": "introduce one image first"})
-            bots = load_bots()
-            if not bots: return self._json({"ok": False, "error": "there are no bots yet"})
-            try: raw = open(os.path.join(FACES_DIR, st["source"]), "rb").read()
-            except OSError: return self._json({"ok": False, "error": "the source image is gone"})
-            # The species and colour come from the client because it derives a species from the bot
-            # id exactly as the engine does; the record's own fields are the fallback.
-            spec = {x.get("id"): x for x in (body.get("targets") or []) if isinstance(x, dict)}
-            targets = []
-            for x in bots:
-                t = spec.get(x["id"]) or {}
-                targets.append((x["id"], t.get("species") or x.get("face") or "",
-                                t.get("color") or x.get("color") or ""))
-            batch_id = time.strftime("%Y%m%d-%H%M%S")
-            source = "data:%s;base64,%s" % (
-                FACE_MIME.get(os.path.splitext(st["source"])[1].lower(), "image/png"),
-                base64.b64encode(raw).decode())
-            FACE_JOB.update({"running": True, "done": 0, "total": len(targets), "error": "", "id": batch_id})
-            threading.Thread(target=_face_worker,
-                             args=(batch_id, st["source"], source, targets), daemon=True).start()
-            return self._json({"ok": True, "job": dict(FACE_JOB)})
+            # The flag is claimed before the loading and the encoding, so a second click a moment
+            # later is turned away instead of starting a second batch beside this one. Every early
+            # way out below releases it again; once the worker starts, the worker releases it.
+            with FACE_JOB_LOCK:
+                if FACE_JOB["running"]: return self._json({"ok": False, "error": "the faces are still being drawn"})
+                FACE_JOB["running"] = True
+            started = False
+            try:
+                st = faces_batch()
+                if not st["source"]: return self._json({"ok": False, "error": "introduce one image first"})
+                bots = load_bots()
+                if not bots: return self._json({"ok": False, "error": "there are no bots yet"})
+                try: raw = open(os.path.join(FACES_DIR, st["source"]), "rb").read()
+                except OSError: return self._json({"ok": False, "error": "the source image is gone"})
+                # The species and colour come from the client because it derives a species from the bot
+                # id exactly as the engine does; the record's own fields are the fallback.
+                spec = {x.get("id"): x for x in (body.get("targets") or []) if isinstance(x, dict)}
+                targets = []
+                for x in bots:
+                    t = spec.get(x["id"]) or {}
+                    targets.append((x["id"], t.get("species") or x.get("face") or "",
+                                    t.get("color") or x.get("color") or ""))
+                batch_id = time.strftime("%Y%m%d-%H%M%S")
+                source = "data:%s;base64,%s" % (
+                    FACE_MIME.get(os.path.splitext(st["source"])[1].lower(), "image/png"),
+                    base64.b64encode(raw).decode())
+                FACE_JOB.update({"running": True, "done": 0, "total": len(targets), "error": "", "id": batch_id})
+                threading.Thread(target=_face_worker,
+                                 args=(batch_id, st["source"], source, targets), daemon=True).start()
+                started = True
+                return self._json({"ok": True, "job": dict(FACE_JOB)})
+            finally:
+                if not started:
+                    with FACE_JOB_LOCK: FACE_JOB["running"] = False
         if u.path == "/api/faces/assign":
-            bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
-            if not b: return self._json({"ok": False, "error": "unknown bot"})
-            preset = (body.get("preset") or "").strip()
-            if preset:
-                if preset not in PRESET_IDS:
-                    return self._json({"ok": False, "error": "that preset does not exist"})
-                # Exactly one face source wins: a preset is a whole character, so the drawn face and
-                # the bot's own picture go, and the picture's file goes with them.
-                b["preset"] = preset
-                b["genface"] = ""; b["genface_closed"] = ""
-                if b.get("avatar"):
-                    remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
-            else:
-                f = (body.get("file") or "").strip()
-                if f and f not in faces_batch()["files"]:
-                    return self._json({"ok": False, "error": "that face is not in the set"})
-                set_genface(b, f)
-            save_bots(bots)
+            with _DOC_LOCK:
+                bots = load_bots(); b = bot_by_id(bots, body.get("id") or "")
+                if not b: return self._json({"ok": False, "error": "unknown bot"})
+                preset = (body.get("preset") or "").strip()
+                if preset:
+                    if preset not in PRESET_IDS:
+                        return self._json({"ok": False, "error": "that preset does not exist"})
+                    # Exactly one face source wins: a preset is a whole character, so the drawn face and
+                    # the bot's own picture go, and the picture's file goes with them.
+                    b["preset"] = preset
+                    b["genface"] = ""; b["genface_closed"] = ""
+                    if b.get("avatar"):
+                        remove_avatar(b["id"]); b["avatar"] = 0; b["avatar_closed"] = 0
+                else:
+                    f = (body.get("file") or "").strip()
+                    if f and f not in faces_batch()["files"]:
+                        return self._json({"ok": False, "error": "that face is not in the set"})
+                    set_genface(b, f)
+                save_bots(bots)
             return self._json({"ok": True, "preset": b.get("preset") or "",
                                "genface": b["genface"], "genface_closed": b["genface_closed"]})
         if u.path == "/api/faces/shuffle":
@@ -6975,10 +7564,11 @@ class H(BaseHTTPRequestHandler):
             if r is None: return self._json({"ok": False, "error": "unknown room"})
             return self._json(r)
         if u.path == "/api/faces/clear":
-            bots = load_bots()
-            for b in bots:
-                b["genface"] = ""; b["genface_closed"] = ""; b["preset"] = ""
-            save_bots(bots)
+            with _DOC_LOCK:
+                bots = load_bots()
+                for b in bots:
+                    b["genface"] = ""; b["genface_closed"] = ""; b["preset"] = ""
+                save_bots(bots)
             # The introduced image stays: it is what the next set is drawn from, and the panel says so.
             _save_json(FACES_BATCH_PATH, {"source": faces_batch()["source"]})
             _faces_prune()
@@ -7030,55 +7620,57 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True, "approval": st["approval"], "session": sid})
         if u.path == "/api/memory":
             bid = body.get("bot")
-            if not bid: return self._json({"ok": False, "err": "which bot?"}, 400)   # mem_path slugs the id
+            if not bid: return self._json({"ok": False, "error": "which bot?"}, 400)   # mem_path slugs the id
             if body.get("text") is not None: mem_write(bid, body["text"])
             return self._json({"ok": True})
         if u.path == "/api/lucent":
             if not lucent: return self._json({"ok": False, "error": "the Lucent bridge is not installed in this build"}, 400)
             return self._json(lucent.save_config(body.get("url"), body.get("email"), body.get("password")))
         if u.path == "/api/settings":
-            s = load_settings(); patch = body.get("settings") or {}
-            for k, v in patch.items():
-                if k == "connectors": continue   # connector credentials go through /api/connector
-                if k == "mcp":
-                    # The panel never sees env values or header values, so a save carrying none
-                    # keeps the stored ones rather than wiping a working server's credentials.
-                    old = s.get("mcp") or []
-                    s["mcp"] = mcp_merge(old, v)
-                    for m in old:                    # an edit must not keep talking to the old server
-                        mcp_forget(m.get("id"))
-                    continue
-                if isinstance(v, dict) and isinstance(s.get(k), dict): s[k].update(v)
-                else: s[k] = v
-            save_settings(s)
+            with _SET_LOCK:
+                s = load_settings(); patch = body.get("settings") or {}
+                for k, v in patch.items():
+                    if k == "connectors": continue   # connector credentials go through /api/connector
+                    if k == "mcp":
+                        # The panel never sees env values or header values, so a save carrying none
+                        # keeps the stored ones rather than wiping a working server's credentials.
+                        old = s.get("mcp") or []
+                        s["mcp"] = mcp_merge(old, v)
+                        for m in old:                    # an edit must not keep talking to the old server
+                            mcp_forget(m.get("id"))
+                        continue
+                    if isinstance(v, dict) and isinstance(s.get(k), dict): s[k].update(v)
+                    else: s[k] = v
+                save_settings(s)
             return self._json({"ok": True, "settings": settings_public(s)})
         if u.path == "/api/connector":
-            cid = body.get("id"); s = load_settings(); ent = _connector_entry(s, cid)
-            if not ent: return self._json({"ok": False, "error": "unknown connector"})
-            if body.get("disconnect"):
-                for k in ("token", "base_url", "client_id", "client_secret"): ent[k] = ""
-            else:
-                # Every credential field is write-only: blank means "keep what is saved", so the
-                # browser never has to round-trip a secret just to leave it alone.
-                for k in ("token", "client_id", "client_secret"):
-                    v = (body.get(k) or "").strip()
-                    if v: ent[k] = v
-                if "base_url" in body:
-                    # A custom base is how a self-hosted GitHub Enterprise is reached, and it is also
-                    # a way to aim this connector's own credential at the metadata service or at
-                    # something on the internal network — the tool calls this app makes carry the
-                    # token, so a private host is refused here, where the user can see why.
-                    base_url = (body.get("base_url") or "").strip()
-                    error = connector_url_error(base_url) if base_url else ""
-                    if error:
-                        return self._json({"ok": False, "error": error})
-                    ent["base_url"] = base_url
-            _TOKEN_CACHE.pop(cid, None)     # a new or cleared credential must not reuse the cached token
-            for x in s.get("connectors", []): x["connected"] = connector_connected(s, x.get("id"))
-            # Through the cache, not straight to disk: a bare `_save_json` here left the in-memory copy
-            # stale, so the bot's tool list never gained the new connector and the next settings save
-            # wrote that stale copy back — silently wiping the credential.
-            save_settings(s)
+            with _SET_LOCK:
+                cid = body.get("id"); s = load_settings(); ent = _connector_entry(s, cid)
+                if not ent: return self._json({"ok": False, "error": "unknown connector"})
+                if body.get("disconnect"):
+                    for k in ("token", "base_url", "client_id", "client_secret"): ent[k] = ""
+                else:
+                    # Every credential field is write-only: blank means "keep what is saved", so the
+                    # browser never has to round-trip a secret just to leave it alone.
+                    for k in ("token", "client_id", "client_secret"):
+                        v = (body.get(k) or "").strip()
+                        if v: ent[k] = v
+                    if "base_url" in body:
+                        # A custom base is how a self-hosted GitHub Enterprise is reached, and it is also
+                        # a way to aim this connector's own credential at the metadata service or at
+                        # something on the internal network — the tool calls this app makes carry the
+                        # token, so a private host is refused here, where the user can see why.
+                        base_url = (body.get("base_url") or "").strip()
+                        error = connector_url_error(base_url) if base_url else ""
+                        if error:
+                            return self._json({"ok": False, "error": error})
+                        ent["base_url"] = base_url
+                _TOKEN_CACHE.pop(cid, None)     # a new or cleared credential must not reuse the cached token
+                for x in s.get("connectors", []): x["connected"] = connector_connected(s, x.get("id"))
+                # Through the cache, not straight to disk: a bare `_save_json` here left the in-memory copy
+                # stale, so the bot's tool list never gained the new connector and the next settings save
+                # wrote that stale copy back — silently wiping the credential.
+                save_settings(s)
             return self._json({"ok": True, "connected": connector_connected(s, cid),
                                "tools": [c["tool"] for cc, c in CONNECTORS.items() if connector_connected(s, cc)]})
         if u.path == "/api/connector/test":
@@ -7174,16 +7766,26 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/browser/restart":
             return self._json(BROWSER.restart())
         if u.path == "/api/browser/accounts":
-            # The Computer panel's account rows save here. A room's list is the room's, so it is
-            # written to the room; with no room named (a chat with one bot) it is the default list.
+            # The Computer panel's account rows save here. A room's list is the room's, and a chat
+            # with one bot saves onto that bot — every chat has its own list, so no chat shows
+            # accounts that were set up somewhere else.
             acc = _norm_accounts(body.get("accounts"))
             rid = (body.get("room") or "").strip()
             if rid:
-                chs = load_channels(); ch = channel_by_id(chs, rid)
-                if not ch: return self._json({"ok": False, "err": "unknown room"})
-                ch["browser"] = acc; save_channels(chs)
+                with _DOC_LOCK:
+                    chs = load_channels(); ch = channel_by_id(chs, rid)
+                    if not ch: return self._json({"ok": False, "err": "unknown room"})
+                    ch["browser"] = acc; save_channels(chs)
                 return self._json({"ok": True, "accounts": acc})
-            s = load_settings(); s.setdefault("browser", {})["accounts"] = acc; save_settings(s)
+            bid = (body.get("bot") or "").strip()
+            if bid:
+                with _DOC_LOCK:
+                    bots = load_bots(); b = bot_by_id(bots, bid)
+                    if not b: return self._json({"ok": False, "err": "unknown bot"})
+                    b["browser"] = acc; save_bots(bots)
+                return self._json({"ok": True, "accounts": acc})
+            with _SET_LOCK:
+                s = load_settings(); s.setdefault("browser", {})["accounts"] = acc; save_settings(s)
             return self._json({"ok": True, "accounts": acc})
         if u.path == "/api/browser/own/open":
             return self._json(open_own_profile(body.get("name", ""), body.get("sites")))
@@ -7196,8 +7798,25 @@ class H(BaseHTTPRequestHandler):
             sid = self._sid(body)
             _, actor = _computer_scope(sid)
             ch, _solo = resolve_session(sid, None, load_channels(), load_bots())
-            out = BROWSER.call("open", url=url, timeout=60, _owner=actor, routes=_room_routes(ch))
+            out = BROWSER.call("open", url=url, timeout=60, _owner=actor, _human=True,
+                               routes=_turn_routes(ch, bot_by_id(load_bots(), _solo)))
             return self._json({"ok": BROWSER.ok, "out": out[:400]})
+        if u.path == "/api/computer/take":
+            # The person takes the page from the bot, or hands it back. `on` is explicit so a lost
+            # click cannot leave the browser in whichever state the request happened to imply.
+            on = body.get("on", True) is not False and body.get("on") != "0"
+            out = BROWSER.call("take" if on else "give", timeout=10, _human=True)
+            if str(out).startswith("("): return self._json({"ok": False, "err": out})
+            return self._json({"ok": True, "human": on})
+        if u.path == "/api/computer/input":
+            # One gesture from the panel. A bot's calls are refused while the person is driving (see
+            # `Browser._run`), so this is the only writer of the page in that state.
+            out = BROWSER.call("human_input", timeout=40, _human=True,
+                               kind=(body.get("kind") or ""), fx=body.get("fx") or 0,
+                               fy=body.get("fy") or 0, text=(body.get("text") or "")[:4000],
+                               key=(body.get("key") or ""), dy=body.get("dy") or 0)
+            if str(out).startswith("("): return self._json({"ok": False, "err": out})
+            return self._json({"ok": True})
         if u.path == "/api/clear":
             sid = self._sid(body)
             if not clear_chat(sid):
@@ -7256,9 +7875,22 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         self._json({"error": "not found"}, 404)
 
+def _clear_orphan_pending():
+    """Drop approval cards left in the store by a turn a restart killed. Nothing can answer one —
+    the waiter lived in memory — so `/api/state` and `/api/history` would draw an Allow/Deny for a
+    command that will never run, and the dock would say the chat needs an answer. A turn running in
+    this process is the only thing that can still own a card: it registers in STEER before the card
+    is written and in APPROVAL for as long as it waits."""
+    changed = False
+    for sid, st in _sessions_snapshot():
+        if isinstance(st, dict) and st.get("pending") and sid not in STEER and sid not in APPROVAL:
+            st["pending"] = None; changed = True
+    if changed: _write_sessions(_all_sessions())
+
 def boot(warm_browser=True):
     """Everything that has to happen once before the socket opens: a session for every bot and
     company on the roster, the routine scheduler, and the headless browser warm-up."""
+    _clear_orphan_pending()          # before any turn can start, so nothing live is mistaken for stale
     _migrate_room_browser()
     for b in load_bots(): new_session(b["id"], bot=b["id"], title=b["name"])
     for c in load_channels(): new_session(c["id"], bot=None, title=c["name"])
@@ -7381,13 +8013,14 @@ def _stop_link_locked():
 def set_relay(on=None, url=None):
     """Turn the link on or off, or point it at a different relay. The setting is what is remembered
     and the dial-out follows it, so the switch survives a restart and a running app is never quit."""
-    s = load_settings()
-    r = s.setdefault("relay", {"on": False, "url": ""})
-    candidate = (url or "").strip() if url is not None else (r.get("url") or "").strip()
-    if not (on is False and url is None) and relay_url_error(candidate): return False
-    if url is not None: r["url"] = candidate
-    if on is not None: r["on"] = bool(on)
-    save_settings(s)
+    with _SET_LOCK:
+        s = load_settings()
+        r = s.setdefault("relay", {"on": False, "url": ""})
+        candidate = (url or "").strip() if url is not None else (r.get("url") or "").strip()
+        if not (on is False and url is None) and relay_url_error(candidate): return False
+        if url is not None: r["url"] = candidate
+        if on is not None: r["on"] = bool(on)
+        save_settings(s)
     if r["on"] and r["url"]: _start_link(r["url"])
     elif r["on"]: _stop_link(); _link_state(False, "no relay address yet")
     else: _stop_link(); _link_state(False, "the link is off")

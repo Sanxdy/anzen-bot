@@ -228,12 +228,14 @@ console.log("\n-- a notice from the app lands in the transcript --");
 const noticeBranch = slice('  else if (ev.type === "notice" && ev.text) {', "\n}");
 ok("the notice branch is the only one that claims a notice",
    (src.match(/ev\.type === "notice"/g) || []).length === 1);
-function runNotice(ev) {
-  const calls = { card: [], chime: [], said: [] };
+function runNotice(ev, onScreen = true) {
+  const calls = { card: [], chime: [], said: [], fail: [] };
   const to = { tag: "this turn's sink" };
-  new Function("ev", "to", "chime", "announce", "addCard", "if (false) {} " + noticeBranch)(
+  new Function("ev", "to", "chime", "announce", "addCard", "isLimit", "here", "failDock",
+               "if (false) {} " + noticeBranch)(
     ev, to, l => calls.chime.push(l), t => calls.said.push(t),
-    (cls, head, text, sink) => calls.card.push([cls, head, text, sink]));
+    (cls, head, text, sink) => calls.card.push([cls, head, text, sink]),
+    s => /429|rate.?limit/i.test(String(s || "")), () => onScreen, r => calls.fail.push(r));
   return { calls, to };
 }
 const warn = runNotice({ type: "notice", level: "warn", text: "Builder — refused: the secret store." });
@@ -245,6 +247,10 @@ ok("...into the sink the turn was writing to, so a member's note lands in that m
 ok("...and read out for a screen reader", warn.calls.said[0] === "Builder — refused: the secret store.");
 ok("a warning does not chime", warn.calls.chime.length === 0);
 ok("an error-level notice chimes", runNotice({ type: "notice", level: "error", text: "boom" }).calls.chime[0] === "error");
+ok("a rate-limit notice also turns the corner orange",
+   runNotice({ type: "notice", level: "warn", text: "429 rate limited" }).calls.fail.length === 1);
+ok("...but only for the chat on screen",
+   runNotice({ type: "notice", level: "warn", text: "429 rate limited" }, false).calls.fail.length === 0);
 ok("a notice with no text draws nothing", runNotice({ type: "notice" }).calls.card.length === 0);
 
 /* The live strip folds a turn onto its bot's row; a notice carries no phase, so it must pass through
@@ -252,6 +258,39 @@ ok("a notice with no text draws nothing", runNotice({ type: "notice" }).calls.ca
 const liveSrc = slice("function liveEvent(sid, ev) {", "\n/* ---------------- the queue");
 ok("the live strip folds only the events it knows", !/notice/.test(liveSrc));
 ok("...and clears on the two that end a turn", /ev\.type === "final" \|\| ev\.type === "error"/.test(liveSrc));
+
+/* ---------- a history read must answer for the chat it was asked about ---------- */
+/* `reloadTranscript` is called by the end of a turn, by a wake-up and by the watch stream. The read
+   is async, and a chat switch can land inside it: the answer then painted the chat you left into the
+   chat you opened, and left `S.messages` holding the wrong record for the next render. */
+console.log("\n-- a read that lands after a chat switch is dropped --");
+const reloadSrc = slice("async function reloadTranscript() {", "\n/* Stop is offered");
+function runReload() {
+  const S = { active: "room" };
+  const drawn = [], adopted = [];
+  let answer;
+  const fn = new Function("S", "get", "render", "adoptLive", `"use strict";${reloadSrc}\nreturn reloadTranscript;`)(
+    S, () => new Promise(res => { answer = res; }), (m, p) => drawn.push([m, p]),
+    (sid, live) => adopted.push([sid, live]));
+  return { S, drawn, adopted, start: fn, answer: (...a) => answer(...a) };
+}
+const stale = runReload();
+const staleRun = stale.start();
+stale.S.active = "other";                                   // the user switches chats mid-read
+stale.answer({ messages: [{ role: "user", content: "from the room" }], pending: null });
+await staleRun;
+ok("the answer is not painted into the chat you opened", stale.drawn.length === 0, JSON.stringify(stale.drawn));
+ok("...and does not overwrite the record", stale.S.messages === undefined, JSON.stringify(stale.S.messages));
+
+const fresh = runReload();
+const freshRun = fresh.start();
+fresh.answer({ messages: [{ role: "user", content: "still here" }], pending: null, live: { turn: "t1" } });
+await freshRun;
+ok("a read that still belongs to the chat on screen is drawn",
+   fresh.drawn.length === 1 && fresh.S.messages.length === 1, JSON.stringify(fresh.drawn));
+ok("...and a turn that is still running comes with it, so the strip and Stop can be drawn",
+   fresh.adopted.length === 1 && fresh.adopted[0][0] === "room" && fresh.adopted[0][1].turn === "t1",
+   JSON.stringify(fresh.adopted));
 
 console.log(`\n${pass} ok, ${fail} failed`);
 process.exit(fail ? 1 : 0);

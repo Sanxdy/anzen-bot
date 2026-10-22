@@ -12,7 +12,7 @@ path the server writes is re-pointed under it — so a run can never touch the u
 
     python3 tests/test_backend_guards.py
 """
-import os, sys, json, tempfile, threading, socket, http.client, http.server, collections
+import os, sys, json, tempfile, threading, socket, time, http.client, http.server, collections, queue
 
 _TMP = tempfile.mkdtemp(prefix="anzen-guards-")
 os.environ["DATA_DIR"] = _TMP
@@ -30,8 +30,11 @@ S.SESS_PATH = os.path.join(_TMP, "sessions.json")
 S.LOGDIR = os.path.join(_TMP, "logs"); os.makedirs(S.LOGDIR, exist_ok=True)
 S.TOKEN_PATH = os.path.join(_TMP, "access_token")
 S.LAN_MARK = os.path.join(_TMP, "lan")
+# The preset tree is app assets beside the shell, so it is redirected the same way: a clip fixture
+# must never land in the real `faces/`.
+S.PRESET_DIR = os.path.join(_TMP, "presets")
 assert all(getattr(S, n).startswith(_TMP) for n in
-           ("BOTS_PATH", "CH_PATH", "LOGDIR", "SESS_PATH", "TOKEN_PATH", "LAN_MARK")), \
+           ("BOTS_PATH", "CH_PATH", "LOGDIR", "SESS_PATH", "TOKEN_PATH", "LAN_MARK", "PRESET_DIR")), \
     "a data path escaped the temp dir"
 
 PASS = FAIL = 0
@@ -65,6 +68,57 @@ ok("an out-of-enum value is refused",
 ok("a valid call passes", S._validate_tool_args("run_shell", {"command": "ls", "timeout": 5, "mode": "fast"}, schemas) == "")
 ok("an unsupported schema feature stays permissive",
    S._validate_tool_args("list_files", {"path": "a", "extra": [1, 2]}, schemas) == "")
+
+print("--- the store is private, and a password box is never typed into ---")
+# config.json carries the router key and settings.json the connector secrets; a file written before
+# this was tightened would still be readable by every account on the machine.
+_saved = os.path.join(_TMP, "saved.json")
+S._save_json(_saved, {"key": "secret"})
+ok("a saved JSON is readable only by its owner", (os.stat(_saved).st_mode & 0o777) == 0o600,
+   oct(os.stat(_saved).st_mode & 0o777))
+ok("...and holds what was written", json.load(open(_saved)) == {"key": "secret"})
+
+print("--- a bot's file tools cannot reach the store ---")
+# A bot whose folder is the app dir (or a parent like `~`) passes the containment test for every
+# path inside it, so `read_file` could open settings.json and `write_file` could rewrite it, with no
+# card either way. `_in_sandbox` is the one gate all five file tools go through, and it refuses the
+# store itself now, by the same rule `_file_path` and `run_shell` already used.
+_APP = os.path.realpath(tempfile.mkdtemp(prefix="anzen-app-"))
+os.makedirs(os.path.join(_APP, "data"))
+open(os.path.join(_APP, "data", "access_token"), "w").write("tok")
+_real_data, _real_wd = S.DATA, S.work_dir()
+S.DATA = os.path.join(_APP, "data")
+S.set_work_dir(_APP)
+try:
+    ok("a file in the bot's own folder is still reachable",
+       S._in_sandbox("notes.md") == os.path.join(_APP, "notes.md"), S._in_sandbox("notes.md"))
+    ok("the pairing token is refused", S._in_sandbox("data/access_token") is None)
+    ok("settings are refused", S._in_sandbox(os.path.join(_APP, "data", "settings.json")) is None)
+    ok("...and a write through the tool itself lands nowhere",
+       S.exec_tool("b", "write_file", {"path": "data/settings.json", "content": "{}"})[0] == "(path outside sandbox)")
+    # The desktop app's working folder *is* the store, and the rule above refused every write it made:
+    # a turn's file never appeared. The store's own files are refused there; anything else is not.
+    S.set_work_dir(os.path.join(_APP, "data"))
+    ok("a bot whose folder is the app dir can still write an ordinary file",
+       S._in_sandbox("notes.md") == os.path.join(_APP, "data", "notes.md"), S._in_sandbox("notes.md"))
+    ok("...but not the pairing token", S._in_sandbox("access_token") is None)
+    ok("...nor the settings", S._in_sandbox("settings.json") is None)
+finally:
+    S.DATA = _real_data; S.set_work_dir(_real_wd)
+
+class _FakePage:
+    def __init__(self, kind): self.kind = kind; self.filled = []
+    def locator(self, sel): return self
+    def evaluate(self, js): return self.kind == "password"
+    def fill(self, sel, text): self.filled.append(text)
+    def wait_for_timeout(self, ms): pass
+def typed(kind):
+    b = S.Browser.__new__(S.Browser); b.page = _FakePage(kind)
+    return b.type("#f", "hunter2"), b.page.filled
+msg, filled = typed("password")
+ok("a password field is refused and nothing is typed", filled == [] and "password" in msg, (msg, filled))
+msg, filled = typed("text")
+ok("an ordinary field still types", filled == ["hunter2"], filled)
 
 print("--- connector URL hygiene and credential redaction ---")
 ok("a cleartext connector base is refused", bool(S.connector_url_error("http://api.github.com")))
@@ -161,6 +215,33 @@ ts = [threading.Thread(target=_churn, args=(k,)) for k in range(8)]
 [t.start() for t in ts]; [t.join() for t in ts]
 ok("concurrent ctx access never raises", not errs, errs[:3])
 for k in list(S.ctx_keys()): S.ctx_pop(k)
+
+print("--- a first-run secret is minted once, and a lookup never races a delete ---")
+_tokpath = os.path.join(S.DATA, "mint-race-token")
+_minted = []
+_bar = threading.Barrier(8)
+def _mint():
+    _bar.wait(); _minted.append(S._mint_token(_tokpath))
+_ts = [threading.Thread(target=_mint) for _ in range(8)]
+[t.start() for t in _ts]; [t.join() for t in _ts]
+_on_disk = open(_tokpath).read().strip()
+ok("every caller gets the token the file holds", _minted and all(t == _on_disk for t in _minted), _minted)
+
+errs = []
+# A tiny switch interval is what makes the delete land between the lookup and the read reliably.
+_sw = sys.getswitchinterval(); sys.setswitchinterval(1e-6)
+def _lookup():
+    try:
+        for _ in range(300): S.load("race-id"); S.new_session("race-id", bot="b")
+    except Exception as e: errs.append(repr(e))
+def _delete():
+    for _ in range(300):
+        S.new_session("race-id", bot="b"); S.drop_session("race-id")
+_r = [threading.Thread(target=_lookup) for _ in range(4)]
+[t.start() for t in _r]; _d = threading.Thread(target=_delete); _d.start()
+[t.join() for t in _r]; _d.join()
+sys.setswitchinterval(_sw)
+ok("a read of a chat being deleted never raises", not errs, errs[:3])
 
 print("--- a command the app will refuse is refused once, and no card is raised for it ---")
 # The refusal lives in one place. `shell_refused` decides it, `run_shell` returns it, and the agent
@@ -350,7 +431,9 @@ S.save_channels([{"id": "work-room", "name": "Work Room", "members": ["lead"], "
 S.save_routines([])
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 S.LAN = False
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), S.H)
+# The app's own server class, not the stock one: its accept queue is wide enough for the concurrent
+# bursts below (the stock backlog of 5 resets a few of eight simultaneous connects at random).
+srv = S.Srv(("127.0.0.1", port), S.H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 def post(path, body):
@@ -359,6 +442,36 @@ def post(path, body):
     r = c.getresponse(); data = r.read(); c.close()
     try: return r.status, json.loads(data or b"{}")
     except Exception: return r.status, {}
+
+def post_short(path, raw, length):
+    """POST a body the client never finishes — a phone that lost wifi mid-upload. The socket is
+    half-closed so the server's read hits EOF short of the Content-Length it was promised."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.sendall(("POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+               "Content-Length: %d\r\n\r\n" % (path, length)).encode() + raw)
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk: break
+        data += chunk
+    s.close()
+    return int(data.split(b" ")[1])
+
+def get(path, headers=None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", path, headers=headers or {})
+    r = c.getresponse(); data = r.read(); hdrs = dict(r.getheaders()); c.close()
+    return r.status, data, hdrs
+
+print("--- a body that did not arrive whole is refused, not read as empty ---")
+# A body cut short by a dropped connection used to parse to `{}` and be accepted: `/api/chat` then
+# answered 200 and died mid-turn on a missing `text`, and the attachments were dropped in silence.
+ok("a truncated POST body is a 400, not an empty request",
+   post_short("/api/chat", b'{"session": "work-room", "text": "hi"', 200) == 400)
+ok("a JSON null body is a 400, not a 500", post("/api/chat", None)[0] == 400)
+st, j = post("/api/chat", {"session": "work-room"})
+ok("a chat with no text and no attachments is a 400", st == 400 and not j.get("ok"), (st, j))
 
 st, j = post("/api/routine", {"prompt": "standup", "session": "work-room", "bot": "lead", "every": 60})
 ok("a routine naming both a room and a bot is refused", st == 400 and "room routine" in j.get("error", ""), (st, j))
@@ -372,6 +485,21 @@ st, j = post("/api/routine", {"prompt": "x", "session": "work-room", "every": Tr
 ok("a bool interval is refused", st == 400, (st, j))
 st, j = post("/api/routine", {"prompt": "x", "session": "work-room"})
 ok("a routine with no schedule is refused", st == 400, (st, j))
+S.save_routines([])
+
+# A hand-edited record without a prompt can never run. It used to be dispatched, fail on the missing
+# key, and be marked run anyway — so it never ran again and nothing ever reached a client.
+S.save_routines([{"id": "no-prompt", "session": "work-room", "every": 1}])
+ok("a routine with no prompt is never due", S._due(S.load_routines()[0], time.time()) is False)
+_real_turn0, ran = S._run_turn, []
+S._run_turn = lambda *a, **k: ran.append(a) or iter(())
+S._RT_LIVE[0] += 1
+try:
+    S._run_routine({"id": "no-prompt", "session": "work-room", "every": 1},
+                   S.load_bots(), S.load_settings(), S.load_channels())
+finally:
+    S._run_turn = _real_turn0
+ok("...and dispatching it starts no turn", not ran, ran)
 S.save_routines([])
 
 # A routine's prompt is stored as a user message so it can drive a turn, but it is not the user's:
@@ -411,7 +539,222 @@ ok("a valid relay url is accepted and recorded as wss",
    (st, j, S.load_settings().get("relay")))
 st, j = post("/api/relay", {"on": False})
 ok("the relay switches off again", j.get("ok") is True, (st, j))
+
+# The shape check alone lets `..` through, so a request no client normalised is what proves the
+# containment rule is the one that answers.
+_c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+_c.request("GET", "/api/upload/../bots.json")
+_r = _c.getresponse(); _r.read(); _c.close()
+ok("an upload path that climbs out of its folder is not served", _r.status == 404, _r.status)
+
+def make_bot(i): post("/api/bot", {"bot": {"name": "Race %d" % i, "model": "m"}})
+ts = [threading.Thread(target=make_bot, args=(i,)) for i in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+names = {b["name"] for b in S.load_bots()}
+ok("concurrent bot saves do not lose one another",
+   all("Race %d" % i in names for i in range(8)), sorted(names))
+
+def patch_setting(i): post("/api/settings", {"settings": {"probe_%d" % i: i}})
+ts = [threading.Thread(target=patch_setting, args=(i,)) for i in range(6)]
+[t.start() for t in ts]; [t.join() for t in ts]
+st_now = S.load_settings()
+ok("concurrent settings saves do not lose one another",
+   all(st_now.get("probe_%d" % i) == i for i in range(6)), st_now)
+
+print("--- a second answer to one card never writes a denial ---")
+# Two answers to one card — a double-click, or the desktop and the phone — are the normal case. The
+# first wakes the turn, which pops the waiter; the second then lands on the transcript's `pending`.
+# It used to append "(command denied by user)" whatever the answer was, so an allowed command that
+# really ran was recorded as refused.
+S.new_session("approve-chat", bot="lead")
+def answer(allow):
+    st = S.load("approve-chat"); st["pending"] = {"cmd": "ls"}; S.save("approve-chat", st)
+    return post("/api/approve", {"session": "approve-chat", "allow": allow})[1]
+def said(sid):
+    return [m.get("content") or "" for m in S.load(sid).get("messages") or []]
+j = answer(True)
+ok("a stale card answered Allow is resolved, not denied",
+   j.get("ok") is True and j.get("resolved") is True, j)
+ok("...and no denial is written", not any("command denied" in m for m in said("approve-chat")), said("approve-chat"))
+ok("...and the card is gone", S.load("approve-chat").get("pending") is None)
+answer(False)
+ok("a stale card answered Deny still says the command was denied",
+   any("command denied by user" in m for m in said("approve-chat")), said("approve-chat"))
+
+print("--- a watcher that fell behind still learns the turn ended ---")
+# One `agent_text` per token overflows the 64-slot queue on a slow phone. Losing the tail of that
+# stream used to lose `done` with it, and the client kept the chat `running: true` for ever.
+q = S._watching()
+try:
+    for i in range(64): S._fanout({"type": "agent_text", "text": str(i)})
+    S._fanout({"type": "done"})
+    got = []
+    while True:
+        try: got.append(q.get_nowait())
+        except queue.Empty: break
+    ok("a full queue still carries the turn's end", bool(got) and got[-1].get("type") == "done", got[-2:])
+    ok("...by dropping the oldest delta, not the newest", len(got) == 64 and got[0].get("text") == "1", got[:2])
+finally:
+    S._unwatch(q)
+
+q = S._watching()
+try:
+    S._fanout({"type": "done"})
+    for i in range(63): S._fanout({"type": "agent_text", "text": str(i)})
+    S._fanout({"type": "agent_text", "text": "late"})
+    got = []
+    while True:
+        try: got.append(q.get_nowait())
+        except queue.Empty: break
+    ok("a later delta never pushes a queued end out", any(e.get("type") == "done" for e in got) and len(got) <= 64,
+       len(got))
+finally:
+    S._unwatch(q)
+
+print("--- a duplicated bot does not inherit the source's browser logins ---")
+# Saved profiles are keyed by account name on this machine, not by bot: copied, the duplicate would
+# inherit a login the user never granted it, and both bots would drive one profile. Its picture is a
+# file named by the source's id, so the reference goes too rather than point at a URL that 404s.
+post("/api/bot", {"bot": {"name": "Copy Me", "model": "m", "avatar": 3,
+                          "browser": [{"name": "fpl", "sites": "fantasy.premierleague.com"}]}})
+st, j = post("/api/bot/duplicate", {"id": "copy-me"})
+cp = S.bot_by_id(S.load_bots(), "copy-me-copy")
+ok("the copy is made", st == 200 and cp is not None, (st, j))
+ok("...without the source's browser accounts", cp is not None and cp.get("browser") == [], cp)
+ok("...and without a picture file it does not have",
+   cp is not None and cp.get("avatar") == 0 and cp.get("avatar_closed") == 0, cp)
+ok("...while the source keeps both", S.bot_by_id(S.load_bots(), "copy-me").get("browser") != [])
+
+print("--- one face batch at a time, even for two clicks ---")
+# Both requests used to pass a bare `if FACE_JOB["running"]` before either set it, so both batches
+# ran: double the image spend and two writers on bots.json. The flag is now claimed under a lock
+# before the loading, so a second request while the first is in flight is turned away.
+os.makedirs(S.FACES_DIR, exist_ok=True)
+open(os.path.join(S.FACES_DIR, "src.png"), "wb").write(b"\x89PNG\r\n\x1a\n")
+S._save_json(S.FACES_BATCH_PATH, {"source": "src.png"})
+_park = threading.Event(); _real_worker = S._face_worker
+S._face_worker = lambda *a: _park.wait(10)
+try:
+    st, j = post("/api/faces/generate", {})
+    ok("the first request starts a batch", j.get("ok") is True and j.get("job", {}).get("running") is True, (st, j))
+    st2, j2 = post("/api/faces/generate", {})
+    ok("...and a second one while it runs is refused", j2.get("ok") is False and "still being drawn" in j2.get("error", ""), (st2, j2))
+finally:
+    S.FACE_JOB["running"] = False; _park.set(); S._face_worker = _real_worker
+
+print("--- preset clips: listed from disk, served whole or in one range, never off-path ---")
+# Clips are optional app assets beside the preset frames, so the folder is empty in a fresh
+# checkout: every check below builds its own fixture under the redirected PRESET_DIR. The bytes
+# are not a real WebM — these routes move bytes and never parse the container.
+CLIP = bytes(range(256)) * 4
+_cd = os.path.join(S.PRESET_DIR, "cat", "clips")
+os.makedirs(_cd, exist_ok=True)
+open(os.path.join(_cd, "idle.webm"), "wb").write(CLIP)
+open(os.path.join(_cd, "celebrate.mp4"), "wb").write(CLIP[:16])
+open(os.path.join(_cd, "notes.txt"), "wb").write(b"not a clip")
+
+st, body, _ = get("/api/clips/cat")
+j = json.loads(body or b"{}")
+ok("the listing names only the clips that exist",
+   st == 200 and j == {"ok": True, "clips": {"celebrate": "/api/clip/cat/celebrate.mp4",
+                                             "idle": "/api/clip/cat/idle.webm"}}, (st, j))
+st, body, _ = get("/api/clips/cat-grey")
+ok("a preset with no clips folder answers an empty map, not an error",
+   st == 200 and json.loads(body or b"{}").get("clips") == {}, (st, body))
+ok("an unknown preset id is a 404", get("/api/clips/nope")[0] == 404)
+ok("...on the clip route too", get("/api/clip/nope/idle.webm")[0] == 404)
+# The drawn mascot — every room, and every bot without a preset — has a shared clip set of its own.
+ok("the drawn mascot can have clips: an empty map until one exists",
+   get("/api/clips/mochi")[0] == 200 and
+   json.loads(get("/api/clips/mochi")[1] or b"{}").get("clips") == {})
+_md = os.path.join(S.PRESET_DIR, "mochi", "clips")
+os.makedirs(_md, exist_ok=True)
+open(os.path.join(_md, "idle.webm"), "wb").write(CLIP)
+st, body, h = get("/api/clip/mochi/idle.webm")
+ok("...and one of its clips is served like a preset's",
+   st == 200 and body == CLIP and h.get("Content-Type") == "video/webm", (st, len(body or b"")))
+ok("a missing clip is a 404", get("/api/clip/cat/sleeping.webm")[0] == 404)
+ok("a file in the clips folder that is not a clip is not served", get("/api/clip/cat/notes.txt")[0] == 404)
+ok("a traversal that climbs out of the folder is refused", get("/api/clip/cat/../../server.py")[0] == 404)
+ok("...and the encoded form is refused too", get("/api/clip/cat/..%2F..%2Fserver.py")[0] == 404)
+
+st, body, h = get("/api/clip/cat/idle.webm")
+ok("a full request answers 200 with every byte",
+   st == 200 and body == CLIP and h.get("Content-Length") == str(len(CLIP)), (st, len(body)))
+ok("...typed as video/webm", h.get("Content-Type") == "video/webm", h.get("Content-Type"))
+ok("...private, sandboxed and sniff-proof",
+   h.get("Cache-Control") == "private, max-age=3600"
+   and h.get("Content-Security-Policy") == "default-src 'none'; sandbox"
+   and h.get("X-Content-Type-Options") == "nosniff", h)
+st, body, h = get("/api/clip/cat/celebrate.mp4")
+ok("an mp4 clip is typed as video/mp4", h.get("Content-Type") == "video/mp4", h.get("Content-Type"))
+
+st, body, h = get("/api/clip/cat/idle.webm", {"Range": "bytes=10-19"})
+ok("a range request answers 206 with just those bytes",
+   st == 206 and body == CLIP[10:20] and h.get("Content-Range") == "bytes 10-19/%d" % len(CLIP)
+   and h.get("Content-Length") == "10" and h.get("Content-Type") == "video/webm", (st, len(body), h))
+st, body, h = get("/api/clip/cat/idle.webm", {"Range": "bytes=9999-"})
+ok("an unsatisfiable range answers 416 with the size",
+   st == 416 and h.get("Content-Range") == "bytes */%d" % len(CLIP), (st, h.get("Content-Range")))
+st, body, h = get("/api/clip/cat/idle.webm", {"Range": "bytes=abc"})
+ok("a malformed range answers 416 too", st == 416, st)
 srv.shutdown()
+
+print("--- a failed write never reaches the cache, and a card waits for a person ---")
+before = S.load_settings()
+bad = json.loads(json.dumps(before)); bad["probe_write"] = "never"
+real_save = S._save_json
+def _boom(*a, **k): raise OSError("disk full")
+S._save_json = _boom
+try:
+    try: S.save_settings(bad); raised = False
+    except OSError: raised = True
+finally: S._save_json = real_save
+ok("a settings write that fails is not published to the cache", raised and S.load_settings() == before)
+ok("an approval card has a budget of its own, in minutes", S.APPROVAL_WAIT >= 300, S.APPROVAL_WAIT)
+ok("the handler drops a connection that goes silent", 0 < S.H.timeout <= 120, S.H.timeout)
+
+print("--- a save keeps its own temp file, and a read is bounded by one clock ---")
+import base64 as _b64
+PNGD = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+logo_url = "data:image/png;base64," + _b64.b64encode(PNGD).decode()
+ldir = os.path.join(_TMP, "race-logos")
+saved = []
+ts = [threading.Thread(target=lambda: saved.append(S._save_image(ldir, "same", logo_url))) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+ok("every concurrent save of one picture succeeds", all(r.get("ok") for r in saved), saved[:3])
+ok("...and no half-written temp file is left behind",
+   not [f for f in os.listdir(ldir) if f.endswith(".tmp")], os.listdir(ldir))
+ok("...and the stored picture is the one that was sent",
+   open(os.path.join(ldir, "same.png"), "rb").read() == PNGD)
+# A failed write must not take the old logo with it: the older format goes only once the new file
+# is in place.
+real_mk = S.tempfile.mkstemp
+S.tempfile.mkstemp = lambda **kw: (_ for _ in ()).throw(OSError("disk full"))
+try:
+    failed = S._save_image(ldir, "same", "data:image/gif;base64,"
+                           + _b64.b64encode(b"GIF89a" + b"\x00" * 32).decode())
+finally: S.tempfile.mkstemp = real_mk
+ok("a save that fails leaves the logo that was there",
+   failed.get("ok") is False and open(os.path.join(ldir, "same.png"), "rb").read() == PNGD, failed)
+
+class _Trickle:
+    n = 0
+    def read1(self, n):
+        self.n += 1; time.sleep(0.05); return b"x" if self.n < 100 else b""
+try: S._read_deadline(_Trickle(), 0.02); raised = False
+except socket.timeout: raised = True
+ok("a response that trickles is cut at the deadline, not per read", raised)
+
+class _NoHandshake:
+    closed = False
+    def request(self, *a, **k): raise S.MCPError("no handshake")
+    def notify(self, *a, **k): pass
+    def close(self): self.closed = True
+mc = S.MCPClient.__new__(S.MCPClient); mc.t = _NoHandshake(); mc.info = ""; mc.tools = []; mc.by_safe = {}
+try: mc.start()
+except S.MCPError: pass
+ok("a failed MCP handshake closes the process it spawned", mc.t.closed)
 
 print("--- a turn's duration rides on the assistant row, never on a typed message ---")
 # The clock spans the whole turn — model steps and tool calls — and only `run_agent`'s `finally`
@@ -431,6 +774,24 @@ ok("a finished turn records a numeric duration",
    isinstance(out.get("took"), (int, float)) and not isinstance(out.get("took"), bool) and out["took"] >= 0, out)
 ok("...rounded to a tenth of a second", out.get("took") == round(out.get("took"), 1), out.get("took"))
 ok("a message the user typed carries no duration", "took" not in S._user_message("hi", None, False))
+
+print("--- a restart clears an approval card no turn is waiting on ---")
+# The card's waiter is an in-memory Event; after a restart there is none, so the stored `pending`
+# draws an Allow/Deny for a command that will never run and leaves the dock asking for an answer.
+S.new_session("stale-card", bot="lead")
+_st = S.load("stale-card"); _st["pending"] = {"cmd": "rm -rf x", "agent": "lead"}; S.save("stale-card", _st)
+S.new_session("live-card", bot="lead")
+_lt = S.load("live-card"); _lt["pending"] = {"cmd": "ls", "agent": "lead"}; S.save("live-card", _lt)
+S.APPROVAL["live-card"] = {"event": threading.Event(), "allow": False}
+_keep = (S.warm_mcp, S.scheduler, S.lucent)
+S.warm_mcp = lambda: None; S.scheduler = lambda: None; S.lucent = None
+try: S.boot(warm_browser=False)
+finally:
+    S.warm_mcp, S.scheduler, S.lucent = _keep; S.APPROVAL.pop("live-card", None)
+ok("boot clears a card left by a turn that is gone", S.load("stale-card").get("pending") is None,
+   S.load("stale-card").get("pending"))
+ok("...and leaves a card whose turn is still waiting",
+   S.load("live-card").get("pending") == {"cmd": "ls", "agent": "lead"}, S.load("live-card").get("pending"))
 
 print("\n%d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
