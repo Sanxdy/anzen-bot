@@ -160,6 +160,43 @@ ok("role hints drive emoji and skills", S._role_hint("QA and Release Engineer")[
    and "testing" in S._role_hint("Backend Engineer")[1])
 ok("a non-BotMRR paste falls through to the model",
    S.parse_team("Lea - Producer\nAlex - UI")["agents"] == [])
+# A brief written as a YAML block scalar. Read as a plain value it was the single character ">", so
+# every bot in a pasted team arrived with no instructions and the room had no lead who knew its job.
+_BLOCK = """---
+botmrr: 1
+name: Block Team
+agents:
+  - key: lea
+    name: Lea
+    title: Producer
+    description: >
+      Lead the team.
+
+      Never do the work yourself.
+    appearance:
+      color: purple
+  - key: alex
+    name: Alex
+    title: Engineer
+    description: |
+      Builds it.
+      Then tests it.
+rooms:
+  - key: demo
+    name: Demo
+    members:
+      - lea
+      - alex
+    bulletin: >-
+      Keep it small.
+"""
+_t = S.parse_team(_BLOCK)
+ok("a folded brief keeps its words, not the `>` marker",
+   _t["agents"][0]["description"] == "Lead the team.\nNever do the work yourself.")
+ok("...and a folded room bulletin is read too", _t["rooms"][0]["bulletin"] == "Keep it small.")
+ok("a literal brief keeps its line breaks", _t["agents"][1]["description"] == "Builds it.\nThen tests it.")
+ok("...and the fields after a block still parse",
+   _t["agents"][0]["color"] == "purple" and _t["agents"][1]["name"] == "Alex")
 
 made, rooms = S.build_team(FIXTURE)
 ok("build_team makes one bot per agent", [b["name"] for b in made] == ["Lea", "Alex"])

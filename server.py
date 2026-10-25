@@ -441,8 +441,10 @@ DEFAULT_BOTS = [
  {"id":"producer","name":"Producer","title":"Chief of Staff","role":"Plans, delegates, coordinates the team",
   "color":"purple","model":DEFAULT_MODEL,"approval":"approve","memory":True,"voice":"",
   "instructions":"You are the team lead. Do NOT do hands-on work yourself. Begin with a short "
-  "one-or-two line plan, then DELEGATE each task with `delegate` (at most once per teammate per turn), then "
-  "call `finish`.",
+  "one-or-two line plan, then DELEGATE each task with `delegate`, splitting the work across the "
+  "teammates whose job it is — and hand follow-up work back to the same teammate (a fix QA asked for, "
+  "a rebuild after a change). Then call `finish` with what they reported. Answer by yourself only when "
+  "no teammate could do it better.",
   "tools_allow":None,"skills":["planning","delegation","writing"],"hidden":False,"pinned":True},
  {"id":"researcher","name":"Researcher","title":"Research","role":"Reads the sandbox and the web, gathers facts",
   "color":"blue","model":DEFAULT_MODEL,"approval":"ask","memory":True,"voice":"",
@@ -473,6 +475,8 @@ for _b in DEFAULT_BOTS: _b["emoji"] = BOT_EMOJI.get(_b["id"], "🤖")
 # from the bot record and its room, so a bot left on the old text is moved to the current one — a
 # brief the user edited is not on this list and is left alone.
 _STALE_BRIEFS = [
+ "You are the team lead. Do NOT do hands-on work yourself. Begin with a short one-or-two line plan, then "
+ "DELEGATE each task with `delegate` (at most once per teammate per turn), then call `finish`.",
  "You are the Producer and team lead. Do NOT do hands-on work yourself. Begin with a short one-or-two line "
  "plan, then DELEGATE each task with `delegate` (at most once per teammate per turn), then call `finish`. "
  "Teammates: Researcher (web+sandbox), Builder (code), QA (tests), Ops (services).",
@@ -556,6 +560,11 @@ def _norm_bots(b):
         _fill(x, "approval", "ask"); _fill(x, "memory", True); _fill(x, "voice", "")
         _fill(x, "hidden", False); _fill(x, "pinned", False); _fill(x, "skills", [])
         _fill(x, "tools_allow", None)
+        # A brief stored as a YAML block marker is a brief that was never read — `parse_team` used to
+        # keep the `>` and drop the text under it. It is no brief at all, so it is filled like a blank
+        # one rather than left standing as a bot whose whole instruction is one punctuation mark.
+        if (x.get("instructions") or "").strip() in (">", ">-", ">+", "|", "|-", "|+"):
+            x["instructions"] = None
         _fill(x, "instructions", "You are " + x["name"] + ".")
         _fill(x, "emoji", BOT_EMOJI.get(x["id"], ""))
         _fill(x, "face", "")   # blank = the client derives a species from the id
@@ -1536,13 +1545,32 @@ def _scalar(v):
     v = (v or "").strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'": v = v[1:-1]
     return v
+def _block(lines, i, ind, v):
+    """A YAML block scalar's text, and the line to read on from. `>` folds its lines into one, `|`
+    keeps them. Without this a brief written as `description: >` was stored as the single character
+    ">": every bot in an imported team came in with no instructions at all, and nothing said so."""
+    keep = []
+    while i < len(lines) and (not lines[i].strip()
+                              or len(lines[i]) - len(lines[i].lstrip(" ")) > ind):
+        keep.append(lines[i].strip()); i += 1
+    if v.startswith(">"):
+        out = ""
+        for ln in keep:
+            if not ln: out += "\n"
+            elif out and not out.endswith("\n"): out += " " + ln
+            else: out += ln
+        return out.strip(), i
+    return "\n".join(keep).strip(), i
+
 def parse_team(text):
     """Read a BotMRR playbook into {name, chief, agents, rooms}. Pure stdlib, no YAML dependency."""
     m = re.search(r"^---[ \t]*\n(.*?)\n---[ \t]*$", text or "", re.S | re.M)
     body = m.group(1) if m else (text or "")
     out = {"name": "", "chief": "", "agents": [], "rooms": []}
     section = rec = sub = None
-    for raw in body.splitlines():
+    lines = body.splitlines(); i = 0
+    while i < len(lines):
+        raw = lines[i]; i += 1
         if not raw.strip() or raw.lstrip().startswith("#"): continue
         ind = len(raw) - len(raw.lstrip(" ")); s = raw.strip()
         if ind == 0:
@@ -1550,6 +1578,7 @@ def parse_team(text):
             if k in ("agents", "rooms", "channels"):
                 section = "rooms" if k in ("rooms", "channels") else "agents"; rec = sub = None
             else:
+                if v.strip() in (">", ">-", ">+", "|", "|-", "|+"): v, i = _block(lines, i, ind, v.strip())
                 if k == "name": out["name"] = _scalar(v)
                 elif k == "chiefOfStaff": out["chief"] = _scalar(v)
                 section = rec = sub = None
@@ -1566,7 +1595,9 @@ def parse_team(text):
             elif rec is not None and sub == "playbooks": rec.setdefault("playbooks", []).append(v or _scalar(item))
             continue
         if rec is None: continue
-        k, _, v = s.partition(":"); k = k.strip(); v = _scalar(v)
+        k, _, v = s.partition(":"); k = k.strip()
+        if v.strip() in (">", ">-", ">+", "|", "|-", "|+"): v, i = _block(lines, i, ind, v.strip())
+        v = _scalar(v)
         if ind <= 4:                                  # a field of the record itself
             if k in ("appearance", "defaultResponder", "playbooks", "members"): sub = k; continue
             sub = None
@@ -4266,6 +4297,11 @@ TOOL_SCHEMAS = {
 ALL_TOOLS = ["run_shell","read_file","write_file","list_files","generate_image","send_file","browser_open","browser_read","browser_click",
              "browser_type","browser_press","browser_back","browser_eval","browser_see","browser_save","memory_update","use_skill","delegate","lucent_api","finish"]
 DEFAULT_TOOLS = {b["id"]: (ALL_TOOLS if b["id"] != "producer" else ["delegate","send_file","lucent_api","memory_update","use_skill","finish"]) for b in DEFAULT_BOTS}
+# How many tasks one turn may hand to the team. A teammate may be asked again — build, QA finds a bug,
+# build the fix — so this counts hand-offs, not names. It is a ceiling on a lead that keeps re-delegating
+# instead of reporting: every delegation is a whole turn of its own, and without a cap it could spend the
+# step budget spawning turns and never land one.
+MAX_DELEGATIONS = 8
 
 # Plan-only mode: the bot investigates with read-only tools and reports a plan, then stops. Nothing
 # that changes the world is offered, so "plan" cannot quietly turn into "do" — the user approves the
@@ -5552,6 +5588,18 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
     if planning:
         # read-only only: in plan mode the bot cannot act, so it cannot act by accident either
         tools = [t for t in tools if t["function"]["name"] in PLAN_TOOLS]
+    # A room's lead is the one bot that is meant to use the team, and that is only a sentence in its
+    # brief — a model can ignore a sentence. So its first `finish` with nothing delegated is refused
+    # once (see the `finish` branch). Only the lead: a member answering its own chat is not running
+    # the room. Only with somebody to hand to and the tool to hand them with, which is exactly when
+    # `delegate` is in `tools` — plan mode drops it, and so does an edited tool list.
+    lead_id = ""
+    if ch_now:
+        lead_id = ch_now.get("lead") or ""
+        if not bot_by_id(bots, lead_id):
+            lead_id = next((m for m in (ch_now.get("members") or []) if bot_by_id(bots, m)), "")
+    lead_has_team = (depth == 0 and bid == lead_id and bool(peers)
+                     and "delegate" in {t["function"]["name"] for t in tools})
     # The prompt is assembled as (row, text) chunks so the context panel can say what filled the
     # window. Joining the chunks in order rebuilds the exact string this used to concatenate, so the
     # split is measured from the prompt that is actually sent rather than a parallel guess.
@@ -5621,7 +5669,7 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
     budget = context_budget(model, ctx_cfg.get("limit") or 0)
     compress = ctx_cfg.get("compress", True)
     told = False
-    delegated = set(); denied = False; used = []; done = False; said = ""
+    hands = 0; nudged = False; denied = False; used = []; done = False; said = ""
     # Every time this app stops the bot — a refused command, a denied card, a call that never ran —
     # is remembered here. They are what the user is told about by name: a bot that dies silently
     # after being refused three times leaves the room with nothing to read, and "the turn ran out of
@@ -5837,9 +5885,9 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                     sb = bot_by_id(bots, sub)
                     if not sb or sub == bid: result = "(unknown teammate)"
                     elif depth >= 3: result = "(delegation is too deep — call finish now.)"
-                    elif sub in delegated: result = f"({sb['name']} already worked on this turn — call finish now.)"
+                    elif hands >= MAX_DELEGATIONS: result = "(you have handed out enough work this turn — call finish now.)"
                     else:
-                        delegated.add(sub)
+                        hands += 1
                         used.append("delegate:" + sub)
                         yield {"type": "agent", "id": sub, "name": sb["name"], "state": "start", "task": subtask}
                         # The delegate's turn is a task in Lucent too, in whichever project this
@@ -5866,6 +5914,20 @@ def _agent_loop(sid, bid, task, context, out, bots, settings, depth, images=None
                         if not (ch_now and ch_now.get("id") == sid):
                             st2 = load(sid); st2["messages"].append({"role": "assistant", "who": sb["name"], "content": sout.get("text", ""), "ts": time.time()}); save(sid, st2)
                 elif name == "finish":
+                    if lead_has_team and not hands and not nudged:
+                        # The lead of a room, with a team it never called. Refused once, in words, so
+                        # the team is the default and a one-line answer is still possible: the second
+                        # `finish` goes through. It is the tool's answer, not an error — the turn
+                        # carries on, and nothing the user sees turns red.
+                        nudged = True
+                        result = ("(you lead this room and have not handed anything to your team. "
+                                  "Delegate at least one concrete task, then finish with what they "
+                                  "reported. If nothing here needs a teammate, say so in one line and "
+                                  "call `finish` again.)")
+                        yield {"type": "tool", "id": tc.get("id"), "agent": bid, "name": name, "args": args, "out": None}
+                        yield {"type": "tool", "id": tc.get("id"), "agent": bid, "name": name, "args": args, "out": result}
+                        messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": result})
+                        continue
                     # A bot that calls `finish` with nothing to say still has the last thing it said,
                     # and a blank report is the silent stop in another costume — so fall back rather
                     # than hand the room an empty line.
