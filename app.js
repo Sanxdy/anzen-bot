@@ -89,6 +89,8 @@ const ICON = {
   file:'<path d="M6.5 2.8h7l4.5 4.5v13.9h-11.5z"/><path d="M13.5 2.8v4.5H18"/>',
   pin:'<path d="M9.2 3.6h5.6l-.9 4.8 3.4 3.4H5.9l3.4-3.4z"/><path d="M12 11.8v8.6"/>',
   edit:'<path d="M4 20.2h4l11-11a2.1 2.1 0 0 0-3-3l-11 11z"/><path d="M14.5 5.2l3 3"/>',
+  bundle:'<path d="M20.4 12.6V19a2 2 0 0 1-2 2H5.6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6.4"/>'
+        + '<path d="M15.6 2.8h5.6v5.6"/><path d="M21.2 2.8 11 13"/>',
   copy:'<rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2"/><path d="M4 15.5V5.5a2 2 0 0 1 2-2h10"/>',
   hide:'<path d="M2.5 12S6 5.5 12 5.5c1.5 0 2.8.4 4 1M21.5 12S18 18.5 12 18.5c-1.5 0-2.8-.4-4-1"/><path d="M3.2 3.2l17.6 17.6"/>',
   trash:'<path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13"/>',
@@ -3081,6 +3083,7 @@ async function reloadConfig() {
   if (!cfg) return;
   S.bots = cfg.bots; S.channels = cfg.channels; S.models = cfg.models; S.settings = cfg.settings || {}; S.routines = cfg.routines || [];
   S.tools = cfg.tools || S.tools; S.connectorTools = cfg.connector_tools || []; S.fontSizes = cfg.font_sizes || S.fontSizes;
+  S.skills = cfg.skills || S.skills;   // a workspace import installs skills, and the Skills tab reads this
   S.teamTemplate = cfg.team_template || S.teamTemplate;
   applyAppearance(S.settings.appearance); renderNav(); loadChats();
 }
@@ -3512,6 +3515,7 @@ const TABS = [
   ["bots", "Bots", "bots", "Your workspace"],
   ["faces", "Bot faces", "faces", "Your workspace"],
   ["channels", "Rooms", "channels", "Your workspace"],
+  ["bundle", "Backup", "bundle", "Your workspace"],
   ["apps", "Connected apps", "apps", "Your workspace"],
   ["lucent", "Lucent", "globe", "Your workspace"],
   ["skills", "Skills", "skills", "Your workspace"],
@@ -3608,7 +3612,7 @@ function renderPanel() {
   if (S.facePrev) { detach(S.facePrev); S.facePrev = null; }   // the face preview dies with the panel
   p.setAttribute("aria-labelledby", "tab-" + curTab);
   ({ general: tabGeneral, channels: tabChannels, bots: tabBots, faces: tabFaces, models: tabModels,
-     phone: tabPhone, approvals: tabApprovals, memory: tabMemory, skills: tabSkills, plugins: tabPlugins,
+     phone: tabPhone, approvals: tabApprovals, memory: tabMemory, skills: tabSkills, plugins: tabPlugins, bundle: tabBundle,
      apps: tabApps, lucent: tabLucent, voice: tabVoice, appearance: tabAppearance, help: tabHelp }[curTab] || tabGeneral)(p);
 }
 function h3(p, title, hint) { p.appendChild(el("h3", "", esc(title))); if (hint) p.appendChild(el("p", "hint", hint)); }
@@ -5065,6 +5069,126 @@ function tabSkills(p) {
    remote one); whichever it is, the tools it offers are handed to every bot, named after the server
    so two servers can both have an `echo`. The panel is what connects one and says what it found, so
    a server that will not come up says why here rather than failing silently inside a turn. */
+/* --- Backup: one file that moves the whole workspace --- */
+function tabBundle(p) {
+  h3(p, "Backup", "Everything that makes this workspace yours — the bots, the rooms, their memory, their pictures, their skills and their chats — in one file. Install anzen-bot on another machine, import it there, and it carries on where this one left off.");
+  const note = el("div", "hint", "");
+
+  /* --- Export --- */
+  const xc = el("div", "card");
+  xc.innerHTML = `<div class="ct"><span class="ico">${svg("bundle")}</span><div><b>Export this workspace</b>
+    <div class="sub">Downloads a .zip. Nothing leaves this machine until you move that file yourself.</div></div></div>`;
+  const xwhat = el("div", "desc", "The bundle holds: bots and their instructions, colours and faces · rooms and their bulletins · memory notes · uploaded avatars · generated faces · room logos · routines · installed skills with their files · chat history · appearance and behaviour settings.");
+  const xnot = el("div", "desc", "It does not hold: the router address and its key, connector tokens, the phone pairing token, the relay secret, or the browser profiles — those belong to the machine, and a backup is a file you keep in a Downloads folder.");
+  const xrow = el("div", "row"); xrow.style.marginTop = "12px";
+  const xbtn = el("a", "btn pri", "Export workspace");
+  xbtn.href = "/api/workspace/export"; xbtn.setAttribute("download", "");
+  const xsay = el("div", "desc", "");
+  xrow.appendChild(xbtn);
+  xc.append(xwhat, xnot, xrow, xsay);
+  p.appendChild(xc);
+
+  /* --- Import --- */
+  const ic = el("div", "card");
+  ic.innerHTML = `<div class="ct"><span class="ico">${svg("bundle")}</span><div><b>Import a workspace</b>
+    <div class="sub">Reads a bundle from another machine (or an older copy of this one).</div></div></div>`;
+  const ifile = el("input"); ifile.type = "file"; ifile.accept = ".zip,application/zip";
+  ifile.style.display = "none";
+  const ibtn = el("button", "btn ghost", "Choose a bundle…"); ibtn.type = "button";
+  const isay = el("div", "desc", "");
+  const ipick = el("div"); ipick.style.display = "none";
+  const irow = el("div", "row"); irow.style.marginTop = "12px";
+  irow.appendChild(ibtn);
+  ic.append(irow, isay, ipick);
+  p.appendChild(ic);
+  p.appendChild(note);
+
+  /* Nothing is written until the bundle has been read and shown: an import can replace a roster, and
+     that is not a thing to do on a filename alone. */
+  let held = null;                                   // { name, data, counts }
+  const reset = () => { held = null; ipick.innerHTML = ""; ipick.style.display = "none"; ifile.value = ""; };
+  ibtn.onclick = () => ifile.click();
+  ifile.onchange = async () => {
+    const f = ifile.files[0]; if (!f) return;
+    ibtn.disabled = true; ibtn.textContent = "Reading…"; isay.textContent = ""; ipick.innerHTML = "";
+    try {
+      const data = await new Promise((res, rej) => {
+        const fr = new FileReader();
+        fr.onload = () => res(fr.result);
+        fr.onerror = () => rej(new Error("could not read that file"));
+        fr.readAsDataURL(f);
+      });
+      const r = await jpost("/api/workspace/inspect", { data });
+      if (!r.ok) { isay.textContent = "That is not a usable bundle: " + (r.error || "the server could not read it"); return; }
+      held = { name: f.name, data, counts: r.counts };
+      showBundle();
+    } catch (e) {
+      isay.textContent = "Could not read that file: " + (isOffline(e) ? "the connection to the server dropped." : (e && e.message ? e.message : e));
+    } finally {
+      ibtn.disabled = false; ibtn.textContent = "Choose a bundle…";
+    }
+  };
+
+  const showBundle = () => {
+    const c = held.counts || {};
+    const line = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    ipick.innerHTML = ""; ipick.style.display = "";
+    const head = el("div", "desc", `<b>${esc(held.name)}</b>${c.at ? " · exported " + esc(String(c.at).replace("T", " ")) : ""} holds:
+      ${line(c.bots || 0, "bot", "bots")}, ${line(c.channels || 0, "room", "rooms")},
+      ${line(c.sessions || 0, "chat", "chats")}, ${line(c.routines || 0, "routine", "routines")},
+      ${line(c.skills || 0, "skill", "skills")}, ${line(c.memory || 0, "memory note file", "memory note files")},
+      ${line((c.avatars || 0) + (c.faces || 0) + (c.logos || 0), "picture", "pictures")}.`);
+    ipick.appendChild(head);
+
+    /* Two ways in, said plainly rather than as a switch: one adds to what is here, the other replaces
+       it. Merge is the default because it cannot lose a bot you made on this machine. */
+    const mrow = el("div", "row"); mrow.style.marginTop = "10px";
+    let mode = "merge";
+    const bMerge = el("button", "btn ghost sm", "Add to what is here"); bMerge.type = "button";
+    const bSwap = el("button", "btn ghost sm", "Replace what is here"); bSwap.type = "button";
+    const mdesc = el("div", "desc", "Bot ids are kept, so a chat, a picture and a memory note stay attached to the bot they came with. A bot already here with the same id is updated in place.");
+    const paint = () => {
+      bMerge.className = "btn " + (mode === "merge" ? "pri" : "ghost") + " sm";
+      bSwap.className = "btn " + (mode === "replace" ? "pri" : "ghost") + " sm";
+      mdesc.textContent = mode === "merge"
+        ? "Bot ids are kept, so a chat, a picture and a memory note stay attached to the bot they came with. A bot already here with the same id is updated in place."
+        : "The roster, the rooms, the routines, the skills and the chats become the bundle's. Bots made on this machine that the bundle does not have will be gone.";
+    };
+    bMerge.onclick = () => { mode = "merge"; paint(); };
+    bSwap.onclick = () => { mode = "replace"; paint(); };
+    paint();
+    mrow.append(bMerge, bSwap);
+
+    const grow = el("div", "row"); grow.style.marginTop = "10px";
+    const go = el("button", "btn pri", "Import"); go.type = "button";
+    const cancel = el("button", "btn ghost sm", "Cancel"); cancel.type = "button";
+    cancel.onclick = () => { reset(); isay.textContent = "Nothing imported."; };
+    go.onclick = async () => {
+      go.disabled = bMerge.disabled = bSwap.disabled = cancel.disabled = true;
+      const was = go.textContent; go.textContent = "Importing…";
+      try {
+        const r = await jpost("/api/workspace/import", { data: held.data, mode });
+        if (!r.ok) { isay.textContent = "Could not import that bundle: " + (r.error || "the server refused it"); return; }
+        /* The whole page is redrawn from the server's own truth, because the roster, the rooms, the
+           routines, the skills and the settings all changed at once — `reloadConfig` is exactly that
+           reload, and it is the same one every other write in Settings uses. */
+        const w = r.wrote || {};
+        isay.textContent = "Imported " + (w.bots || 0) + " bot" + ((w.bots || 0) === 1 ? "" : "s")
+          + ", " + (w.channels || 0) + " room" + ((w.channels || 0) === 1 ? "" : "s")
+          + ", " + (w.sessions || 0) + " chat" + ((w.sessions || 0) === 1 ? "" : "s")
+          + ", " + (w.files || 0) + " file" + ((w.files || 0) === 1 ? "" : "s") + "."
+          + (r.skipped_count ? " " + r.skipped_count + " entry" + (r.skipped_count === 1 ? "" : "s") + " skipped: " + (r.skipped[0] || "") : "");
+        reset(); await reloadConfig();
+      } catch (e) {
+        go.disabled = bMerge.disabled = bSwap.disabled = cancel.disabled = false; go.textContent = was;
+        isay.textContent = "Could not import that bundle: " + (isOffline(e) ? "the connection to the server dropped." : (e && e.message ? e.message : e));
+      }
+    };
+    grow.append(go, cancel);
+    ipick.append(mrow, mdesc, grow);
+  };
+}
+
 function tabPlugins(p) {
   h3(p, "Plugins", "MCP servers your bots can use. Add a server by the command that starts it (a local one) or its URL (a remote one) — the tools it offers become your bots' tools, named after the server. Env values and headers are stored but never shown again, like every other credential here.");
   const box = el("div"); p.appendChild(box);

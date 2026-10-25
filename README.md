@@ -134,6 +134,7 @@ It is built for people who want agentic AI without handing a vendor their machin
 
 **Make it yours**
 * 15 settings sections, 11 themes, 18 fonts, a per-room logo, and an animated mascot that follows the bot you are talking to.
+* **Backup and move** — **Settings → Backup** exports the whole workspace as one `.zip`: every bot with its colour, face, avatar, instructions and memory notes, the rooms and their bulletins, the routines, the installed skills with their files, the chat history and the appearance settings. Import it on another machine and the workspace carries on there. Two ways in — **add to what is here**, or **replace what is here** — and the bundle is shown before anything is written. Bot ids are kept, so a chat, a picture and a memory note stay attached to the bot they came with. What a bundle never carries: the router address and its key, connector tokens, the phone pairing token, the relay secret and the browser profiles. Those belong to the machine, not to the workspace.
 
 ---
 
@@ -212,7 +213,7 @@ The app's built-in **Help** (the button above Settings in the sidebar) is the fu
 * Shell commands run in a **sandbox** folder, not your home, and a room's repo folder narrows that further. File tools are confined to it, but a shell command is not a jail — treat shell access as the real boundary.
 * API keys are **write-only** to the UI and stored in `data/`. The static file server never serves anything under the data directory.
 * Network access is **off by default**. Reaching the API from your wifi is a deliberate switch, guarded by a token; the desktop app reaches the backend over a Unix socket that nothing else can dial.
-* No credentials, conversations or memory are ever included in a shared team file.
+* No credentials, conversations or memory are ever included in a **shared team file** (a pasted playbook). A **workspace bundle** you export yourself is different: it carries the conversations and the memory notes on purpose, because that is what makes the move worth doing — but it still carries no router key, no connector token, no pairing token and no relay secret, and it is never written anywhere except where you save it.
 
 ---
 

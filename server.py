@@ -1755,6 +1755,225 @@ def build_team(text):
     for c in rooms: new_session(c["id"], bot=None, title=c["name"])
     return made, rooms
 
+# ---------------------------------------------------------------- workspace bundle
+# Moving a workspace to another machine used to mean rebuilding it there: the only importer this app
+# had read a BotMRR playbook, and a playbook carries a name, a title and a brief — no memory, no
+# avatar, no face, no skills, no routines, no chats. A bundle carries all of it in one zip, so "move
+# to the other PC" is a download and an upload.
+#
+# What is deliberately left out is anything that belongs to *this* machine rather than to the
+# workspace: the router URL and its key (`config.json`), the access token, the relay secret, the
+# browser profiles (their cookies are the logins), and the logs. A bundle is meant to be saved in a
+# Downloads folder and handed around, and a file that carries API keys is neither of those things.
+BUNDLE_FORMAT = "anzen-workspace"
+BUNDLE_VERSION = 1
+# The same ceiling a skill zip has, and for the same reason: it travels base64 inside a JSON body,
+# so MAX_BODY_BYTES is already derived from it and a larger bundle would be refused before it was read.
+BUNDLE_MAX_BYTES = MAX_ZIP_BYTES
+BUNDLE_MAX_UNPACKED = 400_000_000      # everything it holds, so a zip bomb cannot fill the disk
+# The picture folders only take images; `memory` and `skills` take whatever a skill bundles.
+BUNDLE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+# Settings that are credentials or that describe this machine. They are dropped on the way out *and*
+# again on the way in: a bundle edited by hand must not be able to put a key back into settings.json,
+# and an import must never wipe the keys the machine it lands on already has.
+BUNDLE_SETTING_SKIP = ("api_keys", "connectors", "mcp", "relay")
+
+def _bundle_settings(s):
+    """The settings worth carrying: how the workspace looks and behaves, with every credential cut.
+    `api_keys`, the connectors' tokens and the relay are this machine's, not the workspace's."""
+    out = json.loads(json.dumps(s or {}))
+    for k in BUNDLE_SETTING_SKIP: out.pop(k, None)
+    for sec in ("voice", "decision"):
+        if isinstance(out.get(sec), dict): out[sec].pop("key", None)
+    return out
+
+def _bundle_rel(name):
+    """A zip member's path, made safe to join under one of our data folders: relative, never climbing
+    out of it. Returns "" for a name to skip."""
+    rel = os.path.normpath((name or "").replace("\\", "/").strip()).lstrip("/")
+    if not rel or rel in (".", "..") or rel.startswith(".." + os.sep) or os.path.isabs(rel):
+        return ""
+    return rel
+
+def export_bundle():
+    """The whole workspace as one zip. Returns (blob, error) — the blob is None when it is too big,
+    and the error then says so rather than handing back a half-built file."""
+    bots = load_bots()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("bots.json", json.dumps(bots, indent=2))
+        z.writestr("channels.json", json.dumps(load_channels(), indent=2))
+        z.writestr("routines.json", json.dumps(load_routines(), indent=2))
+        z.writestr("skills.json", json.dumps(load_installed_skills(), indent=2))
+        z.writestr("settings.json", json.dumps(_bundle_settings(load_settings()), indent=2))
+        # Read from the store, not the file: `_sessions_snapshot` is the same copy every other reader
+        # takes, and the file on disk is a moment behind it.
+        z.writestr("sessions.json", json.dumps(dict(_sessions_snapshot())))
+        folders = (("memory", MEMDIR, False), ("avatars", AVATAR_DIR, True),
+                   ("faces", FACES_DIR, True), ("logos", LOGO_DIR, True),
+                   ("skills", SKILLS_DIR, False))
+        for label, root, images in folders:
+            if not os.path.isdir(root): continue
+            for dirpath, _dirs, names in os.walk(root):
+                for n in sorted(names):
+                    p = os.path.join(dirpath, n)
+                    if not os.path.isfile(p) or os.path.islink(p): continue
+                    if images and os.path.splitext(n)[1].lower() not in BUNDLE_IMAGE_EXTS: continue
+                    rel = os.path.relpath(p, root).replace(os.sep, "/")
+                    z.write(p, label + "/" + rel)
+        z.writestr("manifest.json", json.dumps(
+            {"format": BUNDLE_FORMAT, "version": BUNDLE_VERSION,
+             "at": datetime.datetime.now().isoformat(timespec="seconds"),
+             "counts": {"bots": len(bots), "channels": len(load_channels()),
+                        "routines": len(load_routines()), "skills": len(load_installed_skills()),
+                        "sessions": len(_sessions_snapshot())}}, indent=2))
+    blob = buf.getvalue()
+    if len(blob) > BUNDLE_MAX_BYTES:
+        return None, ("this workspace comes to %.1f MB and a bundle may be %d MB — the pictures are "
+                      "what make it large" % (len(blob) / 1_000_000, BUNDLE_MAX_BYTES // 1_000_000))
+    return blob, ""
+
+def bundle_manifest(data):
+    """Open a bundle and say what is in it, writing nothing. Returns (info, error) — this is what the
+    import panel shows before anything is touched."""
+    if not data: return None, "send the bundle as a data URL in `data`"
+    if len(data) > BUNDLE_MAX_BYTES: return None, "that bundle is larger than %d MB" % (BUNDLE_MAX_BYTES // 1_000_000)
+    try: zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception: return None, "that file is not a zip"
+    with zf:
+        names = set(zf.namelist())
+        if "manifest.json" not in names:
+            return None, "that zip is not an anzen-bot bundle — it has no manifest.json"
+        try: man = json.loads(zf.read("manifest.json") or b"{}")
+        except Exception: return None, "that bundle's manifest.json is not readable"
+        if not isinstance(man, dict) or man.get("format") != BUNDLE_FORMAT:
+            return None, "that zip is not an anzen-bot bundle"
+        if man.get("version") != BUNDLE_VERSION:
+            return None, ("that bundle is version %s and this app reads version %d"
+                          % (man.get("version"), BUNDLE_VERSION))
+        if sum(i.file_size for i in zf.infolist()) > BUNDLE_MAX_UNPACKED:
+            return None, "that bundle unpacks to more than this app will write"
+        counts = dict(man.get("counts") or {})
+        # Counted from the zip rather than trusted from the manifest: a bundle can be edited, and this
+        # is the number a person decides on.
+        for doc, key in (("bots.json", "bots"), ("channels.json", "channels"),
+                         ("routines.json", "routines"), ("skills.json", "skills"),
+                         ("sessions.json", "sessions")):
+            if doc not in names: continue
+            try: v = json.loads(zf.read(doc) or b"null")
+            except Exception: return None, "%s in that bundle is not valid JSON" % doc
+            if isinstance(v, (list, dict)): counts[key] = len(v)
+        for label in ("memory", "avatars", "faces", "logos"):
+            counts[label] = sum(1 for n in names if n.startswith(label + "/") and not n.endswith("/"))
+        # `skills` already counts skill records; their files are a separate number, so one does not
+        # silently overwrite the other and the panel can say both.
+        counts["skill_files"] = sum(1 for n in names if n.startswith("skills/") and not n.endswith("/"))
+        return {"at": man.get("at") or "", "counts": counts}, ""
+
+def import_bundle(data, mode="merge"):
+    """Write a bundle into this workspace. `merge` folds it into what is here — the same bot id is
+    replaced, a new one is added — and `replace` swaps the roster, the rooms, the routines, the skills
+    and the chats for the bundle's. Pictures and memory are always written over what is here.
+    Returns (result, error)."""
+    info, err = bundle_manifest(data)
+    if err: return None, err
+    replace = mode == "replace"
+    try: zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception: return None, "that file is not a zip"
+    wrote = {"bots": 0, "channels": 0, "routines": 0, "skills": 0, "sessions": 0, "files": 0}
+    with zf, _DOC_LOCK:
+        names = set(zf.namelist())
+        def doc(name):
+            if name not in names: return None
+            try: return json.loads(zf.read(name) or b"null")
+            except Exception: return None
+        # Bots first: an id never changes, so everything below (a room's members, a chat, a picture, a
+        # memory file) stays attached to the bot it came with.
+        incoming = doc("bots.json")
+        if isinstance(incoming, list):
+            incoming = _norm_bots([x for x in incoming if isinstance(x, dict)])
+            keep = [] if replace else [b for b in load_bots() if b["id"] not in {x["id"] for x in incoming}]
+            # `_norm_bots` on the whole roster, not just the arrivals: names have to be unique across
+            # it, and that is the one place that decides.
+            save_bots(_norm_bots(keep + incoming))
+            wrote["bots"] = len(incoming)
+        incoming = doc("channels.json")
+        if isinstance(incoming, list):
+            incoming = _norm_channels([x for x in incoming if isinstance(x, dict)])
+            keep = [] if replace else [c for c in load_channels() if c["id"] not in {x["id"] for x in incoming}]
+            save_channels(keep + incoming)
+            wrote["channels"] = len(incoming)
+        incoming = doc("routines.json")
+        if isinstance(incoming, list):
+            incoming = [x for x in incoming if isinstance(x, dict) and x.get("id")]
+            keep = [] if replace else [r for r in load_routines() if r.get("id") not in {x["id"] for x in incoming}]
+            with _RT_LOCK: save_routines(keep + incoming)
+            wrote["routines"] = len(incoming)
+        incoming = doc("skills.json")
+        if isinstance(incoming, list):
+            incoming = [x for x in incoming if isinstance(x, dict) and x.get("id")]
+            keep = [] if replace else [s for s in load_installed_skills() if s["id"] not in {x["id"] for x in incoming}]
+            _save_json(SKILLS_FILE, keep + incoming)
+            wrote["skills"] = len(incoming)
+        # Settings: only the keys the bundle is allowed to carry, laid over what this machine has, so
+        # an import never empties a key that was already typed in here.
+        incoming = doc("settings.json")
+        if isinstance(incoming, dict):
+            cur = load_settings()
+            for k, v in incoming.items():
+                if k in BUNDLE_SETTING_SKIP: continue
+                cur[k] = v
+            save_settings(cur)
+        # Files before chats: a bot's picture is named by the record above, and a transcript that
+        # mentions a file should find it already there.
+        total = 0
+        skipped = []
+        for label, root, images in (("memory", MEMDIR, False), ("avatars", AVATAR_DIR, True),
+                                    ("faces", FACES_DIR, True), ("logos", LOGO_DIR, True),
+                                    ("skills", SKILLS_DIR, False)):
+            os.makedirs(root, exist_ok=True)
+            for name in names:
+                if not name.startswith(label + "/") or name.endswith("/"): continue
+                rel = _bundle_rel(name[len(label) + 1:])
+                if not rel: skipped.append(name); continue
+                if images and os.path.splitext(rel)[1].lower() not in BUNDLE_IMAGE_EXTS:
+                    skipped.append(name); continue
+                dest = os.path.realpath(os.path.join(root, rel))
+                if not (dest == os.path.realpath(root) or dest.startswith(os.path.realpath(root) + os.sep)):
+                    skipped.append(name); continue        # it points outside the folder it claims to be in
+                try: size = zf.getinfo(name).file_size
+                except KeyError: skipped.append(name); continue
+                # A zip bomb is a small file that expands without limit; the running total is what
+                # stops it, and a member over the cap is refused on its own declared size.
+                if size > BUNDLE_MAX_UNPACKED or total + size > BUNDLE_MAX_UNPACKED:
+                    skipped.append(name + " (too big)"); continue
+                try: blob = zf.read(name)
+                except Exception: skipped.append(name + " (unreadable)"); continue
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    open(dest, "wb").write(blob)
+                except Exception: skipped.append(name + " (could not be written)"); continue
+                total += size; wrote["files"] += 1
+        # A picture's version is what the browser cache-busts with, and it is stamped from the file's
+        # mtime — which the copy above just changed. Re-stamped here so a bot shows the face that
+        # arrived instead of asking for the one it had on the other machine.
+        bots = load_bots(); restamped = False
+        for b in bots:
+            av = avatar_state(b)
+            if b.get("avatar") != av["v"] or b.get("avatar_closed") != av["closed_v"]:
+                b["avatar"] = av["v"]; b["avatar_closed"] = av["closed_v"]; restamped = True
+        if restamped: save_bots(bots)
+        incoming = doc("sessions.json")
+        if isinstance(incoming, dict):
+            chats = {} if replace else dict(_all_sessions())
+            for sid, st in incoming.items():
+                if isinstance(st, dict): chats[sid] = st
+            _write_sessions(chats)
+            wrote["sessions"] = len(incoming)
+    return {"mode": "replace" if replace else "merge", "wrote": wrote,
+            "counts": info["counts"], "from": info["at"],
+            "skipped": skipped[:10], "skipped_count": len(skipped)}, ""
+
 # ---------------------------------------------------------------- sessions
 SESS_PATH = os.path.join(DATA, "sessions.json")
 RUNNING = {}; APPROVAL = {}; STEER = {}
@@ -7021,6 +7240,19 @@ class H(BaseHTTPRequestHandler):
             return self._json({k: load(k)["pending"] for k in known + scoped})
         if u.path == "/api/chats":
             return self._json({"chats": chat_list()})
+        if u.path == "/api/workspace/export":
+            # A plain download, not JSON: the browser saves it under the name in the header, which is
+            # what makes "export on the laptop, import on the VPS" one click at each end. Nothing on
+            # this door is cacheable, for the same reason the shell is not.
+            blob, err = export_bundle()
+            if err: return self._json({"ok": False, "error": err}, 413)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Content-Disposition", 'attachment; filename="anzen-workspace-%s.zip"' % stamp)
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers(); self.wfile.write(blob); return
         if u.path == "/api/memory":
             bid = q.get("bot", ["producer"])[0]
             return self._json({"bot": bid, "text": open(mem_path(bid), encoding="utf-8", errors="replace").read() if os.path.isfile(mem_path(bid)) else ""})
@@ -7353,6 +7585,23 @@ class H(BaseHTTPRequestHandler):
                 if not allow: return self._json({"ok": True, "denied": True})
                 return self._json({"ok": True, "resolved": True})
             return self._json({"ok": True, "denied": not allow})
+        if u.path == "/api/workspace/inspect":
+            # What is in the bundle, before any of it is written. The import panel shows this and only
+            # then offers the button: an import can replace a roster, and that is not a thing to do on
+            # a filename alone.
+            info, err = bundle_manifest(_data_bytes(body.get("data") or ""))
+            if err: return self._json({"ok": False, "error": err})
+            return self._json({"ok": True, **info})
+        if u.path == "/api/workspace/import":
+            mode = "replace" if (body.get("mode") or "") == "replace" else "merge"
+            res, err = import_bundle(_data_bytes(body.get("data") or ""), mode)
+            if err: return self._json({"ok": False, "error": err})
+            # Everything the page redraws from, in the shape it already expects: a roster, the rooms,
+            # the routines, the skills and the settings all changed at once.
+            return self._json({"ok": True, **res, "bots": self._bots_public(load_bots()),
+                               "channels": channels_public(load_channels()),
+                               "routines": load_routines(), "skills": skills_public(),
+                               "settings": settings_public(load_settings())})
         if u.path == "/api/skills/scan":
             data = _data_bytes(body.get("data") or "")
             if not data: return self._json({"ok": False, "error": "send the zip as a data URL in `data`"})
