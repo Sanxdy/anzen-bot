@@ -1906,6 +1906,16 @@ def import_bundle(data, mode="merge"):
         incoming = doc("routines.json")
         if isinstance(incoming, list):
             incoming = [x for x in incoming if isinstance(x, dict) and x.get("id")]
+            # `last` is when the routine ran on the machine it came from, and it is compared against
+            # this machine's clock. A timestamp from the future — a laptop whose clock is ahead, a
+            # bundle imported after a clock change — makes `now - last` negative, so an interval
+            # routine would never come due and would sit there silently. Clamped to now: it still does
+            # not fire twice in a row, and it cannot be stuck for ever.
+            now = time.time()
+            for x in incoming:
+                try:
+                    if float(x.get("last") or 0) > now: x["last"] = now
+                except (TypeError, ValueError): x["last"] = 0
             keep = [] if replace else [r for r in load_routines() if r.get("id") not in {x["id"] for x in incoming}]
             with _RT_LOCK: save_routines(keep + incoming)
             wrote["routines"] = len(incoming)
