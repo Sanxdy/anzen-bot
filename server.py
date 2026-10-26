@@ -16,6 +16,15 @@ import json, os, re, select, signal, socket, socketserver, subprocess, sys, thre
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
+# The server uses `dict | dict` to merge records, which is Python 3.9 and later. On 3.8 that is a
+# TypeError raised deep inside a request, so the app looks like it is running while every import and
+# half the settings surface answers 500 — Ubuntu 20.04's /usr/bin/python3 is 3.8, which is exactly
+# that trap. Said plainly here instead, before anything else is set up.
+if sys.version_info < (3, 9):
+    sys.exit("anzen-bot needs Python 3.9 or newer; this is %d.%d. Start it with a newer python3 "
+             "(the README says so), or the app will boot and then fail inside requests."
+             % sys.version_info[:2])
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The link out to your relay lives beside this file, and it is imported rather than reimplemented:
 # both ends of the link speak the same small WebSocket protocol, and a second copy of it would be a
@@ -2902,6 +2911,10 @@ KEYCHAIN_CMDS = ("security find-generic-password", "security find-internet-passw
                  "security dump-keychain")
 BROWSER_REFUSAL = ("another browser's data is not yours to read — you browse with the app's own "
                    "browser, through the browser tools")
+# How often a browser that is down may be re-attached to. The panel polls its preview, and without a
+# floor a Playwright that is simply not installed was re-imported on every poll — which is a traceback
+# per second in the log. This is the same idea as the model retry backoff, in one number.
+BROWSER_RETRY_S = 5
 def names_foreign_browser(cmd):
     c = cmd.replace("\\ ", " ").replace("\\", "/").lower()   # `Application\ Support` is one path
     if any(f in c for f in BROWSER_DATA) or any(k in c for k in KEYCHAIN_CMDS): return True
@@ -3749,20 +3762,28 @@ def browser_brief(rec=None):
             "blank throwaway browser with no cookies — that is the right way to search the web or read "
             "a public page." + pick + BROWSER_OWN_LINE)
 
-def open_own_profile(name, sites=None):
+def open_own_profile(name, sites=None, sid=""):
     """Open one profile's window so you can sign in to it. The bot drives that same window
     afterwards, so a sign-in done here is a sign-in done for the bot: nothing is logged in twice, and
     the cookies are on disk for the next run. `sites` is the row that was clicked, so the window lands
     on the site that row names, and a row that names none opens a blank window rather than borrowing
-    another chat's site."""
+    another chat's site.
+
+    `sid` is the chat the button was pressed in, and it is what makes the window *that chat's* screen.
+    Without it the window was opened but never claimed, so `self.owner` kept whoever had browsed last
+    and the panel answered "Nico is using the computer — not this chat's bot" about a window the person
+    had just opened themselves: the button looked like it did nothing."""
     name = (name or "").strip() or "default"
     if not getattr(BROWSER, "ok", False) or BROWSER.mode != "profiles":
         return {"ok": False, "err": "switch the browser to “Own browser — saved profiles” first"}
     try: os.makedirs(own_profile_dir(name), exist_ok=True)
     except OSError as e: return {"ok": False, "err": "could not make the profile folder: %s" % e}
     url = first_site(sites)
+    # The chat that pressed the button owns the window. A room's actor is its lead, a solo chat's is
+    # its bot — the same rule `/api/computer/open` uses, so the two doors cannot disagree.
+    _, actor = _computer_scope(sid)
     # `_human`: a press in the panel, so it must not wait behind the panel's own take-over.
-    out = BROWSER.call("profile_open", name=name, url=url, timeout=180, _human=True)
+    out = BROWSER.call("profile_open", name=name, url=url, timeout=180, _human=True, _owner=actor)
     return {"ok": not str(out).startswith("("), "out": str(out)[:300]}
 
 # ---------------------------------------------------------------- model client
@@ -8109,7 +8130,12 @@ class H(BaseHTTPRequestHandler):
                 s = load_settings(); s.setdefault("browser", {})["accounts"] = acc; save_settings(s)
             return self._json({"ok": True, "accounts": acc})
         if u.path == "/api/browser/own/open":
-            return self._json(open_own_profile(body.get("name", ""), body.get("sites")))
+            # The chat is passed so the window that opens belongs to the panel that asked for it —
+            # otherwise the panel refuses to show a window the person just opened themselves. Not
+            # `_sid`: that defaults to "producer", which would claim the window for a bot the person
+            # was not looking at. No chat named means no claim, and the panel scopes as it did before.
+            who = body.get("session") or body.get("bot") or ""
+            return self._json(open_own_profile(body.get("name", ""), body.get("sites"), who))
         if u.path == "/api/computer/open":
             url = (body.get("url") or "").strip()
             if not url: return self._json({"ok": False, "err": "no url"})

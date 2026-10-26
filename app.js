@@ -3264,7 +3264,11 @@ function compAccounts() {
       sites.onchange = () => { a.sites = sites.value.trim(); saved(); };
       si.onclick = async () => {
         si.textContent = "Opening…"; si.disabled = true;
-        const res = await jpost("/api/browser/own/open", { name: a.name || "default", sites: a.sites });
+        /* `session` is what makes the window that opens belong to the panel you pressed it in. Without
+           it the server opened the window but claimed it for nobody, so the panel kept saying another
+           bot was using the computer and the button looked like it did nothing. */
+        const res = await jpost("/api/browser/own/open",
+          { name: a.name || "default", sites: a.sites, session: S.active || "" });
         si.disabled = false; si.textContent = "Sign in";
         say.textContent = res.ok ? (res.out || "opened") : ("Could not open — " + (res.err || "unknown"));
         draw();
