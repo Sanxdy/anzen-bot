@@ -1002,6 +1002,17 @@
     box-shadow:-30px 0 80px -40px #000}
   .sidepanel.on{transform:none}
   #comp{width:min(560px,100%)}
+  /* Three sizes for the computer panel, because a 1280-wide screenshot squeezed into 560px is a
+     picture you cannot read or click in — 41% of the page, which is what made driving it feel
+     broken. `wide` takes half the window and `full` the whole of it, and the picture is drawn as
+     large as the space allows rather than letterboxed into a fixed ratio. */
+  #comp.size-wide{width:min(62vw,900px)}
+  #comp.size-full{width:100%}
+  #comp.size-wide .frame,#comp.size-full .frame{aspect-ratio:auto;flex:1;min-height:0;height:auto}
+  #comp.size-wide .cbody,#comp.size-full .cbody{display:flex;flex-direction:column;gap:12px}
+  #comp.size-wide .frame img,#comp.size-full .frame img{object-fit:contain}
+  #compSize{display:flex;gap:4px;margin-left:8px}
+  #compSize button{padding:4px 9px;font-size:calc(11.5px * var(--fs))}
   #files{width:min(420px,100%)}
   #link{width:min(640px,100%)}
   /* The link panel is a page, not a list: the frame fills the body and the body keeps no padding, so
@@ -1390,6 +1401,11 @@
 <aside id="comp" class="sidepanel" aria-label="Computer panel" inert>
   <div class="chead"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.8" y="4.2" width="18.4" height="12.4" rx="2"/><path d="M9 20.4h6M12 16.6v3.8"/></svg></span><b>Computer</b>
     <button class="btn ghost sm" id="compTake" style="margin-left:auto" title="Drive the bot's browser yourself, then hand it back">Take over</button>
+    <div id="compSize" role="group" aria-label="Panel size">
+      <button class="btn ghost sm" data-size="normal" title="Normal width">Normal</button>
+      <button class="btn ghost sm" data-size="wide" title="Half the window">Wide</button>
+      <button class="btn ghost sm" data-size="full" title="The whole window">Full</button>
+    </div>
     <button class="btn ghost sm" id="compRefresh">Refresh</button>
     <button class="x" id="compClose" aria-label="Close computer panel">×</button></div>
   <div class="cbody">

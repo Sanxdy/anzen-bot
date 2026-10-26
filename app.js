@@ -912,6 +912,17 @@ function ago(ts) {
    `null` — a hard-coded id here named a bot that may not exist and left the app staring at an
    empty screen under a "null" heading. */
 function firstChatId() {
+  /* The chat you were last looking at, so a refresh lands where you were. It used to always open the
+     first room, which meant a page reload during a turn dropped you into a different chat and the
+     turn — still running in the one you left — looked like it had simply stopped. Only a chat that
+     still exists is honoured. */
+  let last = "";
+  try { last = localStorage.getItem("lastChat") || ""; } catch (e) {}
+  const known = (S.channels || []).some(c => c.id === last)
+             || (S.chats || []).some(c => c.id === last)
+             || (S.bots || []).some(b => b.id === last)
+             || (last.includes("/") && (S.bots || []).some(b => b.id === last.split("/")[1]));
+  if (last && known) return last;
   if (S.channels && S.channels.length) return S.channels[0].id;
   if (S.chats && S.chats.length) return S.chats[0].id;
   if (S.bots && S.bots.length) return S.bots[0].id;
@@ -1372,6 +1383,7 @@ async function select(id) {
   const prev = S.active, prevChan = S.activeIsChannel, prevName = $("#hName").textContent;
   const prevPending = pending, prevReply = S.reply, prevSay = attachSay;
   S.active = id; S.activeIsChannel = !!chan(id); closeDrawer();
+  try { localStorage.setItem("lastChat", id); } catch (e) {}   // so a reload lands here, not on the first room
   /* The strip shows the room on screen, and a turn in another room keeps running — so switching is a
      change of what is shown, not a reason to forget what any room is doing. */
   workingPaint();
@@ -2040,7 +2052,7 @@ async function stream(path, payload, onEvent, T) {
   } catch (e) { throw isOffline(e) ? offlineTurn(false) : e; }
   if (!res.ok) throw humanErr("The server refused this turn (HTTP " + res.status + "). Try again in a moment.");
   if (!res.body) throw humanErr("The server sent a reply this browser cannot read.");
-  const rd = res.body.getReader(); const dec = new TextDecoder(); let buf = "", sawDone = false, idle = null;
+  const rd = res.body.getReader(); const dec = new TextDecoder(); let buf = "", sawDone = false, sawFinal = false, idle = null;
   const arm = () => { clearTimeout(idle); idle = setTimeout(() => { try { rd.cancel(); } catch (e) {} }, STREAM_IDLE_MS); };
   /* Stop walks away from the stream. The server notices the dropped connection and ends the turn;
      cancelling the reader is what carries that over both transports — a plain fetch closes the
@@ -2057,13 +2069,17 @@ async function stream(path, payload, onEvent, T) {
       while ((i = buf.indexOf("\n\n")) >= 0) {
         const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
         if (chunk.startsWith("data: ")) {
-          try { const ev = JSON.parse(chunk.slice(6)); if (ev && ev.type === "done") sawDone = true; onEvent(ev); } catch (e) {}
+          try { const ev = JSON.parse(chunk.slice(6)); if (ev && ev.type === "done") sawDone = true; if (ev && ev.type === "final") sawFinal = true; onEvent(ev); } catch (e) {}
         }
       }
     }
   } finally { clearTimeout(idle); }
-  /* A turn that already reported its own error, or one you stopped, is not a connection that dropped. */
-  if (!sawDone && !(T && (T.stopped || T.failed))) throw offlineTurn(true);
+  /* A turn that already reported its own error, or one you stopped, is not a connection that dropped.
+     A turn that already delivered its `final` answer is not one either: the reader can end a beat
+     before `done` arrives — the connection closes, the browser is refreshed, a proxy trims the tail —
+     and calling that "the turn failed" put a red card under an answer that was already on screen.
+     `sawFinal` is what tells the two apart. */
+  if (!sawDone && !sawFinal && !(T && (T.stopped || T.failed))) throw offlineTurn(true);
 }
 /* One place that puts a message into a chat — typed, forwarded, or a reply with a quote attached.
    `opts` carries `quote` and/or `fwd`, which travel with the message to the server and are kept on
@@ -5753,6 +5769,21 @@ $("#compRefresh").onclick = async e => {
 $("#compOpen").onclick = async () => { const u = $("#compUrl").value.trim(); if (!u) return;
   await post("/api/computer/open", { url: u, session: S.active }); await refreshComp(true);
 };
+/* ---- panel size ----
+   A 1280-wide screenshot in a 560px panel is 41% of the page: unreadable, and unclickable because you
+   cannot see what you are aiming at. Three sizes, remembered, because the size you want depends on
+   what you are doing — reading a chat with the bot's screen beside it, or driving that screen. */
+const COMP_SIZES = ["normal", "wide", "full"];
+function applyCompSize(size) {
+  const el = $("#comp");
+  for (const s of COMP_SIZES) el.classList.toggle("size-" + s, s === size);
+  for (const b of $$("#compSize button"))
+    b.setAttribute("aria-pressed", b.dataset.size === size ? "true" : "false");
+  try { localStorage.setItem("compSize", size); } catch (e) {}
+  panelTop();
+}
+for (const b of $$("#compSize button")) b.onclick = () => applyCompSize(b.dataset.size);
+try { applyCompSize(localStorage.getItem("compSize") || "normal"); } catch (e) { applyCompSize("normal"); }
 /* ---------------- driving the bot's browser ----------------
    The frame is a screenshot scaled into a fixed box, so a click is sent as a fraction of the page,
    never as a pixel: the image is device pixels, the page is CSS pixels, and the box letterboxes it —
