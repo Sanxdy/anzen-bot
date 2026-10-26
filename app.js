@@ -5853,7 +5853,7 @@ function fitComp(force) {
     const key = w + "x" + h;
     if (key === fitLast) return;
     fitLast = key;
-    jpost("/api/computer/fit", { w, h }).catch(() => { fitLast = ""; });
+    jpost("/api/computer/fit", { w, h, session: S.active }).catch(() => { fitLast = ""; });
   }, 220);
 }
 /* Opening a page builds a fresh browser context at its default size, so the frame's shape is lost the
@@ -5885,28 +5885,45 @@ try { applyCompSize(localStorage.getItem("compSize") || "normal"); } catch (e) {
    never as a pixel: the image is device pixels, the page is CSS pixels, and the box letterboxes it —
    the fraction is the one number that is the same in all three. */
 function frameSpot(e) {
-  /* The server reshapes the page to the frame, so the picture now fills it exactly — `object-fit:
-     contain` scales it by the same amount in both axes. Reading the offset as a letterbox would
-     misplace every click by half the leftover space, so it is computed from the real fit. */
+  /* The server reshapes the page to the frame, so the picture should fill it exactly and `contain`
+     scales it by the same amount in both axes. It is still measured rather than assumed: when the two
+     shapes disagree — the frame was resized a moment ago and the next shot has not arrived — a click
+     would otherwise be silently dropped, and a click that does nothing is indistinguishable from a
+     panel that cannot be driven at all. So the fraction is clamped to the picture instead: a press just
+     outside it still lands on the nearest edge of the page, which is what a person aiming at the edge
+     means. */
   const img = $("#compShot"), r = img.getBoundingClientRect();
   const iw = img.naturalWidth, ih = img.naturalHeight;
   if (!iw || !ih || !r.width || !r.height) return null;
   const s = Math.min(r.width / iw, r.height / ih), w = iw * s, h = ih * s;
-  const fx = (e.clientX - (r.left + (r.width - w) / 2)) / w;
-  const fy = (e.clientY - (r.top + (r.height - h) / 2)) / h;
-  return (fx < 0 || fx > 1 || fy < 0 || fy > 1) ? null : { fx, fy };
+  const clamp = v => v < 0 ? 0 : v > 1 ? 1 : v;
+  const fx = clamp((e.clientX - (r.left + (r.width - w) / 2)) / w);
+  const fy = clamp((e.clientY - (r.top + (r.height - h) / 2)) / h);
+  return { fx, fy };
 }
-const drive = body => { if (compTaken) jpost("/api/computer/input", body); };
+/* Every gesture is followed by a fresh shot. The poll runs at 600ms while you are driving, which is
+   long enough that a click looks like it did nothing — and "a click that appears to do nothing" is
+   indistinguishable from a picture you cannot touch. So the picture is re-taken as soon as the input
+   lands, and the poll is only the backstop. */
+const drive = async body => {
+  if (!compTaken) return;
+  try { await jpost("/api/computer/input", { ...body, session: S.active }); } catch (e) {}
+  refreshComp(true);
+};
 $("#compTake").onclick = async () => {
   const on = !compTaken;
-  const r = await jpost("/api/computer/take", { on });
+  const r = await jpost("/api/computer/take", { on, session: S.active });
   if (!r || !r.ok) { $("#compMeta").textContent = (r && (r.err || r.error)) || "the browser did not answer"; return; }
   setTaken(on);
   await refreshComp(true);
 };
 $("#compFrame").addEventListener("click", e => {
   if (!compTaken) return;
-  const s = frameSpot(e); if (!s) return;
+  const s = frameSpot(e);
+  /* `frameSpot` returns null only when there is no picture at all. Every other press is sent: a press
+     near an edge is clamped to the edge rather than dropped, because a click that does nothing reads as
+     a panel that cannot be driven. */
+  if (!s) { $("#compMeta").textContent = "no picture to click yet — waiting for the screen"; return; }
   $("#compFrame").focus();                     // so the keys that follow land in the page
   drive({ kind: "click", fx: s.fx, fy: s.fy });
 });

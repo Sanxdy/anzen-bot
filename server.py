@@ -3185,9 +3185,10 @@ class Browser:
                 ev.set(); continue
             # In profiles mode nothing is launched until a site needs it, so these three can be the
             # first call of a turn with no page behind them yet. Say so in words rather than raising
-            # an AttributeError the bot reads as a browser failure.
+            # an AttributeError the bot reads as a browser failure. `fit` belongs here too: the panel
+            # asks for a shape before anything is open, and it resolves its own page.
             if fn not in ("open", "profile_open", "preview", "profile_cookies", "take", "give",
-                          "human_input") and not getattr(self, "page", None):
+                          "human_input", "fit") and not getattr(self, "page", None):
                 res["out"] = "(no page is open yet — call browser_open first)"; ev.set(); continue
             try: res["out"] = getattr(self, fn)(**args)
             except Exception as e: res["out"] = f"(browser error: {e})"
@@ -3428,17 +3429,25 @@ class Browser:
 
         The panel is a window onto the bot's browser, so the browser takes the panel's shape instead of
         the panel letterboxing a fixed 16:10 picture — that letterboxing is what left black bars down
-        the sides of every wide panel. Sizes are clamped to what a real screen could be, and a small
-        difference is ignored so the poll does not resize the page on every tick and reflow whatever
-        the bot is reading."""
-        if not getattr(self, "page", None): return "(no page is open yet)"
+        the sides of every wide panel, and a strip too short to aim a click in.
+
+        It resolves the page itself rather than assuming the job's owner has one: the panel asks before
+        anything is open, and the first fit arrives for a chat whose page may live under a member of the
+        room rather than the lead. A fit that silently refuses is why the screenshot stayed 1280x820
+        while the frame was 531x260 — every click was then computed against a letterbox that did not
+        exist."""
+        page = getattr(self, "page", None) or next(
+            (p for p in self.pages.values() if p is not None), None)
+        if page is None: return "(no page is open yet)"
         try: w = int(round(float(w))); h = int(round(float(h)))
         except Exception: return "(bad size)"
-        w = max(480, min(2560, w)); h = max(360, min(1600, h))
-        cur = self.page.viewport_size or {}
+        # The floor is deliberately low: a panel in its normal size is only a few hundred pixels tall,
+        # and clamping the page taller than the frame means the shot never matches the box.
+        w = max(320, min(2560, w)); h = max(200, min(1600, h))
+        cur = page.viewport_size or {}
         if abs(int(cur.get("width") or 0) - w) < 8 and abs(int(cur.get("height") or 0) - h) < 8:
             return ""
-        try: self.page.set_viewport_size({"width": w, "height": h})
+        try: page.set_viewport_size({"width": w, "height": h})
         except Exception as e: return "(could not resize: %s)" % e
         return ""
     def human_input(self, kind, fx=0.0, fy=0.0, text="", key="", dy=0):

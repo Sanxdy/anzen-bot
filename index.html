@@ -1002,21 +1002,22 @@
     box-shadow:-30px 0 80px -40px #000}
   .sidepanel.on{transform:none}
   #comp{width:min(560px,100%)}
-  /* The panel shows the bot's screen, so the screen is shaped like the panel. It used to be the other
-     way round — a fixed 16:10 screenshot letterboxed into whatever box it was given — which left
-     black bars down both sides of every wide panel. `fitComp` tells the server the frame's real shape
-     and the browser is resized to match, so the picture fills the frame exactly at every size.
-     `contain` then behaves like `fill` and the black never appears. */
-  #comp .cbody{display:flex;flex-direction:column;gap:12px;overflow:hidden}
+  /* The frame is a screen, so it keeps a screen's shape: 16:10 at normal size, and the panel's whole
+     height at wide/full. It was 138px tall before — a 1280x820 screenshot squeezed into a strip where
+     most of the picture was letterbox and a click aimed at it fell on nothing. `fitComp` reshapes the
+     bot's browser to whatever this box is, so the picture always fills it exactly and every click maps
+     one-to-one. */
+  #comp .cbody{display:flex;flex-direction:column;gap:10px;overflow-y:auto;padding:12px 14px}
   #comp.size-wide{width:min(76vw,1180px)}
   #comp.size-full{width:100%}
   /* Wide and full put the controls in a side column so the screen gets the panel's whole height. In a
-     single column the URL box and the account list ate two thirds of the panel and left a 422px-tall
-     strip — the screen grew sideways but never downward, which is what "still small vertically" was. */
+     single column the URL box and the account list ate two thirds of the panel and left a strip — the
+     screen grew sideways but never downward, which is what "still small vertically" was. */
   #comp.size-wide .cbody,#comp.size-full .cbody{
     display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;overflow:hidden;
     padding:12px 14px;align-items:stretch}
-  #comp.size-wide .cbody>.frame,#comp.size-full .cbody>.frame{height:100%;min-height:0;margin:0}
+  #comp.size-wide .cbody>.frame,#comp.size-full .cbody>.frame{height:100%;min-height:0;margin:0;
+    aspect-ratio:auto;flex:1 1 0}
   #comp.size-wide .cbody>.ccols,#comp.size-full .cbody>.ccols{overflow:auto;min-height:0;min-width:0;
     display:flex;flex-direction:column;gap:10px}
   #comp.size-wide .ccols .meta,#comp.size-full .ccols .meta{margin-top:0}
@@ -1043,8 +1044,11 @@
     background:radial-gradient(120% 110% at 50% 0%,#171D2A,#0A0D14 72%)}
   /* The frame takes whatever height is left after the controls, at every size. The `aspect-ratio`
      this rule used to carry is what pinned it to 16:10 and left the wide sizes short and letterboxed;
-     the screen itself is reshaped to this box (see `fitComp`), so the picture always fills it. */
-  #comp .cbody>.frame{flex:1 1 0;min-height:140px;aspect-ratio:auto}
+     the screen itself is reshaped to this box (see `fitComp`), so the picture always fills it. The
+     floor is 260px because a shorter box than that is not a screen you can aim a click in — the server
+     clamps its own viewport to 360px tall, so a 138px frame showed a letterboxed strip where clicks
+     landed on nothing. */
+  #comp .cbody>.frame{flex:0 0 auto;aspect-ratio:16/10;min-height:0}
   #comp .cbody>*:not(.frame){flex:0 0 auto}
   #comp .frame.live{background:#000}
   #comp .frame img{width:100%;height:100%;object-fit:contain;display:none}
