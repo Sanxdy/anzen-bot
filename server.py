@@ -3367,6 +3367,24 @@ class Browser:
     def _png(self, raw): return "data:image/png;base64," + base64.b64encode(raw).decode()
     def take(self): self.human = "1"; return ""
     def give(self): self.human = ""; return ""
+    def fit(self, w=0, h=0):
+        """Reshape the bot's screen to the shape of the panel showing it.
+
+        The panel is a window onto the bot's browser, so the browser takes the panel's shape instead of
+        the panel letterboxing a fixed 16:10 picture — that letterboxing is what left black bars down
+        the sides of every wide panel. Sizes are clamped to what a real screen could be, and a small
+        difference is ignored so the poll does not resize the page on every tick and reflow whatever
+        the bot is reading."""
+        if not getattr(self, "page", None): return "(no page is open yet)"
+        try: w = int(round(float(w))); h = int(round(float(h)))
+        except Exception: return "(bad size)"
+        w = max(480, min(2560, w)); h = max(360, min(1600, h))
+        cur = self.page.viewport_size or {}
+        if abs(int(cur.get("width") or 0) - w) < 8 and abs(int(cur.get("height") or 0) - h) < 8:
+            return ""
+        try: self.page.set_viewport_size({"width": w, "height": h})
+        except Exception as e: return "(could not resize: %s)" % e
+        return ""
     def human_input(self, kind, fx=0.0, fy=0.0, text="", key="", dy=0):
         """One input from the person, forwarded to the page the bot is on.
 
@@ -8155,6 +8173,14 @@ class H(BaseHTTPRequestHandler):
             out = BROWSER.call("take" if on else "give", timeout=10, _human=True)
             if str(out).startswith("("): return self._json({"ok": False, "err": out})
             return self._json({"ok": True, "human": on})
+        if u.path == "/api/computer/fit":
+            # The panel tells the server how big its frame is, and the bot's screen is reshaped to
+            # match. Without this the screenshot keeps its 16:10 shape and a wide panel shows black
+            # bars down both sides — the picture grew, the screen inside it never did.
+            out = BROWSER.call("fit", timeout=20, _human=True,
+                               w=body.get("w") or 0, h=body.get("h") or 0)
+            if str(out).startswith("("): return self._json({"ok": False, "err": out})
+            return self._json({"ok": True})
         if u.path == "/api/computer/input":
             # One gesture from the panel. A bot's calls are refused while the person is driving (see
             # `Browser._run`), so this is the only writer of the page in that state.

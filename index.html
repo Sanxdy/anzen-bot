@@ -1002,15 +1002,24 @@
     box-shadow:-30px 0 80px -40px #000}
   .sidepanel.on{transform:none}
   #comp{width:min(560px,100%)}
-  /* Three sizes for the computer panel, because a 1280-wide screenshot squeezed into 560px is a
-     picture you cannot read or click in — 41% of the page, which is what made driving it feel
-     broken. `wide` takes half the window and `full` the whole of it, and the picture is drawn as
-     large as the space allows rather than letterboxed into a fixed ratio. */
-  #comp.size-wide{width:min(62vw,900px)}
+  /* The panel shows the bot's screen, so the screen is shaped like the panel. It used to be the other
+     way round — a fixed 16:10 screenshot letterboxed into whatever box it was given — which left
+     black bars down both sides of every wide panel. `fitComp` tells the server the frame's real shape
+     and the browser is resized to match, so the picture fills the frame exactly at every size.
+     `contain` then behaves like `fill` and the black never appears. */
+  #comp .cbody{display:flex;flex-direction:column;gap:12px;overflow:hidden}
+  #comp.size-wide{width:min(76vw,1180px)}
   #comp.size-full{width:100%}
-  #comp.size-wide .frame,#comp.size-full .frame{aspect-ratio:auto;flex:1;min-height:0;height:auto}
-  #comp.size-wide .cbody,#comp.size-full .cbody{display:flex;flex-direction:column;gap:12px}
-  #comp.size-wide .frame img,#comp.size-full .frame img{object-fit:contain}
+  /* Wide and full put the controls in a side column so the screen gets the panel's whole height. In a
+     single column the URL box and the account list ate two thirds of the panel and left a 422px-tall
+     strip — the screen grew sideways but never downward, which is what "still small vertically" was. */
+  #comp.size-wide .cbody,#comp.size-full .cbody{
+    display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;overflow:hidden;
+    padding:12px 14px;align-items:stretch}
+  #comp.size-wide .cbody>.frame,#comp.size-full .cbody>.frame{height:100%;min-height:0;margin:0}
+  #comp.size-wide .cbody>.ccols,#comp.size-full .cbody>.ccols{overflow:auto;min-height:0;min-width:0;
+    display:flex;flex-direction:column;gap:10px}
+  #comp.size-wide .ccols .meta,#comp.size-full .ccols .meta{margin-top:0}
   #compSize{display:flex;gap:4px;margin-left:8px}
   #compSize button{padding:4px 9px;font-size:calc(11.5px * var(--fs))}
   #files{width:min(420px,100%)}
@@ -1030,8 +1039,13 @@
   .sidepanel .chead .x:hover{background:var(--card2);color:var(--txt)}
   .sidepanel .cbody{flex:1;overflow:auto;padding:16px 18px}
   .sidepanel .meta{font-size:calc(12px * var(--fs));font-family:var(--mono);color:var(--dim);margin-top:10px;word-break:break-all}
-  #comp .frame{border:1px solid var(--line2);border-radius:12px;overflow:hidden;aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;
+  #comp .frame{border:1px solid var(--line2);border-radius:12px;overflow:hidden;display:flex;align-items:center;justify-content:center;
     background:radial-gradient(120% 110% at 50% 0%,#171D2A,#0A0D14 72%)}
+  /* The frame takes whatever height is left after the controls, at every size. The `aspect-ratio`
+     this rule used to carry is what pinned it to 16:10 and left the wide sizes short and letterboxed;
+     the screen itself is reshaped to this box (see `fitComp`), so the picture always fills it. */
+  #comp .cbody>.frame{flex:1 1 0;min-height:140px;aspect-ratio:auto}
+  #comp .cbody>*:not(.frame){flex:0 0 auto}
   #comp .frame.live{background:#000}
   #comp .frame img{width:100%;height:100%;object-fit:contain;display:none}
   #comp .frame.live img{display:block}
@@ -1410,6 +1424,7 @@
     <button class="x" id="compClose" aria-label="Close computer panel">×</button></div>
   <div class="cbody">
     <div class="frame" id="compFrame" tabindex="-1"><canvas id="compFace" aria-hidden="true"></canvas><img id="compShot" alt="The bot's screen" draggable="false"></div>
+    <div class="ccols">
     <div class="meta" id="compMeta">no screen yet</div>
     <div class="desc" id="compDrive">Click, type and scroll in the frame: you are driving the bot's real browser. The bot is paused while you do, and picks up again when you press Hand back.</div>
     <div class="fld" style="margin-top:16px"><label for="compUrl">POINT THE BOT AT A PAGE</label>
@@ -1421,6 +1436,7 @@
       <div id="compAcc" aria-labelledby="compAccLabel"></div>
       <div class="hint" id="compAccSay"></div>
       <div class="desc" id="compAccHint"></div>
+    </div>
     </div>
   </div>
 </aside>

@@ -3139,6 +3139,7 @@ async function openComp() {
   if (!S.compFace) S.compFace = attach($("#compFace"), "idle", { size: 210, species: "mochi", ...sideFace("blue") });
   compDress();
   compAccounts();
+  fitComp();                 // shape the screen to the frame before the first shot is asked for
   await refreshComp();
   clearInterval(compTimer); compTimer = setInterval(refreshComp, compEvery());
 }
@@ -3185,6 +3186,7 @@ async function refreshComp(force) {
     // `err` alongside a picture is not a failure: it is the note saying this is the profile that is
     // on screen, not the bot's own. Shown, so nobody mistakes one profile for the other.
     $("#compMeta").textContent = (d.title || "(untitled)") + "  ·  " + (d.url || "") + (d.err ? "  —  " + d.err : "");
+    fitIfNeeded();          // a new page came back at its own default size; ask for the frame's again
   } else {
     // No `src` at all, rather than an empty one: an empty src is what made the browser draw a
     // broken-image glyph beside the alt text. The frame is showing the face instead.
@@ -5774,6 +5776,39 @@ $("#compOpen").onclick = async () => { const u = $("#compUrl").value.trim(); if 
    cannot see what you are aiming at. Three sizes, remembered, because the size you want depends on
    what you are doing — reading a chat with the bot's screen beside it, or driving that screen. */
 const COMP_SIZES = ["normal", "wide", "full"];
+/* Reshape the bot's screen to the frame it is shown in. Called when the panel opens, when a size is
+   chosen, and when the window changes — the frame's own measured box is what the browser is set to, so
+   the screenshot arrives already the right shape and `contain` has nothing left to letterbox. Without
+   this every size only grew the picture inside a 16:10 box and left black down both sides. */
+let fitTimer = null, fitLast = "";
+function fitComp(force) {
+  clearTimeout(fitTimer);
+  if (force) fitLast = "";
+  fitTimer = setTimeout(() => {
+    const f = $("#compFrame"); if (!f) return;
+    const r = f.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40) return;                       // panel is closed or hidden
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);           // a crisp shot on a retina screen
+    const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+    const key = w + "x" + h;
+    if (key === fitLast) return;
+    fitLast = key;
+    jpost("/api/computer/fit", { w, h }).catch(() => { fitLast = ""; });
+  }, 220);
+}
+/* Opening a page builds a fresh browser context at its default size, so the frame's shape is lost the
+   moment the bot goes anywhere. The screenshot's own size is the honest signal: if it does not match
+   the frame, ask for a resize again. `fitLast` still stops this from looping once they agree. */
+function fitIfNeeded() {
+  const f = $("#compFrame"), img = $("#compShot");
+  if (!f || !img || !img.naturalWidth) return;
+  const r = f.getBoundingClientRect();
+  if (r.width < 40 || r.height < 40) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (Math.abs(img.naturalWidth - Math.round(r.width * dpr)) > 12 ||
+      Math.abs(img.naturalHeight - Math.round(r.height * dpr)) > 12) fitComp(true);
+}
+window.addEventListener("resize", () => { if ($("#comp").classList.contains("on")) fitComp(); });
 function applyCompSize(size) {
   const el = $("#comp");
   for (const s of COMP_SIZES) el.classList.toggle("size-" + s, s === size);
@@ -5781,6 +5816,7 @@ function applyCompSize(size) {
     b.setAttribute("aria-pressed", b.dataset.size === size ? "true" : "false");
   try { localStorage.setItem("compSize", size); } catch (e) {}
   panelTop();
+  fitComp();
 }
 for (const b of $$("#compSize button")) b.onclick = () => applyCompSize(b.dataset.size);
 try { applyCompSize(localStorage.getItem("compSize") || "normal"); } catch (e) { applyCompSize("normal"); }
@@ -5789,6 +5825,9 @@ try { applyCompSize(localStorage.getItem("compSize") || "normal"); } catch (e) {
    never as a pixel: the image is device pixels, the page is CSS pixels, and the box letterboxes it —
    the fraction is the one number that is the same in all three. */
 function frameSpot(e) {
+  /* The server reshapes the page to the frame, so the picture now fills it exactly — `object-fit:
+     contain` scales it by the same amount in both axes. Reading the offset as a letterbox would
+     misplace every click by half the leftover space, so it is computed from the real fit. */
   const img = $("#compShot"), r = img.getBoundingClientRect();
   const iw = img.naturalWidth, ih = img.naturalHeight;
   if (!iw || !ih || !r.width || !r.height) return null;
