@@ -709,6 +709,14 @@ def _computer_scope(sid):
         return mem, lead
     return set(), ""
 
+def _panel_key(sid):
+    """The chat-key whose page the Computer panel for `sid` is showing, or "" for none.
+
+    One place that answers it, so the panel's picture and the panel's gestures cannot end up on
+    different pages — which is exactly what taking over the wrong bot's screen looked like."""
+    owners, actor = _computer_scope(sid)
+    return BROWSER.key_for(actor, owners)
+
 def _file_root(sid):
     """(root, label) for a chat's Files panel: the repo that chat works in, or the shared sandbox.
 
@@ -2973,9 +2981,17 @@ class Browser:
         self.q = queue.Queue(); self.ready = threading.Event()
         self.thread = None; self.ok = False; self.err = ""; self.url = ""; self.title = ""
         self.mode = "profiles"; self.last_try = 0.0
-        self.owner = ""                             # the bot whose page is the one on screen (see _computer_scope)
-        self.human = ""                             # set while a person is driving the page from the panel
-        self.page = None                            # set by _attach; stays None in profiles mode until a site needs one
+        self.owner = ""                             # the bot whose page was most recently put on screen
+        self.human = ""                             # "is anyone driving a page?" — see `human_on`
+        self.page = None                            # the page of the chat the current job belongs to (see _run)
+        # One page per chat. A single shared page meant every chat fought over one screen: a bot in
+        # another room opened a site and the panel you were looking at said "Nico is using the computer
+        # — not this chat's bot" about a window you had opened yourself. Keyed by the bot a call is
+        # made on behalf of, which is the same `_owner` the panel is scoped by, so the two cannot
+        # disagree. `_key` is that bot for the job currently running on the browser thread.
+        self.pages = {}                             # chat key -> that chat's own page
+        self.humans = {}                            # chat key -> "1" while a person drives that page
+        self._key = ""
         # Everything Playwright hands us belongs to the thread that made it: the sync API refuses to
         # be touched from any other one, and refuses a second driver in the same one. A restart runs
         # the next browser in a new thread while the old one is still winding down, so the driver,
@@ -3147,10 +3163,15 @@ class Browser:
             # is the same thread that sets `self.page`, so the two can never disagree about whose
             # screen this is. It is what the Computer panel is scoped by — see `_computer_scope`.
             if owner: self.owner = owner
+            # Each chat drives its own page, so the page is chosen here — on the one thread allowed to
+            # touch Playwright — and put back below. Every method keeps talking to `self.page`.
+            key = owner or ""
+            self._key = key
+            self.page = self.pages.get(key)
             # A person who took the browser in the panel is the only one driving it. A bot's call
             # while that is true is answered, not queued: the turn reads why and can say so, where a
             # silent wait would look like a hung browser. Only the panel's own calls carry `_human`.
-            why = self._gated(human)
+            why = self._gated(human, key)
             if why:
                 res["out"] = why
                 ev.set(); continue
@@ -3170,20 +3191,40 @@ class Browser:
                 res["out"] = "(no page is open yet — call browser_open first)"; ev.set(); continue
             try: res["out"] = getattr(self, fn)(**args)
             except Exception as e: res["out"] = f"(browser error: {e})"
+            # The method may have opened a page, swapped to a profile's page, or let one go — keep the
+            # chat's own slot in step with whatever it left behind.
+            if self.page is None: self.pages.pop(key, None)
+            else: self.pages[key] = self.page
             ev.set()
-    def _gated(self, human):
+    def key_for(self, actor, owners=None):
+        """Which chat's page the Computer panel should show.
+
+        The chat's own bot first; then any member of the room, because in a room the member is who
+        browses and the room itself never does. "" means nothing is on screen for this chat — which is
+        a real answer, not an error, and is what the panel says instead of another chat's work."""
+        order = [actor] + sorted(x for x in (owners or ()) if x and x != actor)
+        for k in order:
+            if self.pages.get(k) is not None: return k
+        return ""
+
+    def human_on(self, key):
+        """Whether a person is driving this chat's page right now."""
+        return bool(self.humans.get(key or ""))
+
+    def _gated(self, human, key=""):
         """Why a call may not run right now, or "" if it may.
 
         The browser thread's backstop, for a job that was queued just before the person took over.
         The ordinary path never reaches it: `call` parks the bot until they hand the browser back,
-        so the bot resumes its step rather than being told its step was dropped."""
-        if self.human and not human:
+        so the bot resumes its step rather than being told its step was dropped.
+        Per chat: taking over one bot's screen must not pause a bot in another room."""
+        if self.humans.get(key) and not human:
             return ("(the person has taken the browser in the Computer panel — do not retry; "
                     "say what you were doing and wait for them to hand it back)")
         return ""
-    def _park(self):
+    def _park(self, key=""):
         """Wait here while a person is driving the page. True if the bot may go on, False if the turn
-        was stopped while it waited.
+        was stopped while it waited. Only the page of *this* chat is waited for.
 
         Deliberately *outside* `_call_lock`: the panel's own gestures go through `call` too, so a bot
         holding the lock while it waited would lock the person out of the page they just took — the
@@ -3191,7 +3232,7 @@ class Browser:
         forgotten; the bot is then told, in words, what happened to its step."""
         sid = getattr(_WORK, "sid", None)
         waited = 0.0
-        while self.human:
+        while self.humans.get(key):
             if sid and sid in STOP: return False
             if waited >= HUMAN_WAIT: return False
             time.sleep(0.25); waited += 0.25
@@ -3204,7 +3245,7 @@ class Browser:
             # A bot's step waits for the person to finish, then runs. That is what handing the
             # browser back means: the turn carries on from where it was paused, with no message
             # needed from the user. The panel's own calls skip this — they are the person.
-            if not self._park():
+            if not self._park(getattr(self, "_key", "")):
                 sid = getattr(_WORK, "sid", None)
                 if sid and sid in STOP: return "(stopped by the user)"
                 return ("(the person kept the browser for %d minutes — say what you were doing and "
@@ -3252,14 +3293,20 @@ class Browser:
         Reading it here is the point — refusing it is what sent the bot off to shell out, which is
         many times slower and sees far less of the page."""
         me = self._mine()
+        key = getattr(self, "_key", "") or ""
         try:
-            if me["hpage"] is None:
+            # One throwaway page per chat, for the same reason the profiles get one: a public site read
+            # in chat A must not be the page chat B is looking at.
+            pages = me.setdefault("hpages", {})
+            if me.get("hb") is None:
                 me["hb"] = self._driver().chromium.launch(**_launch_opts(True))
                 me["hctx"] = _plain_ctx(me["hb"])
-                me["hpage"] = me["hctx"].new_page()
-            return me["hpage"]
+            p = pages.get(key)
+            if p is None or p.is_closed():
+                p = pages[key] = me["hctx"].new_page()
+            return p
         except Exception as e:
-            me["hb"] = None; me["hctx"] = None; me["hpage"] = None
+            me["hb"] = None; me["hctx"] = None; me["hpages"] = {}
             self.err = "headless: %s" % e
             return None
     def open(self, url, routes=None, account=None):
@@ -3286,7 +3333,14 @@ class Browser:
             if name:
                 try:
                     ctx = self._ensure_ctx(name)
-                    self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    # Two chats can be routed to one account, and the profile's first page belongs to
+                    # whoever opened it. A second chat gets its own page in the same profile, so it
+                    # shares the cookies but not the screen.
+                    mine = None
+                    for cand in ctx.pages:
+                        claimed = next((k for k, v in self.pages.items() if v is cand), None)
+                        if claimed in (None, self._key): mine = cand; break
+                    self.page = mine or ctx.new_page()
                 except Exception as e:
                     return json.dumps({"url": url, "title": "", "text":
                                        "(not opened — the %s profile would not start: %s)" % (name, e)})
@@ -3365,8 +3419,10 @@ class Browser:
         self.page.go_back(wait_until="domcontentloaded", timeout=30000); return self._snap()
     def shot(self): return self._png(self.page.screenshot())
     def _png(self, raw): return "data:image/png;base64," + base64.b64encode(raw).decode()
-    def take(self): self.human = "1"; return ""
-    def give(self): self.human = ""; return ""
+    def take(self):
+        self.humans[self._key] = "1"; self.human = "1"; return ""
+    def give(self):
+        self.humans.pop(self._key, None); self.human = "1" if self.humans else ""; return ""
     def fit(self, w=0, h=0):
         """Reshape the bot's screen to the shape of the panel showing it.
 
@@ -3391,7 +3447,7 @@ class Browser:
         Positions arrive as a fraction of the viewport, not as pixels: the panel shows a screenshot
         scaled into a fixed frame, and the image is device pixels while the page is CSS pixels — a
         fraction is the same number in both, whatever the display's scale factor."""
-        if not self.human: return "(take the browser first)"
+        if not self.human_on(self._key): return "(take the browser first)"
         if not getattr(self, "page", None): return "(no page is open yet)"
         p = self.page
         vp = p.viewport_size or {"width": 1280, "height": 820}
@@ -3414,9 +3470,9 @@ class Browser:
             # page that closed while a person was driving must not leave the panel saying they are.
             return json.dumps({"png": "", "url": "", "title": "", "err":
                                "no page is open yet — ask a bot to browse, or open a profile window below",
-                               "human": bool(self.human)})
+                               "human": self.human_on(self._key)})
         return json.dumps({"png": self._png(self.page.screenshot()), "url": self.page.url,
-                           "title": self.page.title(), "err": "", "human": bool(self.human)})
+                           "title": self.page.title(), "err": "", "human": self.human_on(self._key)})
     def save(self, selector="img", wait_ms=60000):
         """Wait for `selector`, then download what it points at (img / video / canvas) as a data URL.
         This is the 'wait for the attachment, then download it' step of the free web route."""
@@ -7508,22 +7564,23 @@ class H(BaseHTTPRequestHandler):
             # Scoped to the chat you are looking at. One browser serves every chat, so a panel that
             # answered with whatever was on screen showed you another chat's work. An empty frame that
             # names whoever *is* using it reads as "not this chat" rather than as a broken panel.
-            owners, _ = _computer_scope(q.get("sid", [""])[0])
-            if owners is not None and BROWSER.owner not in owners:
-                who = bot_by_id(load_bots(), BROWSER.owner) if BROWSER.owner else None
-                return self._json({"png": "", "url": "", "title": "", "human": bool(BROWSER.human),
-                                   "owner": BROWSER.owner,
-                                   "err": ("%s is using the computer — not this chat's bot" % who["name"]) if who
-                                          else "this chat's bot is not using the computer"})
+            owners, actor = _computer_scope(q.get("sid", [""])[0])
+            # Each chat has its own page now, so there is nothing to compare against: either this
+            # chat has a screen or it does not. Saying "Nico is using the computer" about a window you
+            # opened yourself was the old single-page design showing through.
+            key = _panel_key(q.get("sid", [""])[0])
+            if not key:
+                return self._json({"png": "", "url": "", "title": "", "human": False, "owner": "",
+                                   "err": "no screen yet — open a page below, or ask this bot to browse"})
             # Always through call(), even with no browser: that is what retries the attach, so a
             # profile opened after the panel was first drawn shows up on the next poll by itself.
             d = BROWSER.call("preview", timeout=30, force=q.get("force", [""])[0] in ("1", "true"),
-                             _human=True)
+                             _human=True, _owner=key)
             try: d = json.loads(d)
             except Exception: d = {"png": "", "url": BROWSER.url, "title": BROWSER.title, "err": str(d)}
             return self._json({"png": d.get("png", ""), "url": d.get("url", ""),
                                "title": d.get("title", ""), "err": d.get("err", ""),
-                               "human": bool(d.get("human")), "owner": BROWSER.owner})
+                               "human": bool(d.get("human")), "owner": key})
         if u.path == "/api/files":
             sid = q.get("session", q.get("bot", [""]))[0]
             root, label = _file_root(sid)
@@ -8170,7 +8227,8 @@ class H(BaseHTTPRequestHandler):
             # The person takes the page from the bot, or hands it back. `on` is explicit so a lost
             # click cannot leave the browser in whichever state the request happened to imply.
             on = body.get("on", True) is not False and body.get("on") != "0"
-            out = BROWSER.call("take" if on else "give", timeout=10, _human=True)
+            out = BROWSER.call("take" if on else "give", timeout=10, _human=True,
+                               _owner=_panel_key(self._sid(body)))
             if str(out).startswith("("): return self._json({"ok": False, "err": out})
             return self._json({"ok": True, "human": on})
         if u.path == "/api/computer/fit":
@@ -8178,6 +8236,7 @@ class H(BaseHTTPRequestHandler):
             # match. Without this the screenshot keeps its 16:10 shape and a wide panel shows black
             # bars down both sides — the picture grew, the screen inside it never did.
             out = BROWSER.call("fit", timeout=20, _human=True,
+                               _owner=_panel_key(self._sid(body)),
                                w=body.get("w") or 0, h=body.get("h") or 0)
             if str(out).startswith("("): return self._json({"ok": False, "err": out})
             return self._json({"ok": True})
@@ -8185,6 +8244,7 @@ class H(BaseHTTPRequestHandler):
             # One gesture from the panel. A bot's calls are refused while the person is driving (see
             # `Browser._run`), so this is the only writer of the page in that state.
             out = BROWSER.call("human_input", timeout=40, _human=True,
+                               _owner=_panel_key(self._sid(body)),
                                kind=(body.get("kind") or ""), fx=body.get("fx") or 0,
                                fy=body.get("fy") or 0, text=(body.get("text") or "")[:4000],
                                key=(body.get("key") or ""), dy=body.get("dy") or 0)

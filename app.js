@@ -1773,6 +1773,53 @@ async function editMsg(i) {
   autoGrow($("#input"));
   $("#input").focus(); $("#input").setSelectionRange($("#input").value.length, $("#input").value.length);
 }
+/* A failed turn leaves a card that says what went wrong — and nothing to do about it, which is why
+   the only way forward was to type "continue" or retype the task. These are the two things worth
+   offering on that card:
+     Retry     send the last message in this chat again, from the top.
+     Continue  ask the bot to carry on from where it stopped, keeping the work it already did.
+   The message's own Retry further up the transcript does the same first thing, but it is easy to miss
+   when the thing you are looking at is a red card at the bottom. */
+function failActions(card, sid, text, opts) {
+  if (!card) return card;
+  const acts = el("div", "acts");
+  const r = el("button", "ab", "Retry");
+  r.title = "Send the message that failed again";
+  r.onclick = () => retryLast(sid, text, opts);
+  const c = el("button", "ab", "Continue");
+  c.title = "Ask the bot to carry on from where it stopped";
+  c.onclick = () => continueTurn(sid);
+  acts.append(r, c);
+  card.appendChild(acts);
+  return card;
+}
+/* What "carry on" says. It names the one thing that makes a resumed turn useful — do not start over —
+   because a bot told only "continue" tends to redo the steps it already finished. */
+const CONTINUE_TEXT = "Carry on from where you stopped — do not repeat the steps you already finished. "
+  + "If you cannot continue, say plainly what is still unfinished and why.";
+async function retryLast(sid, text, opts) {
+  if (busy(sid)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
+  /* The words come from the turn that failed. Reaching into the transcript for "the last user
+     message" was wrong: a turn that never got a reply never got a row either, so that search landed on
+     an older message from an earlier turn and asked the wrong question. */
+  const sent = text != null ? { text, opts } : (S.lastSent || {})[sid];
+  if (!sent || !sent.text) { alert("There is nothing in this chat to send again."); return; }
+  /* If the failed message IS in the record, forget it and everything after it first, so the retry does
+     not sit under the wreckage of the attempt that died. If it is not there, there is nothing to
+     forget — the server never saw it. */
+  if (sid === S.active) {
+    const at = S.messages.map(m => m && m.role === "user" ? m.content : null).lastIndexOf(sent.text);
+    if (at >= 0 && await truncateAt(at, sid) && sid === S.active) render(S.messages, null);
+    if (sid !== S.active) return;
+  }
+  pinned = true;
+  await deliver(sid, sent.text, sent.opts || null);
+}
+async function continueTurn(sid) {
+  if (busy(sid)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
+  pinned = true;
+  await deliver(sid, CONTINUE_TEXT, null);
+}
 async function retryMsg(i) {
   const sid = S.active;          // bound now: the retry is sent to the chat it was asked in
   if (busy(sid)) { alert("This chat is working on a turn. Stop it, or wait for it to finish."); return; }
@@ -2093,6 +2140,9 @@ async function deliver(sid, text, opts) {
      words are the one thing that must not land below the fold — and re-pinning here is also what makes
      the bot's answer to them follow. */
   if (sid === S.active) { pinned = true; addMsg("user", text, null, null, o); }
+  /* Kept per chat, so the failure card's Retry still has the words when the turn never reached the
+     server and there is no row in the transcript to read them back from. */
+  (S.lastSent = S.lastSent || {})[sid] = { text, opts: o };
   const b = chan(sid) ? null : botOf(sid);
   await runChat("/api/chat", { session: sid, bot: b ? b.id : undefined, text, ...o });
 }
@@ -2630,7 +2680,7 @@ function drawTurnEvent(sid, T, ev) {
     /* Kept on the turn, not only drawn: the redraw at the end replaces the live cards with the saved
        record, and a record that does not carry this notice would drop the only reason the turn stopped. */
     T.failNote = "The bot hit an error and stopped: " + (ev.msg || "no reason given");
-    T.failCard = addCard("sys", "", T.failNote, to);
+    T.failCard = failActions(addCard("sys", "", T.failNote, to), sid, asked, askedOpts);
     if (here()) { failDock(ev.msg); setHead(hSub(H_STATE.error), true); $("#hDot").classList.remove("live"); } }
   /* This app stopping the bot — a refused command, a denied card, a tool that threw. It goes in the
      transcript and not only in the step row, because the row is folded and a bot that was refused
@@ -2657,6 +2707,10 @@ async function runChat(path, payload) {
   (S.myTurns = S.myTurns || {})[sid] = turn;
   S.turns[sid] = { nodes: [], plan: null, running: true };
   const T = S.turns[sid], own = turnSink(sid);
+  /* What this turn was asked, kept for the failure card's Retry: a turn that never reached the server
+     has no row in the transcript, so this is the only place the words survive. */
+  const asked = payload.text, askedOpts = payload.quote || payload.fwd || (payload.attachments || []).length
+    ? { quote: payload.quote, fwd: payload.fwd, attachments: payload.attachments } : null;
   const mode = S.approval;                       // the approval mode this turn started under
   let note = "";                                 // the failure's words, for the record kept below
   delete S.failNotes[sid];                       // this chat is trying again: the old notice is spent
@@ -2697,6 +2751,12 @@ async function runChat(path, payload) {
     note = e && e.human ? e.message
       : "The turn failed. Check that the server is still running, then try again.";
     T.failCard = addCard("sys", "", note, own);
+    /* The card says what went wrong and gives you the way out. Retry re-asks the last thing you sent
+       in this chat, so a turn that died mid-way costs one click instead of retyping the task — and
+       Continue asks the bot to carry on from where it stopped, without repeating the work it already
+       did. Both are offered on the card itself because that is where the eye already is; the message's
+       own Retry is further up the transcript and easy to miss. */
+    failActions(T.failCard, sid, asked, askedOpts);
     /* A failed turn ends in a failure face, not in `idle`: the chime and the transcript line are not
        enough on their own — the corner is where the eye already is. */
     chime("error"); announce("The turn failed.");

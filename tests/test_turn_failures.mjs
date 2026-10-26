@@ -42,17 +42,29 @@ const respond = chunks => async () => ({ ok: true, body: { getReader: () => read
 const sse = obj => "data: " + JSON.stringify(obj) + "\n\n";
 const settle = p => p.then(v => ({ value: v }), e => ({ error: e }));
 
-console.log("\n-- a clean EOF is not a finished turn --");
+console.log("\n-- a clean EOF before the answer is not a finished turn --");
 {
-  const stream = makeStream(respond([sse({ type: "final", text: "hi" })]));
+  /* Nothing was delivered: no `final`, no `done`. The server died or the socket dropped mid-turn, and
+     the turn must say so rather than pass for finished. */
+  const stream = makeStream(respond([sse({ type: "status", state: "working" })]));
   const T = {};
   const seen = [];
   const r = await settle(stream("/api/chat", {}, ev => seen.push(ev.type), T));
-  ok("the events that did arrive are still drawn", seen.join() === "final");
+  ok("the events that did arrive are still drawn", seen.join() === "status");
   ok("the turn fails instead of passing for done", !!r.error && r.error.human === true,
     String(r.error && r.error.message));
   ok("...with the words for a stream that dropped part-way",
     !!r.error && /dropped part-way/.test(r.error.message));
+}
+
+console.log("\n-- an answer that arrived is not a failed turn --");
+{
+  /* The stream can end a beat before its `done`: a refresh, a closed tab, a proxy trimming the tail.
+     The answer is on screen, so a red "the turn failed" card under it would be a lie — and it was
+     exactly what a delivered turn looked like before `sawFinal` was tracked. */
+  const stream = makeStream(respond([sse({ type: "final", text: "hi" })]));
+  const r = await settle(stream("/api/chat", {}, () => {}, {}));
+  ok("a turn whose answer arrived resolves", !r.error, String(r.error && r.error.message));
 }
 
 console.log("\n-- the server's own `done` still finishes it --");
