@@ -3367,6 +3367,17 @@ class Browser:
                         "the user to add it to an account's sites in the room's Computer panel." %
                         (_host(url) or url))
         self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # A redirect can move the navigation to a scheme the guard would have refused — an http(s)
+        # page answering 302 to file:// is the case that matters. `goto` follows it and returns, so
+        # the landing URL is checked here before anything reads the page. About:blank, not a plain
+        # error: leaving the refused document loaded would let the next tool call read it.
+        landed = self.page.url
+        why = browser_url_guard(landed)
+        if why:
+            try: self.page.goto("about:blank", timeout=5000)
+            except Exception: pass
+            return json.dumps({"url": landed, "title": "", "text":
+                               "(not opened — the page redirected to %s, which %s)" % (landed, why)})
         self._settle()
         snap = self._snap()
         if anon:
@@ -5045,7 +5056,10 @@ def _mcp_url_guard(url):
     An MCP server over HTTP is usually a local one — `http://127.0.0.1:3000/mcp` is the common
     shape — so loopback and the private ranges stay allowed. A link-local address (169.254.0.0/16,
     fe80::/10) is never an MCP server, and it is where the instance credentials live; a name is
-    resolved first so `metadata.google.internal` is caught as well as the bare address."""
+    resolved first so `metadata.google.internal` is caught as well as the bare address.
+
+    This is the check itself. It must run on every address actually contacted, not only on the one
+    an operator typed — see `_MCPRedirects` for why the difference is load-bearing."""
     h = (urlparse(url).hostname or "").lower()
     if not h: raise MCPError("that URL names no host")
     try:
@@ -5055,6 +5069,20 @@ def _mcp_url_guard(url):
         except (socket.gaierror, ValueError): return       # let the connect report its own failure
     if any(a.is_link_local for a in addrs):
         raise MCPError("that address is link-local (the cloud metadata service) — not an MCP server")
+
+class _MCPRedirects(urllib.request.HTTPRedirectHandler):
+    """Guard every redirect target, not just the URL that was configured.
+
+    urllib follows 3xx by default, so a server answering the configured URL with a redirect moves
+    the request somewhere the guard never looked — including 169.254.169.254. Refusing redirects
+    outright would break an http→https upgrade, which real MCP servers do, so each hop is guarded
+    instead of banned."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _mcp_url_guard(newurl)      # raises MCPError, which aborts the redirect
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+_MCP_OPENER = urllib.request.build_opener(_MCPRedirects)
 
 def _sse_events(lines):
     """(event, data) pairs from a text/event-stream. One reader serves both a POST that answers with
@@ -5180,10 +5208,12 @@ class _MCPHttp:
         if self.session: h["Mcp-Session-Id"] = self.session
         req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _MCP_OPENER.open(req, timeout=timeout) as r:
                 return r.status, dict(r.headers), r.read(MCP_MAX_BODY)
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers or {}), e.read(4000)
+        except MCPError:
+            raise            # a refused redirect already says why; keep that reason intact
 
     def notify(self, method, params):
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
