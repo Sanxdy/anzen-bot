@@ -3201,11 +3201,22 @@ class Browser:
         """Which chat's page the Computer panel should show.
 
         The chat's own bot first; then any member of the room, because in a room the member is who
-        browses and the room itself never does. "" means nothing is on screen for this chat — which is
-        a real answer, not an error, and is what the panel says instead of another chat's work."""
+        browses and the room itself never does. An empty answer means nothing is on screen for this chat — which is
+        a real answer, not an error, and is what the panel says instead of another chat's work.
+
+        `pages` is keyed by whichever bot actually opened the page. In a room that is the member,
+        but `open` from the panel's own box records the room's LEAD — and when those two disagree
+        the panel showed one page while every gesture went to another, which read as "the browser
+        cannot be taken over". So the actor is tried first, then every owner, then a page whose
+        owner string starts with the actor's room.
+        """
         order = [actor] + sorted(x for x in (owners or ()) if x and x != actor)
         for k in order:
             if self.pages.get(k) is not None: return k
+        # A room's page may be filed under a member that is not in `owners` (a bot that joined
+        # later, or one that browsed before the room's member list was written).
+        for k, v in self.pages.items():
+            if v is not None and k.split("/")[0] == actor: return k
         return ""
 
     def human_on(self, key):
@@ -3422,6 +3433,22 @@ class Browser:
     def _png(self, raw): return "data:image/png;base64," + base64.b64encode(raw).decode()
     def take(self):
         self.humans[self._key] = "1"; self.human = "1"; return ""
+    def adopt(self, src=""):
+        """Make the page this thread just opened answer for this chat's key.
+
+        `open` runs with `_owner=actor` (the room's lead), but `take`, `input` and `preview` are all
+        scoped by `_panel_key`, which resolves through `key_for` and can land on a different member.
+        When the two disagree the panel shows one screen while every gesture goes to another — which
+        reads as "the browser cannot be taken over".
+
+        The page `open` just loaded is on `self.page`, so that is the one to file under this key.
+        Sharing one Playwright page between two keys is safe: `pages` only decides which key answers
+        for it, and it is one browser either way.
+        """
+        page = getattr(self, "page", None) or self.pages.get(src or "")
+        if page is None: return "(no page to adopt)"
+        self.pages[self._key] = page
+        return ""
     def give(self):
         self.humans.pop(self._key, None); self.human = "1" if self.humans else ""; return ""
     def fit(self, w=0, h=0):
@@ -8231,6 +8258,15 @@ class H(BaseHTTPRequestHandler):
             ch, _solo = resolve_session(sid, None, load_channels(), load_bots())
             out = BROWSER.call("open", url=url, timeout=60, _owner=actor, _human=True,
                                routes=_turn_routes(ch, bot_by_id(load_bots(), _solo)))
+            # `take`, `input` and `preview` are all scoped by `_panel_key`, which resolves through
+            # `key_for` — and `key_for` only finds a page that is ALREADY in `pages`. Right after an
+            # open under `actor` there may be no page under the panel's key yet, so the panel would
+            # show nothing and every gesture would be answered with "no page is open yet".
+            # Filing the same page under the actor's key makes the two agree.
+            try:
+                BROWSER.call("adopt", timeout=10, _human=True, _owner=actor, src=actor)
+            except Exception:
+                pass
             return self._json({"ok": BROWSER.ok, "out": out[:400]})
         if u.path == "/api/computer/take":
             # The person takes the page from the bot, or hands it back. `on` is explicit so a lost
